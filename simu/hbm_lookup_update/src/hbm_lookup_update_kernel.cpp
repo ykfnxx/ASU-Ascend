@@ -6,6 +6,8 @@ namespace {
 constexpr uint32_t TABLE_SIZE = 2048;
 constexpr uint32_t TABLE_TILE = 64;      // int32 compare: one vector iteration handles 64 elements on A2/A3.
 constexpr uint32_t QUERY_TILE = 64;      // output staging tile; wrapper allocates states_out padded to this.
+constexpr uint32_t REDUCE_WORK_SIZE = 128;
+constexpr uint32_t REDUCE_OUT_SIZE = 8;
 constexpr int32_t DEFAULT_NOT_FOUND = -1;
 constexpr uint32_t INVALID_REQ = 0xffffffffU;
 
@@ -59,14 +61,10 @@ __aicore__ inline uint32_t PickCoprimeA(uint32_t seed, uint32_t n)
     return a;
 }
 
-// Fill a local tile with the same query key. Duplicate() can replace this loop if you
-// prefer a pure vector fill path; the loop is kept here for wider CANN compatibility.
 __aicore__ inline void FillQueryTile(LocalTensor<int32_t>& queryTile, int32_t qk)
 {
-    for (uint32_t i = 0; i < TABLE_TILE; ++i) {
-        queryTile.SetValue(i, qk);
-    }
-    PipeBarrier<PIPE_ALL>();
+    Duplicate<int32_t>(queryTile, qk, TABLE_TILE);
+    PipeBarrier<PIPE_V>();
 }
 
 // Vector compare table_keys[tileBase:tileBase+TABLE_TILE] == qk, then use the bit mask
@@ -106,6 +104,29 @@ __aicore__ inline uint32_t FindKeyInTable(
     return TABLE_SIZE;  // sentinel: not found
 }
 
+__aicore__ inline uint32_t FindKeyInTableVector(
+    LocalTensor<int32_t>& tableKeysLocal,
+    LocalTensor<uint8_t>& cmpMask,
+    LocalTensor<float>& oneFlag,
+    LocalTensor<float>& hitFlag,
+    LocalTensor<float>& reduceOut,
+    LocalTensor<float>& reduceWork,
+    int32_t qk)
+{
+    CompareScalar<int32_t, uint8_t>(cmpMask, tableKeysLocal, qk, CMPMODE::EQ, TABLE_SIZE);
+    PipeBarrier<PIPE_V>();
+    Select<float, uint8_t>(hitFlag, cmpMask, oneFlag, 0.0f,
+                           SELMODE::VSEL_TENSOR_SCALAR_MODE, TABLE_SIZE);
+    PipeBarrier<PIPE_V>();
+    ReduceMax<float>(reduceOut, hitFlag, reduceWork, TABLE_SIZE, true);
+    PipeBarrier<PIPE_V>();
+
+    if (reduceOut.GetValue(0) == 0.0f) {
+        return TABLE_SIZE;
+    }
+    return reduceOut.ReinterpretCast<uint32_t>().GetValue(1);
+}
+
 class KernelHbmLookupVec {
 public:
     __aicore__ inline KernelHbmLookupVec() {}
@@ -133,8 +154,11 @@ public:
 
         pipe_->InitBuffer(tableKeysBuf_, TABLE_SIZE * sizeof(int32_t));
         pipe_->InitBuffer(tableStatesBuf_, TABLE_SIZE * sizeof(int32_t));
-        pipe_->InitBuffer(queryTileBuf_, TABLE_TILE * sizeof(int32_t));
-        pipe_->InitBuffer(cmpMaskBuf_, TABLE_TILE * sizeof(uint8_t));
+        pipe_->InitBuffer(cmpMaskBuf_, TABLE_SIZE * sizeof(uint8_t));
+        pipe_->InitBuffer(oneFlagBuf_, TABLE_SIZE * sizeof(float));
+        pipe_->InitBuffer(hitFlagBuf_, TABLE_SIZE * sizeof(float));
+        pipe_->InitBuffer(reduceOutBuf_, REDUCE_OUT_SIZE * sizeof(float));
+        pipe_->InitBuffer(reduceWorkBuf_, REDUCE_WORK_SIZE * sizeof(float));
         pipe_->InitBuffer(outTileBuf_, QUERY_TILE * sizeof(int32_t));
     }
 
@@ -147,10 +171,15 @@ public:
 
         auto tableKeysLocal = tableKeysBuf_.Get<int32_t>();
         auto tableStatesLocal = tableStatesBuf_.Get<int32_t>();
-        auto queryTile = queryTileBuf_.Get<int32_t>();
         auto cmpMask = cmpMaskBuf_.Get<uint8_t>();
+        auto oneFlag = oneFlagBuf_.Get<float>();
+        auto hitFlag = hitFlagBuf_.Get<float>();
+        auto reduceOut = reduceOutBuf_.Get<float>();
+        auto reduceWork = reduceWorkBuf_.Get<float>();
         auto outTile = outTileBuf_.Get<int32_t>();
 
+        Duplicate<float>(oneFlag, 1.0f, TABLE_SIZE);
+        PipeBarrier<PIPE_V>();
         uint32_t loadedReq = INVALID_REQ;
 
         for (uint32_t tileId = coreId; tileId < totalTileNum; tileId += blockNum) {
@@ -174,7 +203,8 @@ public:
                 int32_t outVal = notFound_;
                 if (i < valid) {
                     int32_t qk = queryKeysGm_.GetValue(queryBase + qBase + i);
-                    uint32_t hit = FindKeyInTable(tableKeysLocal, queryTile, cmpMask, qk);
+                    uint32_t hit = FindKeyInTableVector(
+                        tableKeysLocal, cmpMask, oneFlag, hitFlag, reduceOut, reduceWork, qk);
                     if (hit < TABLE_SIZE) {
                         outVal = tableStatesLocal.GetValue(hit);
                     }
@@ -193,8 +223,11 @@ private:
     TPipe* pipe_;
     TBuf<TPosition::VECIN> tableKeysBuf_;
     TBuf<TPosition::VECIN> tableStatesBuf_;
-    TBuf<TPosition::VECCALC> queryTileBuf_;
     TBuf<TPosition::VECCALC> cmpMaskBuf_;
+    TBuf<TPosition::VECCALC> oneFlagBuf_;
+    TBuf<TPosition::VECCALC> hitFlagBuf_;
+    TBuf<TPosition::VECCALC> reduceOutBuf_;
+    TBuf<TPosition::VECCALC> reduceWorkBuf_;
     TBuf<TPosition::VECOUT> outTileBuf_;
 
     GlobalTensor<int32_t> tableKeysGm_;

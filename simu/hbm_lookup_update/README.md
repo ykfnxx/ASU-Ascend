@@ -171,14 +171,14 @@ For kernel-internal profile, inspect the files generated under `--profile-dir`. 
 
 The implementation uses two kernels under one Python function. This is deliberate: the lookup kernel is multi-core, while the update kernel runs after lookup on the same stream. The update kernel parallelizes across requests, but each request's resident state table is updated sequentially by one core. This avoids relying on cross-AI-Core synchronization inside one kernel and avoids multi-core random writes to the same request's HBM state table.
 
-Lookup uses vector compare against the resident `table_keys`: each AI Core copies one request's 2K key/state table to UB, fills a 64-element query tile with the current query key, calls `Compare<int32_t, uint8_t>(..., CMPMODE::EQ, 64)`, then verifies candidate bytes and returns the corresponding state. For multi-request lookup, work is flattened as `req_id * ceil(Q / 64) + query_tile_id`. A core reloads the UB table only when its assigned work moves to another request.
+Lookup copies one request's 2K key/state table to UB and scans it with vector ops. For each query key, it runs `CompareScalar<int32_t, uint8_t>(..., CMPMODE::EQ, 2048)`, converts the compare mask to a 0/1 float flag vector with `Select`, then uses `ReduceMax(..., calIndex=true)` to return the first matching table index. Only the final index/state extraction stays scalar. For multi-request lookup, work is flattened as `req_id * ceil(Q / 64) + query_tile_id`. A core reloads the UB table only when its assigned work moves to another request.
 
 The update kernel copies each request's `table_keys/table_states` to UB, applies random updates to UB, and writes the entire 8KB `table_states[r]` back to HBM by `DataCopy`, avoiding `GlobalTensor::SetValue` DCache/cacheline visibility issues for the resident state table.
 
 ## Optimization notes for Ascend 910B modeling
 
 - Current lookup is scan-based: each query key performs up to 2048 key comparisons. This is easy to validate, but its cost scales as `O(R * Q * 2048)`.
-- The main overhead is scalar-heavy control around repeated vector compares: per-query tile fill, mask parsing, candidate verification, and frequent barriers. Replacing scalar tile fill with `Duplicate` or scalar-compare APIs should reduce overhead if supported by the target CANN version.
+- The lookup path is still scan-based, but the inner mask parsing and candidate verification have been moved from scalar loops to `Select`/`ReduceMax`. The remaining scalar work is query load, hit/miss branch, state load, and output staging.
 - If the real KVCache key space can be made dense or bucketed, a direct index or open-addressed hash table in HBM should be modeled next. That changes lookup from scanning 2K entries to a small fixed number of HBM loads.
 - For scan mode, keeping one request's 2K table in UB is a good fit: keys plus states are 16KB. Avoid caching multiple requests in UB unless the table format is compressed.
 - Update is intentionally per-request sequential. Parallelizing updates within the same request would need conflict handling for duplicate query keys and deterministic last-writer semantics.

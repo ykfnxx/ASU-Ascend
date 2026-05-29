@@ -104,8 +104,28 @@ bash run.sh -v Ascend910B3 -t
 Run benchmark after build:
 
 ```bash
-PYTHONPATH=$PWD/build:$PYTHONPATH REQ_NUM=4 QUERY_LEN=2048 BLOCK_DIM=8 ITERS=1000 python3 scripts/bench_lookup_update.py
+PYTHONPATH=$PWD/build:$PYTHONPATH \
+python3 scripts/bench_lookup_update.py \
+  --mode lookup \
+  --req-num 4 \
+  --query-len 2048 \
+  --block-dim 8 \
+  --iters 100
 ```
+
+Quick sweep without profiler:
+
+```bash
+PYTHONPATH=$PWD/build:$PYTHONPATH \
+python3 scripts/bench_lookup_update.py \
+  --mode lookup \
+  --req-num 4,8,16 \
+  --query-len 2048 \
+  --block-dim 8,16,32,64 \
+  --iters 50
+```
+
+`--mode lookup` runs lookup only, `--mode update` runs update only, and `--mode both` runs the combined `lookup_random_update` path.
 
 ## Profile lookup and update separately
 

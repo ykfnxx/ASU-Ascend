@@ -157,10 +157,15 @@ python3 scripts/profile_lookup_update.py \
   --warmup 20 \
   --iters 50 \
   --profile-dir ./profile_hbm_lookup_update \
-  --profiler-level level1
+  --profiler-level level2 \
+  --aic-metrics pipe
 ```
 
-When `--mode both` is used with `--profile-dir`, traces are written to separate `lookup/` and `update/` subdirectories. Increase `--profiler-level` or set `--aic-metrics` only when you need lower-level AI Core metrics, because detailed profiling can noticeably perturb kernel timing.
+When `--mode both` is used with `--profile-dir`, traces are written to separate `lookup/` and `update/` subdirectories. The script prints `host_ms_per_iter` and, when NPU events are available, `device_ms_per_iter`. Use `device_ms_per_iter` as the simple operator execution-time estimate.
+
+For kernel-internal profile, inspect the files generated under `--profile-dir`. `kernel_details.csv` is the main file for this project: it contains NPU task name, `Duration(us)`, `Block Dim`, accelerator core type, and AI Core metric columns when `--aic-metrics` is enabled. `trace_view.json` can be opened with TensorBoard, Chrome tracing, Perfetto, or MindStudio for timeline inspection.
+
+`--aic-metrics` selects one AI Core metric set per run: `pipe`, `arithmetic`, `memory`, `ub`, `l2cache`, or `resource`. For a quick simulation-level estimate, run once with `pipe`; rerun with `memory` or `ub` only if the first result suggests you need more detail.
 
 ## Design notes
 

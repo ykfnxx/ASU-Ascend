@@ -45,5 +45,7 @@ cmake -S . -B "${BUILD_DIR}" \
 cmake --build "${BUILD_DIR}" -j
 
 if [ "${RUN_TEST}" -eq 1 ]; then
-  PYTHONPATH="${PWD}/${BUILD_DIR}:${PYTHONPATH:-}" ${PYTHON_BIN} scripts/test_lookup_update.py
+  LD_LIBRARY_PATH="${PWD}/${BUILD_DIR}/lib:${PWD}/${BUILD_DIR}:${LD_LIBRARY_PATH:-}" \
+  PYTHONPATH="${PWD}/${BUILD_DIR}:${PYTHONPATH:-}" \
+    ${PYTHON_BIN} scripts/test_lookup_update.py
 fi

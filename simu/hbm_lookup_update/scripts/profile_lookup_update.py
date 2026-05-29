@@ -1,4 +1,5 @@
 import argparse
+import ctypes
 import os
 import sys
 import time
@@ -6,11 +7,12 @@ from contextlib import nullcontext
 
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+KERNEL_LIB_NAME = "libhbm_lookup_update_kernels_npu.so"
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Profile hbm_lookup_update lookup-only and update-only kernels.")
+        description="Time/profile hbm_lookup_update lookup-only and update-only kernels.")
     parser.add_argument("--mode", choices=("lookup", "update", "both"),
                         default="both", help="Which kernel path to run.")
     parser.add_argument("--req-num", type=int, default=4,
@@ -32,7 +34,7 @@ def parse_args():
     parser.add_argument("--build-dir", default=os.environ.get("BUILD_DIR", os.path.join(ROOT, "build")),
                         help="Directory containing the built hbm_lookup_update extension.")
     parser.add_argument("--profile-dir", default=None,
-                        help="If set, write torch_npu profiler traces under this directory.")
+                        help="If set, write torch_npu profiler output under this directory.")
     parser.add_argument("--profiler-level", default="level1",
                         choices=("none", "level0", "level1", "level2"),
                         help="torch_npu profiler detail level when --profile-dir is set.")
@@ -43,14 +45,19 @@ def parse_args():
 
 
 def import_runtime(build_dir):
+    build_dir = os.path.abspath(build_dir)
     if build_dir not in sys.path:
         sys.path.insert(0, build_dir)
 
     import numpy as np
     import torch
     import torch_npu
-    import hbm_lookup_update
 
+    kernel_lib = os.path.join(build_dir, "lib", KERNEL_LIB_NAME)
+    if os.path.exists(kernel_lib):
+        ctypes.CDLL(kernel_lib, mode=ctypes.RTLD_GLOBAL)
+
+    import hbm_lookup_update
     return np, torch, torch_npu, hbm_lookup_update
 
 
@@ -95,13 +102,11 @@ def profiler_context(torch_npu, profile_dir, profiler_level, aic_metrics):
 
     os.makedirs(profile_dir, exist_ok=True)
     profiler = torch_npu.profiler
-
-    activities = [
-        profiler.ProfilerActivity.CPU,
-        profiler.ProfilerActivity.NPU,
-    ]
     kwargs = {
-        "activities": activities,
+        "activities": [
+            profiler.ProfilerActivity.CPU,
+            profiler.ProfilerActivity.NPU,
+        ],
         "with_stack": False,
         "profile_memory": False,
         "with_modules": False,
@@ -110,7 +115,6 @@ def profiler_context(torch_npu, profile_dir, profiler_level, aic_metrics):
 
     experimental_config_cls = getattr(profiler, "_ExperimentalConfig", None)
     if experimental_config_cls is not None:
-        export_type = enum_value(getattr(profiler, "ExportType", None), {"level": "Text"}, "level")
         level = enum_value(
             getattr(profiler, "ProfilerLevel", None),
             {
@@ -134,6 +138,7 @@ def profiler_context(torch_npu, profile_dir, profiler_level, aic_metrics):
             },
             aic_metrics,
         )
+        export_type = getattr(getattr(profiler, "ExportType", None), "Text", None)
 
         config_kwargs = {
             "msprof_tx": False,
@@ -153,8 +158,40 @@ def profiler_context(torch_npu, profile_dir, profiler_level, aic_metrics):
     return profiler.profile(**kwargs)
 
 
-def synchronize(torch):
+def make_event_pair(torch):
+    event_cls = getattr(torch.npu, "Event", None)
+    if event_cls is None:
+        return None, None
+    try:
+        return event_cls(enable_timing=True), event_cls(enable_timing=True)
+    except TypeError:
+        return event_cls(), event_cls()
+    except Exception:
+        return None, None
+
+
+def time_loop(torch, iters, body):
     torch.npu.synchronize()
+    start_event, end_event = make_event_pair(torch)
+    if start_event is not None:
+        start_event.record()
+    host_start = time.perf_counter()
+
+    for i in range(iters):
+        body(i)
+
+    if end_event is not None:
+        end_event.record()
+    torch.npu.synchronize()
+    host_elapsed = time.perf_counter() - host_start
+
+    device_elapsed_ms = None
+    if start_event is not None and end_event is not None:
+        try:
+            device_elapsed_ms = start_event.elapsed_time(end_event)
+        except Exception:
+            device_elapsed_ms = None
+    return host_elapsed, device_elapsed_ms
 
 
 def warmup_lookup(hbm_lookup_update, torch, table_keys, table_states, query_keys, args):
@@ -162,17 +199,17 @@ def warmup_lookup(hbm_lookup_update, torch, table_keys, table_states, query_keys
         hbm_lookup_update.lookup_only(
             table_keys, table_states, query_keys,
             block_dim=args.block_dim, not_found=-1)
-    synchronize(torch)
+    torch.npu.synchronize()
 
 
 def measure_lookup(hbm_lookup_update, torch, table_keys, table_states, query_keys, args):
-    start = time.perf_counter()
-    for _ in range(args.iters):
-        hbm_lookup_update.lookup_only(
+    return time_loop(
+        torch,
+        args.iters,
+        lambda _i: hbm_lookup_update.lookup_only(
             table_keys, table_states, query_keys,
-            block_dim=args.block_dim, not_found=-1)
-    synchronize(torch)
-    return time.perf_counter() - start
+            block_dim=args.block_dim, not_found=-1),
+    )
 
 
 def warmup_update(hbm_lookup_update, torch, table_keys, table_states, query_keys, new_states, args):
@@ -181,21 +218,22 @@ def warmup_update(hbm_lookup_update, torch, table_keys, table_states, query_keys
             table_keys, table_states, query_keys, new_states,
             seed=args.seed + i, update_percent=args.update_percent,
             block_dim=args.block_dim)
-    synchronize(torch)
+    torch.npu.synchronize()
 
 
 def measure_update(hbm_lookup_update, torch, table_keys, table_states, query_keys, new_states, args):
-    start = time.perf_counter()
-    for i in range(args.iters):
-        hbm_lookup_update.update_only(
+    return time_loop(
+        torch,
+        args.iters,
+        lambda i: hbm_lookup_update.update_only(
             table_keys, table_states, query_keys, new_states,
             seed=args.seed + args.warmup + i,
-            update_percent=args.update_percent, block_dim=args.block_dim)
-    synchronize(torch)
-    return time.perf_counter() - start
+            update_percent=args.update_percent,
+            block_dim=args.block_dim),
+    )
 
 
-def print_result(mode, elapsed, args, profile_dir):
+def print_result(mode, host_elapsed, device_elapsed_ms, args, profile_dir):
     lookup_count = args.iters * args.req_num * args.query_len
     update_count = args.iters * args.req_num * ((args.query_len * args.update_percent) // 100)
     work_count = lookup_count if mode == "lookup" else update_count
@@ -205,13 +243,23 @@ def print_result(mode, elapsed, args, profile_dir):
     print(
         f"req_num={args.req_num} query_len={args.query_len} "
         f"block_dim={args.block_dim} update_percent={args.update_percent}")
-    print(f"iters={args.iters} elapsed={elapsed:.6f}s ms_per_iter={elapsed * 1000.0 / args.iters:.6f}")
-    if work_count > 0:
-        print(f"{qps_name}={work_count / elapsed:.3f}")
+    print(f"iters={args.iters} host_ms_per_iter={host_elapsed * 1000.0 / args.iters:.6f}")
+
+    if device_elapsed_ms is None:
+        print("device_ms_per_iter=unavailable")
     else:
-        print(f"{qps_name}=0.000")
+        print(f"device_ms_per_iter={device_elapsed_ms / args.iters:.6f}")
+
+    if work_count > 0:
+        print(f"{qps_name}_host={work_count / host_elapsed:.3f}")
+        if device_elapsed_ms is not None and device_elapsed_ms > 0.0:
+            print(f"{qps_name}_device={work_count / (device_elapsed_ms / 1000.0):.3f}")
+    else:
+        print(f"{qps_name}_host=0.000")
+
     if profile_dir:
         print(f"profile_dir={profile_dir}")
+        print("profile_hint=check kernel_details.csv and trace_view.json under profile_dir")
 
 
 def main():
@@ -234,14 +282,17 @@ def main():
             warmup_update(
                 hbm_lookup_update, torch, table_keys, table_states, query_keys, new_states, args)
 
-        with profiler_context(torch_npu, mode_profile_dir, args.profiler_level, args.aic_metrics):
+        with profiler_context(torch_npu, mode_profile_dir, args.profiler_level, args.aic_metrics) as prof:
             if mode == "lookup":
-                elapsed = measure_lookup(
+                host_elapsed, device_elapsed_ms = measure_lookup(
                     hbm_lookup_update, torch, table_keys, table_states, query_keys, args)
             else:
-                elapsed = measure_update(
+                host_elapsed, device_elapsed_ms = measure_update(
                     hbm_lookup_update, torch, table_keys, table_states, query_keys, new_states, args)
-        print_result(mode, elapsed, args, mode_profile_dir)
+            if prof is not None and hasattr(prof, "step"):
+                prof.step()
+
+        print_result(mode, host_elapsed, device_elapsed_ms, args, mode_profile_dir)
 
 
 if __name__ == "__main__":

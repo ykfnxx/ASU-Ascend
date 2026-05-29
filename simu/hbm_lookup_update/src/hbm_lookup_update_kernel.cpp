@@ -7,6 +7,7 @@ constexpr uint32_t TABLE_SIZE = 2048;
 constexpr uint32_t TABLE_TILE = 64;      // int32 compare: one vector iteration handles 64 elements on A2/A3.
 constexpr uint32_t QUERY_TILE = 64;      // output staging tile; wrapper allocates states_out padded to this.
 constexpr int32_t DEFAULT_NOT_FOUND = -1;
+constexpr uint32_t INVALID_REQ = 0xffffffffU;
 
 __aicore__ inline uint32_t CeilDivU32(uint32_t x, uint32_t y) {
     return (x + y - 1U) / y;
@@ -114,19 +115,21 @@ public:
         GM_ADDR tableStates,
         GM_ADDR queryKeys,
         GM_ADDR statesOut,
+        uint32_t reqNum,
         uint32_t queryLen,
         int32_t notFound,
         TPipe* pipe)
     {
+        reqNum_ = reqNum;
         queryLen_ = queryLen;
         paddedQueryLen_ = AlignUpU32(queryLen_, QUERY_TILE);
         notFound_ = notFound;
         pipe_ = pipe;
 
-        tableKeysGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(tableKeys), TABLE_SIZE);
-        tableStatesGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(tableStates), TABLE_SIZE);
-        queryKeysGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(queryKeys), queryLen_);
-        statesOutGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(statesOut), paddedQueryLen_);
+        tableKeysGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(tableKeys), reqNum_ * TABLE_SIZE);
+        tableStatesGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(tableStates), reqNum_ * TABLE_SIZE);
+        queryKeysGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(queryKeys), reqNum_ * queryLen_);
+        statesOutGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(statesOut), reqNum_ * paddedQueryLen_);
 
         pipe_->InitBuffer(tableKeysBuf_, TABLE_SIZE * sizeof(int32_t));
         pipe_->InitBuffer(tableStatesBuf_, TABLE_SIZE * sizeof(int32_t));
@@ -140,6 +143,7 @@ public:
         uint32_t coreId = GetBlockIdx();
         uint32_t blockNum = GetBlockNum();
         uint32_t queryTileNum = CeilDivU32(queryLen_, QUERY_TILE);
+        uint32_t totalTileNum = reqNum_ * queryTileNum;
 
         auto tableKeysLocal = tableKeysBuf_.Get<int32_t>();
         auto tableStatesLocal = tableStatesBuf_.Get<int32_t>();
@@ -147,19 +151,29 @@ public:
         auto cmpMask = cmpMaskBuf_.Get<uint8_t>();
         auto outTile = outTileBuf_.Get<int32_t>();
 
-        // Each AI Core keeps a UB copy of the 2K resident index and states for vector compare.
-        DataCopy(tableKeysLocal, tableKeysGm_, TABLE_SIZE);
-        DataCopy(tableStatesLocal, tableStatesGm_, TABLE_SIZE);
-        PipeBarrier<PIPE_ALL>();
+        uint32_t loadedReq = INVALID_REQ;
 
-        for (uint32_t tileId = coreId; tileId < queryTileNum; tileId += blockNum) {
-            uint32_t qBase = tileId * QUERY_TILE;
+        for (uint32_t tileId = coreId; tileId < totalTileNum; tileId += blockNum) {
+            uint32_t reqId = tileId / queryTileNum;
+            uint32_t reqTileId = tileId - reqId * queryTileNum;
+            uint32_t qBase = reqTileId * QUERY_TILE;
             uint32_t valid = MinU32(QUERY_TILE, queryLen_ - qBase);
+            uint32_t tableBase = reqId * TABLE_SIZE;
+            uint32_t queryBase = reqId * queryLen_;
+            uint32_t outBase = reqId * paddedQueryLen_;
+
+            if (reqId != loadedReq) {
+                // Each AI Core keeps one req's 2K resident index and states in UB.
+                DataCopy(tableKeysLocal, tableKeysGm_[tableBase], TABLE_SIZE);
+                DataCopy(tableStatesLocal, tableStatesGm_[tableBase], TABLE_SIZE);
+                PipeBarrier<PIPE_ALL>();
+                loadedReq = reqId;
+            }
 
             for (uint32_t i = 0; i < QUERY_TILE; ++i) {
                 int32_t outVal = notFound_;
                 if (i < valid) {
-                    int32_t qk = queryKeysGm_.GetValue(qBase + i);
+                    int32_t qk = queryKeysGm_.GetValue(queryBase + qBase + i);
                     uint32_t hit = FindKeyInTable(tableKeysLocal, queryTile, cmpMask, qk);
                     if (hit < TABLE_SIZE) {
                         outVal = tableStatesLocal.GetValue(hit);
@@ -171,7 +185,7 @@ public:
             PipeBarrier<PIPE_ALL>();
             // statesOut is allocated padded to QUERY_TILE in the pybind wrapper.
             // DataCopy avoids multi-core GlobalTensor::SetValue DCache/cacheline hazards.
-            DataCopy(statesOutGm_[qBase], outTile, QUERY_TILE);
+            DataCopy(statesOutGm_[outBase + qBase], outTile, QUERY_TILE);
         }
     }
 
@@ -188,6 +202,7 @@ private:
     GlobalTensor<int32_t> queryKeysGm_;
     GlobalTensor<int32_t> statesOutGm_;
 
+    uint32_t reqNum_;
     uint32_t queryLen_;
     uint32_t paddedQueryLen_;
     int32_t notFound_;
@@ -202,20 +217,22 @@ public:
         GM_ADDR tableStates,
         GM_ADDR queryKeys,
         GM_ADDR newStates,
+        uint32_t reqNum,
         uint32_t queryLen,
         uint32_t seed,
         uint32_t updatePercent,
         TPipe* pipe)
     {
+        reqNum_ = reqNum;
         queryLen_ = queryLen;
         seed_ = seed;
         updatePercent_ = updatePercent;
         pipe_ = pipe;
 
-        tableKeysGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(tableKeys), TABLE_SIZE);
-        tableStatesGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(tableStates), TABLE_SIZE);
-        queryKeysGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(queryKeys), queryLen_);
-        newStatesGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(newStates), queryLen_);
+        tableKeysGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(tableKeys), reqNum_ * TABLE_SIZE);
+        tableStatesGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(tableStates), reqNum_ * TABLE_SIZE);
+        queryKeysGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(queryKeys), reqNum_ * queryLen_);
+        newStatesGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(newStates), reqNum_ * queryLen_);
 
         pipe_->InitBuffer(tableKeysBuf_, TABLE_SIZE * sizeof(int32_t));
         pipe_->InitBuffer(tableStatesInBuf_, TABLE_SIZE * sizeof(int32_t));
@@ -227,8 +244,7 @@ public:
 
     __aicore__ inline void Process()
     {
-        // The update kernel is launched with blockDim=1 from Python. Keep this guard for safety.
-        if (GetBlockIdx() != 0U || queryLen_ == 0U || updatePercent_ == 0U) {
+        if (queryLen_ == 0U || updatePercent_ == 0U) {
             return;
         }
 
@@ -239,12 +255,6 @@ public:
         auto queryTile = queryTileBuf_.Get<int32_t>();
         auto cmpMask = cmpMaskBuf_.Get<uint8_t>();
 
-        DataCopy(tableKeysLocal, tableKeysGm_, TABLE_SIZE);
-        DataCopy(tableStatesInLocal, tableStatesGm_, TABLE_SIZE);
-        PipeBarrier<PIPE_ALL>();
-        DataCopy(tableStatesCalcLocal, tableStatesInLocal, TABLE_SIZE);
-        PipeBarrier<PIPE_ALL>();
-
         uint32_t updateNum = (queryLen_ * updatePercent_) / 100U;
         if (updateNum > queryLen_) {
             updateNum = queryLen_;
@@ -253,26 +263,41 @@ public:
             return;
         }
 
-        uint32_t a = PickCoprimeA(seed_ ^ 0x9e3779b9U, queryLen_);
-        uint32_t b = Hash32(seed_ ^ 0x85ebca6bU) % queryLen_;
+        uint32_t coreId = GetBlockIdx();
+        uint32_t blockNum = GetBlockNum();
 
-        for (uint32_t t = 0; t < updateNum; ++t) {
-            // Because a and queryLen are coprime, positions are unique for t in [0, queryLen).
-            uint32_t pos = (static_cast<uint64_t>(a) * t + b) % queryLen_;
-            int32_t key = queryKeysGm_.GetValue(pos);
-            int32_t newVal = newStatesGm_.GetValue(pos);
+        for (uint32_t reqId = coreId; reqId < reqNum_; reqId += blockNum) {
+            uint32_t tableBase = reqId * TABLE_SIZE;
+            uint32_t queryBase = reqId * queryLen_;
 
-            uint32_t hit = FindKeyInTable(tableKeysLocal, queryTile, cmpMask, key);
-            if (hit < TABLE_SIZE) {
-                tableStatesCalcLocal.SetValue(hit, newVal);
+            DataCopy(tableKeysLocal, tableKeysGm_[tableBase], TABLE_SIZE);
+            DataCopy(tableStatesInLocal, tableStatesGm_[tableBase], TABLE_SIZE);
+            PipeBarrier<PIPE_ALL>();
+            DataCopy(tableStatesCalcLocal, tableStatesInLocal, TABLE_SIZE);
+            PipeBarrier<PIPE_ALL>();
+
+            uint32_t reqSeed = seed_ ^ Hash32(reqId);
+            uint32_t a = PickCoprimeA(reqSeed ^ 0x9e3779b9U, queryLen_);
+            uint32_t b = Hash32(reqSeed ^ 0x85ebca6bU) % queryLen_;
+
+            for (uint32_t t = 0; t < updateNum; ++t) {
+                // Because a and queryLen are coprime, positions are unique for t in [0, queryLen).
+                uint32_t pos = (static_cast<uint64_t>(a) * t + b) % queryLen_;
+                int32_t key = queryKeysGm_.GetValue(queryBase + pos);
+                int32_t newVal = newStatesGm_.GetValue(queryBase + pos);
+
+                uint32_t hit = FindKeyInTable(tableKeysLocal, queryTile, cmpMask, key);
+                if (hit < TABLE_SIZE) {
+                    tableStatesCalcLocal.SetValue(hit, newVal);
+                }
             }
-        }
 
-        PipeBarrier<PIPE_ALL>();
-        // Write back the whole resident state table by DMA. The table is only 8KB.
-        DataCopy(tableStatesOutLocal, tableStatesCalcLocal, TABLE_SIZE);
-        PipeBarrier<PIPE_ALL>();
-        DataCopy(tableStatesGm_, tableStatesOutLocal, TABLE_SIZE);
+            PipeBarrier<PIPE_ALL>();
+            // Write back the whole resident state table by DMA. The table is only 8KB.
+            DataCopy(tableStatesOutLocal, tableStatesCalcLocal, TABLE_SIZE);
+            PipeBarrier<PIPE_ALL>();
+            DataCopy(tableStatesGm_[tableBase], tableStatesOutLocal, TABLE_SIZE);
+        }
     }
 
 private:
@@ -289,6 +314,7 @@ private:
     GlobalTensor<int32_t> queryKeysGm_;
     GlobalTensor<int32_t> newStatesGm_;
 
+    uint32_t reqNum_;
     uint32_t queryLen_;
     uint32_t seed_;
     uint32_t updatePercent_;
@@ -300,12 +326,13 @@ extern "C" __global__ __aicore__ void hbm_lookup_vec(
     GM_ADDR tableStates,
     GM_ADDR queryKeys,
     GM_ADDR statesOut,
+    uint32_t reqNum,
     uint32_t queryLen,
     int32_t notFound)
 {
     TPipe pipe;
     KernelHbmLookupVec op;
-    op.Init(tableKeys, tableStates, queryKeys, statesOut, queryLen, notFound, &pipe);
+    op.Init(tableKeys, tableStates, queryKeys, statesOut, reqNum, queryLen, notFound, &pipe);
     op.Process();
 }
 
@@ -314,13 +341,14 @@ extern "C" __global__ __aicore__ void hbm_random_update(
     GM_ADDR tableStates,
     GM_ADDR queryKeys,
     GM_ADDR newStates,
+    uint32_t reqNum,
     uint32_t queryLen,
     uint32_t seed,
     uint32_t updatePercent)
 {
     TPipe pipe;
     KernelHbmRandomUpdate op;
-    op.Init(tableKeys, tableStates, queryKeys, newStates, queryLen, seed, updatePercent, &pipe);
+    op.Init(tableKeys, tableStates, queryKeys, newStates, reqNum, queryLen, seed, updatePercent, &pipe);
     op.Process();
 }
 
@@ -333,12 +361,13 @@ extern "C" void hbm_lookup_vec_do(
     void* tableStates,
     void* queryKeys,
     void* statesOut,
+    uint32_t reqNum,
     uint32_t queryLen,
     int32_t notFound)
 {
 #ifndef ASCENDC_CPU_DEBUG
     hbm_lookup_vec<<<blockDim, nullptr, stream>>>(tableKeys, tableStates, queryKeys,
-                                                  statesOut, queryLen, notFound);
+                                                  statesOut, reqNum, queryLen, notFound);
 #endif
 }
 
@@ -349,13 +378,14 @@ extern "C" void hbm_random_update_do(
     void* tableStates,
     void* queryKeys,
     void* newStates,
+    uint32_t reqNum,
     uint32_t queryLen,
     uint32_t seed,
     uint32_t updatePercent)
 {
 #ifndef ASCENDC_CPU_DEBUG
     hbm_random_update<<<blockDim, nullptr, stream>>>(tableKeys, tableStates, queryKeys,
-                                                     newStates, queryLen, seed,
+                                                     newStates, reqNum, queryLen, seed,
                                                      updatePercent);
 #endif
 }

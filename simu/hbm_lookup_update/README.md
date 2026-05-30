@@ -7,7 +7,7 @@
 - `lookup`：按每个 req 一张全量 token 索引表，从 HBM 中查询 `key -> state`。
 - `update`：按一定比例把查询到的 token 对应 state 原地更新。
 - 每个 req 的索引长度固定为 `128K`，模拟全量 token 粒度索引。
-- `query_keys` 模拟 DSA indexer 输出的 token id，脚本里用有效偏移生成。
+- `query_keys` 模拟 DSA indexer 输出的 token id，脚本里用连续有效偏移生成。
 
 ## 语义
 
@@ -66,7 +66,7 @@ for r in 0..R-1:
 - key/state dtype 固定为 `int32`。
 - 每个 req 的 index size 固定为 `128K`。
 - 当前脚本生成的 `table_keys` 是 `arange(128K)`，但 kernel 不读取它。
-- 输入侧保证 `query_keys` 有效，即 `0 <= key < 128K`。
+- 当前 lookup 的 gather 路径假设每个 64-query tile 内 key 落在连续窗口内，且该 64 元素 state window 不越界。
 
 ## 目录结构
 
@@ -212,7 +212,7 @@ python3 scripts/profile_lookup_update.py \
 
 ## 当前实现
 
-lookup 不再做全表 compare，也不再做 UB gather。kernel 直接把 `query_keys` 当成有效 token id，从对应 req 的 `table_states` 读取 state 并写入输出 tile：
+lookup 不再做全表 compare，而是直接把 `query_keys` 当成 token id。每个 query tile 会先把一段连续 `table_states` window 搬到 UB，再用 AscendC `Gather` 根据 key offset 取 state：
 
 ```text
 state = table_states[req, query_keys[req, i]]
@@ -220,9 +220,9 @@ state = table_states[req, query_keys[req, i]]
 
 这更贴近当前要摸测的 IO 形式：
 
-- 每个 query 读取 1 个 `query_key`。
-- 每个 query 读取 1 个 `table_state`。
-- 每个 64-query tile 用一次 `DataCopy` 写回输出。
+- 每个 64-query tile 读取一段连续 `query_key`。
+- 每个 64-query tile 读取一段连续 `table_state` window。
+- UB 内通过 `Gather` 生成输出 `state` tile。
 
 update 也不再把整张 state 表搬到 UB 再写回，而是对选中的 query 位置做随机写：
 
@@ -231,6 +231,8 @@ table_states[req, query_key] = new_state
 ```
 
 因此当前 profile 主要反映 128K token 粒度索引下的 GM 随机读写开销，不再反映 vector full-table compare 的开销。
+
+注意：AscendC `Scatter` 基础 API 在 CANN 8.5 的 A2/910B 系列上不支持，因此 update 当前只按 scatter-style 的 GM random write 建模。
 
 ## Tile 和 core 调度
 

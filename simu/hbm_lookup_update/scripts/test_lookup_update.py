@@ -92,7 +92,10 @@ def run_single_req_case():
     table_states_cpu = (token_ids.astype(np.int64) * 10 + 7).astype(np.int32)
 
     query_len = 512
-    query_cpu = (23 + np.arange(query_len, dtype=np.int32)).astype(np.int32)
+    query_cpu = (
+        np.arange(query_len, dtype=np.int64) * 17 + 23
+    ) % INDEX_SIZE
+    query_cpu = query_cpu.astype(np.int32)
     new_states_cpu = (100000 + np.arange(query_len, dtype=np.int32)).astype(np.int32)
 
     seed = 42
@@ -146,8 +149,9 @@ def run_multi_req_case():
             token_ids.astype(np.int64) * 13 + 1000 * req_id + 17
         ).astype(np.int32)
         query_cpu[req_id] = (
-            req_id * 2048 + 7 + np.arange(query_len, dtype=np.int32)
-        ).astype(np.int32)
+            np.arange(query_len, dtype=np.int64) * 19 + req_id * 101 + 7
+        ) % INDEX_SIZE
+        query_cpu[req_id] = query_cpu[req_id].astype(np.int32)
         new_states_cpu[req_id] = (
             200000 + 10000 * req_id + np.arange(query_len, dtype=np.int32)
         ).astype(np.int32)

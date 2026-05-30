@@ -47,24 +47,20 @@ def import_runtime(build_dir):
 
 
 def make_inputs(np, torch, req_num, query_len, seed):
-    padded_query_len = ((query_len + 63) // 64) * 64
-    if padded_query_len > INDEX_SIZE:
-        raise ValueError("query_len must be <= 128K for the contiguous-key simulation")
-
     token_ids = np.arange(INDEX_SIZE, dtype=np.int32)
     table_keys_cpu = np.empty((req_num, INDEX_SIZE), dtype=np.int32)
     table_states_cpu = np.empty((req_num, INDEX_SIZE), dtype=np.int32)
     query_cpu = np.empty((req_num, query_len), dtype=np.int32)
     new_states_cpu = np.empty((req_num, query_len), dtype=np.int32)
-    start_limit = INDEX_SIZE - padded_query_len + 1
 
     for req_id in range(req_num):
         table_keys_cpu[req_id] = token_ids
         table_states_cpu[req_id] = (
             token_ids.astype(np.int64) + req_id * INDEX_SIZE
         ).astype(np.int32)
-        start = (seed + req_id * 257) % start_limit
-        query_cpu[req_id] = start + np.arange(query_len, dtype=np.int32)
+        query_cpu[req_id] = (
+            np.arange(query_len, dtype=np.int64) * 17 + seed + req_id * 257
+        ) % INDEX_SIZE
         new_states_cpu[req_id] = (
             777000 + 10000 * req_id + np.arange(query_len, dtype=np.int32)
         ).astype(np.int32)

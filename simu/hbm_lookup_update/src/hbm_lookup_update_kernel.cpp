@@ -81,9 +81,6 @@ public:
         queryKeysGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(queryKeys), reqNum_ * queryLen_);
         statesOutGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(statesOut), reqNum_ * paddedQueryLen_);
 
-        pipe_->InitBuffer(queryTileBuf_, QUERY_TILE * sizeof(int32_t));
-        pipe_->InitBuffer(stateWindowBuf_, QUERY_TILE * sizeof(int32_t));
-        pipe_->InitBuffer(offsetTileBuf_, QUERY_TILE * sizeof(uint32_t));
         pipe_->InitBuffer(outTileBuf_, QUERY_TILE * sizeof(int32_t));
     }
 
@@ -94,13 +91,7 @@ public:
         uint32_t queryTileNum = CeilDivU32(queryLen_, QUERY_TILE);
         uint32_t totalTileNum = reqNum_ * queryTileNum;
 
-        auto queryTile = queryTileBuf_.Get<int32_t>();
-        auto stateWindow = stateWindowBuf_.Get<int32_t>();
-        auto offsetTile = offsetTileBuf_.Get<uint32_t>();
         auto outTile = outTileBuf_.Get<int32_t>();
-        queryTile.SetSize(QUERY_TILE);
-        stateWindow.SetSize(QUERY_TILE);
-        offsetTile.SetSize(QUERY_TILE);
         outTile.SetSize(QUERY_TILE);
 
         for (uint32_t tileId = coreId; tileId < totalTileNum; tileId += blockNum) {
@@ -112,24 +103,16 @@ public:
             uint32_t queryBase = reqId * queryLen_;
             uint32_t outBase = reqId * paddedQueryLen_;
 
-            if (valid == QUERY_TILE) {
-                DataCopy(queryTile, queryKeysGm_[queryBase + qBase], QUERY_TILE);
-                PipeBarrier<PIPE_ALL>();
-            } else {
-                for (uint32_t i = 0; i < valid; ++i) {
-                    queryTile.SetValue(i, queryKeysGm_.GetValue(queryBase + qBase + i));
+            for (uint32_t i = 0; i < QUERY_TILE; ++i) {
+                int32_t outVal = 0;
+                if (i < valid) {
+                    uint32_t key = static_cast<uint32_t>(
+                        queryKeysGm_.GetValue(queryBase + qBase + i));
+                    outVal = tableStatesGm_.GetValue(indexBase + key);
                 }
+                outTile.SetValue(i, outVal);
             }
 
-            uint32_t baseKey = static_cast<uint32_t>(queryTile.GetValue(0));
-            DataCopy(stateWindow, tableStatesGm_[indexBase + baseKey], QUERY_TILE);
-            for (uint32_t i = 0; i < valid; ++i) {
-                uint32_t key = static_cast<uint32_t>(queryTile.GetValue(i));
-                offsetTile.SetValue(i, (key - baseKey) * sizeof(int32_t));
-            }
-
-            PipeBarrier<PIPE_ALL>();
-            Gather<int32_t>(outTile, stateWindow, offsetTile, 0, valid);
             PipeBarrier<PIPE_ALL>();
             // statesOut is allocated padded to QUERY_TILE in the pybind wrapper.
             // DataCopy avoids multi-core GlobalTensor::SetValue DCache/cacheline hazards.
@@ -139,9 +122,6 @@ public:
 
 private:
     TPipe* pipe_;
-    TBuf<TPosition::VECIN> queryTileBuf_;
-    TBuf<TPosition::VECIN> stateWindowBuf_;
-    TBuf<TPosition::VECCALC> offsetTileBuf_;
     TBuf<TPosition::VECOUT> outTileBuf_;
 
     GlobalTensor<int32_t> tableStatesGm_;

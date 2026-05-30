@@ -1,7 +1,7 @@
 import math
 import os
 import sys
-from typing import Dict, List
+from typing import List
 
 import numpy as np
 import torch
@@ -15,7 +15,7 @@ if BUILD_DIR not in sys.path:
 
 import hbm_lookup_update  # noqa: E402
 
-TABLE_SIZE = 2048
+INDEX_SIZE = 128 * 1024
 NOT_FOUND = -1
 
 
@@ -56,24 +56,15 @@ def update_positions(query_len: int, seed: int, update_percent: int, req_id: int
     return [((a * t + b) % query_len) for t in range(update_num)]
 
 
-def first_key_to_idx(table_keys_cpu: np.ndarray) -> Dict[int, int]:
-    key_to_idx: Dict[int, int] = {}
-    for i, key in enumerate(table_keys_cpu):
-        key_to_idx.setdefault(int(key), int(i))
-    return key_to_idx
-
-
 def expected_lookup_update(
-    table_keys_cpu: np.ndarray,
     table_states_cpu: np.ndarray,
     query_cpu: np.ndarray,
     new_states_cpu: np.ndarray,
     seed: int,
     update_percent: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    single_req = table_keys_cpu.ndim == 1
-    table_keys_2d = table_keys_cpu.reshape(1, TABLE_SIZE) if single_req else table_keys_cpu
-    table_states_2d = table_states_cpu.reshape(1, TABLE_SIZE) if single_req else table_states_cpu
+    single_req = table_states_cpu.ndim == 1
+    table_states_2d = table_states_cpu.reshape(1, INDEX_SIZE) if single_req else table_states_cpu
     query_2d = query_cpu.reshape(1, query_cpu.shape[-1]) if single_req else query_cpu
     new_states_2d = new_states_cpu.reshape(1, new_states_cpu.shape[-1]) if single_req else new_states_cpu
 
@@ -82,38 +73,38 @@ def expected_lookup_update(
     expected_states = table_states_2d.copy()
 
     for req_id in range(req_num):
-        key_to_idx = first_key_to_idx(table_keys_2d[req_id])
         for i, qk in enumerate(query_2d[req_id]):
-            idx = key_to_idx.get(int(qk))
-            expected_out[req_id, i] = NOT_FOUND if idx is None else table_states_2d[req_id, idx]
+            key = int(qk)
+            expected_out[req_id, i] = table_states_2d[req_id, key] if 0 <= key < INDEX_SIZE else NOT_FOUND
 
         for pos in update_positions(query_len, seed, update_percent, req_id):
-            qk = int(query_2d[req_id, pos])
-            idx = key_to_idx.get(qk)
-            if idx is not None:
-                expected_states[req_id, idx] = new_states_2d[req_id, pos]
+            key = int(query_2d[req_id, pos])
+            if 0 <= key < INDEX_SIZE:
+                expected_states[req_id, key] = new_states_2d[req_id, pos]
 
     if single_req:
         return expected_out.reshape(query_cpu.shape), expected_states.reshape(table_states_cpu.shape)
     return expected_out, expected_states
 
 
-def run_single_req_case(rng: np.random.Generator):
-    # table_keys is deliberately shuffled to prove this is comparison-based lookup,
-    # not table_states[query_key] dense indexing.
-    table_keys_cpu = rng.permutation(np.arange(TABLE_SIZE, dtype=np.int32)).astype(np.int32)
-    table_states_cpu = (table_keys_cpu.astype(np.int64) * 10 + 7).astype(np.int32)
+def run_single_req_case():
+    token_ids = np.arange(INDEX_SIZE, dtype=np.int32)
+    table_keys_cpu = token_ids.copy()
+    table_states_cpu = (token_ids.astype(np.int64) * 10 + 7).astype(np.int32)
 
     query_len = 512
-    query_cpu = rng.choice(np.arange(TABLE_SIZE, dtype=np.int32), size=query_len, replace=True).astype(np.int32)
+    query_cpu = (
+        np.arange(query_len, dtype=np.int64) * 17 + 23
+    ).astype(np.int64) % INDEX_SIZE
+    query_cpu = query_cpu.astype(np.int32)
     # Add several misses.
-    query_cpu[::97] = (3000 + np.arange(len(query_cpu[::97]))).astype(np.int32)
+    query_cpu[::97] = (INDEX_SIZE + np.arange(len(query_cpu[::97]))).astype(np.int32)
     new_states_cpu = (100000 + np.arange(query_len, dtype=np.int32)).astype(np.int32)
 
     seed = 42
     update_percent = 5
     expected_out, expected_states = expected_lookup_update(
-        table_keys_cpu, table_states_cpu, query_cpu, new_states_cpu, seed, update_percent)
+        table_states_cpu, query_cpu, new_states_cpu, seed, update_percent)
 
     table_keys = torch.from_numpy(table_keys_cpu).npu()
     table_states = torch.from_numpy(table_states_cpu.copy()).npu()
@@ -143,33 +134,35 @@ def run_single_req_case(rng: np.random.Generator):
     print(f"PASS: single-req table_states updated at {len(update_positions(query_len, seed, update_percent))} query positions")
 
 
-def run_multi_req_case(rng: np.random.Generator):
+def run_multi_req_case():
     req_num = 4
     query_len = 513
     seed = 2026
     update_percent = 7
 
-    table_keys_cpu = np.empty((req_num, TABLE_SIZE), dtype=np.int32)
-    table_states_cpu = np.empty((req_num, TABLE_SIZE), dtype=np.int32)
+    token_ids = np.arange(INDEX_SIZE, dtype=np.int32)
+    table_keys_cpu = np.empty((req_num, INDEX_SIZE), dtype=np.int32)
+    table_states_cpu = np.empty((req_num, INDEX_SIZE), dtype=np.int32)
     query_cpu = np.empty((req_num, query_len), dtype=np.int32)
     new_states_cpu = np.empty((req_num, query_len), dtype=np.int32)
 
     for req_id in range(req_num):
-        table_keys_cpu[req_id] = rng.permutation(np.arange(TABLE_SIZE, dtype=np.int32)).astype(np.int32)
+        table_keys_cpu[req_id] = token_ids
         table_states_cpu[req_id] = (
-            table_keys_cpu[req_id].astype(np.int64) * 13 + 1000 * req_id + 17
+            token_ids.astype(np.int64) * 13 + 1000 * req_id + 17
         ).astype(np.int32)
-        query_cpu[req_id] = rng.choice(
-            np.arange(TABLE_SIZE, dtype=np.int32), size=query_len, replace=True).astype(np.int32)
+        query_cpu[req_id] = (
+            np.arange(query_len, dtype=np.int64) * 19 + req_id * 101 + 7
+        ) % INDEX_SIZE
         query_cpu[req_id, req_id::101] = (
-            3000 + 100 * req_id + np.arange(len(query_cpu[req_id, req_id::101]))
+            INDEX_SIZE + 100 * req_id + np.arange(len(query_cpu[req_id, req_id::101]))
         ).astype(np.int32)
         new_states_cpu[req_id] = (
             200000 + 10000 * req_id + np.arange(query_len, dtype=np.int32)
         ).astype(np.int32)
 
     expected_out, expected_states = expected_lookup_update(
-        table_keys_cpu, table_states_cpu, query_cpu, new_states_cpu, seed, update_percent)
+        table_states_cpu, query_cpu, new_states_cpu, seed, update_percent)
 
     table_keys = torch.from_numpy(table_keys_cpu).npu()
     table_states = torch.from_numpy(table_states_cpu.copy()).npu()
@@ -226,10 +219,9 @@ def run_multi_req_case(rng: np.random.Generator):
 
 def main():
     torch.npu.set_device(0)
-    rng = np.random.default_rng(20260528)
 
-    run_single_req_case(rng)
-    run_multi_req_case(rng)
+    run_single_req_case()
+    run_multi_req_case()
 
 
 if __name__ == "__main__":

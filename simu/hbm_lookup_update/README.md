@@ -1,24 +1,24 @@
 # hbm_lookup_update
 
-这是一个用于 Ascend 910B / CANN 的 HBM resident KVCache 索引仿真算子 demo。当前重点不是完整缓存系统，而是摸底两个 NPU 算子的开销：
+这是一个用于 Ascend 910B / CANN 的 HBM resident KVCache 索引仿真算子 demo。当前目标是做概要性能摸测，不追求完整缓存系统语义。
 
-- `lookup`：在 HBM 中维护的 per-request `key -> state` 索引里查询 `query_keys`。
-- `update`：按一定比例把命中的 key 对应 state 更新为 `new_states`。
+当前模型：
 
-每个 req 独立拥有一张长度为 2048 的索引表。不同 req 之间的 key/state 表互不共享。
+- `lookup`：按每个 req 一张全量 token 索引表，从 HBM 中查询 `key -> state`。
+- `update`：按一定比例把查询到的 token 对应 state 原地更新。
+- 每个 req 的索引长度固定为 `128K`，模拟全量 token 粒度索引。
+- `query_keys` 模拟 DSA indexer 输出的 token id，脚本里用简单偏移生成。
 
 ## 语义
 
-算子不会在 kernel 内部生成 query key，调用方需要传入 `query_keys`。
-
 多 req 输入格式：
 
-- `table_keys`：`torch.int32` NPU tensor，形状 `[R, 2048]`，每个 req 的 resident HBM key 表。
-- `table_states`：`torch.int32` NPU tensor，形状 `[R, 2048]`，每个 key 对应的 state，update 会原地修改它。
-- `query_keys`：`torch.int32` NPU tensor，形状 `[R, Q]`，外部传入的查询 key。
-- `new_states`：`torch.int32` NPU tensor，形状 `[R, Q]`，update 选中某个 query 位置时写入的新 state。
+- `table_keys`：`torch.int32` NPU tensor，形状 `[R, 128K]`。当前只为兼容接口保留，kernel 不读取它。
+- `table_states`：`torch.int32` NPU tensor，形状 `[R, 128K]`。这是实际索引表，`table_states[req, token_id]` 表示该 token 的状态或位置。
+- `query_keys`：`torch.int32` NPU tensor，形状 `[R, Q]`。当前按 indexer 输出的 token id 建模。
+- `new_states`：`torch.int32` NPU tensor，形状 `[R, Q]`。update 选中某个 query 位置时写入的新 state。
 
-单 req 输入 `[2048]`、`[2048]`、`[Q]`、`[Q]` 仍然支持，会被当作 `R=1`。
+单 req 输入 `[128K]`、`[128K]`、`[Q]`、`[Q]` 仍然支持，会被当作 `R=1`。
 
 Python 调用：
 
@@ -49,25 +49,26 @@ hbm_lookup_update.update_only(
 // lookup
 for r in 0..R-1:
     for i in 0..Q-1:
-        states_out[r, i] = table_states[r, j]
-            if table_keys[r, j] == query_keys[r, i]
+        key = query_keys[r, i]
+        states_out[r, i] = table_states[r, key]
+            if 0 <= key < 128K
             else not_found
 
 // update，在 lookup 之后同 stream 执行
 for r in 0..R-1:
     for pos in random_unique_positions(floor(Q * update_percent / 100), seed, r):
         key = query_keys[r, pos]
-        if table_keys[r, j] == key:
-            table_states[r, j] = new_states[r, pos]
+        if 0 <= key < 128K:
+            table_states[r, key] = new_states[r, pos]
 ```
 
-`states_out` 返回 update 之前的 state。
+`states_out` 返回 update 之前的 state。后续如果要保存实际 KVCache 位置，可以把 `state` 编码成 `physical_block_id / slot / backend_state`，当前 demo 只用 `int32` 占位。
 
 当前假设：
 
-- 每个 req 内 `table_keys[r, :]` 唯一；如果重复，lookup 返回表顺序里的第一个命中位置。
 - key/state dtype 固定为 `int32`。
-- 每个 req 的 table size 固定为 2048。
+- 每个 req 的 index size 固定为 `128K`。
+- 当前脚本生成的 `table_keys` 是 `arange(128K)`，但 kernel 不读取它。
 
 ## 目录结构
 
@@ -116,9 +117,9 @@ bash run.sh -v Ascend910B3 -t
 PYTHONPATH=$PWD/build:$PYTHONPATH \
 python3 scripts/bench_lookup_update.py \
   --mode lookup \
-  --req-num 4 \
+  --req-num 50 \
   --query-len 2048 \
-  --block-dim 8 \
+  --block-dim 64 \
   --iters 100
 ```
 
@@ -128,7 +129,7 @@ python3 scripts/bench_lookup_update.py \
 PYTHONPATH=$PWD/build:$PYTHONPATH \
 python3 scripts/bench_lookup_update.py \
   --mode lookup \
-  --req-num 4,8,16 \
+  --req-num 4,8,16,50 \
   --query-len 2048 \
   --block-dim 8,16,32,64 \
   --iters 50
@@ -162,9 +163,9 @@ python3 scripts/profile_lookup_update.py --help
 PYTHONPATH=$PWD/build:$PYTHONPATH \
 python3 scripts/profile_lookup_update.py \
   --mode lookup \
-  --req-num 4 \
+  --req-num 50 \
   --query-len 2048 \
-  --block-dim 8 \
+  --block-dim 64 \
   --warmup 20 \
   --iters 50 \
   --profile-dir ./profile_lookup \
@@ -178,10 +179,10 @@ python3 scripts/profile_lookup_update.py \
 PYTHONPATH=$PWD/build:$PYTHONPATH \
 python3 scripts/profile_lookup_update.py \
   --mode update \
-  --req-num 4 \
+  --req-num 50 \
   --query-len 2048 \
   --update-percent 5 \
-  --block-dim 8 \
+  --block-dim 64 \
   --warmup 20 \
   --iters 50 \
   --profile-dir ./profile_update \
@@ -211,43 +212,38 @@ python3 scripts/profile_lookup_update.py \
 
 当前摸底阶段建议先跑 `pipe`，需要进一步判断瓶颈时再分别跑 `memory` / `ub`。
 
-## Lookup 当前实现
+## 当前实现
 
-每个 req 有一张独立的 `[2048]` key 表和 `[2048]` state 表。lookup 时，一个 AI Vector Core 会把当前 req 的 `table_keys/table_states` 搬到 UB，然后处理若干个 query tile。
-
-当前 lookup 不是 scalar 逐元素扫描，而是 **全表向量匹配**：
-
-```cpp
-CompareScalar<int32_t, uint8_t>(cmpMask, tableKeysLocal, qk, CMPMODE::EQ, 2048);
-Select<float, uint8_t>(hitFlag, cmpMask, oneFlag, 0.0f, ...);
-ReduceMax<float>(reduceOut, hitFlag, reduceWork, 2048, true);
-```
-
-含义是：对每个 `qk`，用 vector 指令把它和当前 req 的 2048 个 `table_keys` 做一次 full-table compare，再通过 `Select + ReduceMax(calIndex=true)` 得到命中的 table index。最后只有取 index、取 state、写输出 tile 这几步保留少量 scalar 操作。
-
-这个实现已经避免了旧版的 scalar mask 解析和 candidate 复查。profile 中应能看到：
-
-- `aiv_vec_ratio` 明显上升。
-- `aiv_scalar_ratio` 明显下降。
-
-但它的算法关系仍然是：
+lookup 不再做全表 compare，而是直接把 `query_keys` 当成 token id，访问对应 req 的 `table_states`：
 
 ```text
-每个 query 和当前 req 的 2048 个 key 比较
+state = table_states[req, query_keys[req, i]]
 ```
 
-所以它是 vectorized full-table compare，不是 hash/probe 索引。
+这更贴近当前要摸测的 IO 形式：
+
+- 每个 query 读取 1 个 `query_key`。
+- key 合法时随机读取 1 个 `table_state`。
+- 输出 1 个 `state`。
+
+update 也不再把整张 state 表搬到 UB 再写回，而是对选中的 query 位置做随机写：
+
+```text
+table_states[req, query_key] = new_state
+```
+
+因此当前 profile 主要反映 128K token 粒度索引下的 GM 随机读写开销，不再反映 vector full-table compare 的开销。
 
 ## Tile 和 core 调度
 
 当前常量：
 
 ```cpp
-TABLE_SIZE = 2048
+INDEX_SIZE = 128 * 1024
 QUERY_TILE = 64
 ```
 
-`QUERY_TILE` 表示一个 work item 处理一个 req 的 64 个 query。调度逻辑：
+lookup 的一个 work item 对应一个 `(req_id, query_tile_id)`，每个 tile 处理 64 个 query。调度逻辑：
 
 ```cpp
 queryTileNum = ceil(queryLen / QUERY_TILE);
@@ -259,102 +255,23 @@ for (tileId = coreId; tileId < totalTileNum; tileId += blockNum) {
 }
 ```
 
-一个 tile 对应：
+判断 lookup 任务数是否足够喂满 core：
 
 ```text
-(req_id, query_tile_id)
+req_num * ceil(query_len / 64) >= block_dim
 ```
 
-例如：
+例如 `req_num=50, query_len=2048` 时，`totalTileNum = 50 * 32 = 1600`，`block_dim=64` 可以充分分配任务。
 
-```text
-req_num = 4
-query_len = 2048
-QUERY_TILE = 64
-```
-
-则：
-
-```text
-queryTileNum = 32
-totalTileNum = 4 * 32 = 128
-```
-
-如果 `block_dim=64`，最多 64 个 AI Vector Core 都能拿到任务，每个 core 平均处理约 2 个 tile。
-
-判断任务数是否足够喂满 core：
-
-```text
-req_num * ceil(query_len / QUERY_TILE) >= block_dim
-```
-
-如果 `query_len <= QUERY_TILE`，每个 req 只有 1 个 query tile，此时 req 很少而 `block_dim` 很大时，会有很多 core 没活。
-
-## TABLE_TILE 和 QUERY_TILE
-
-`TABLE_TILE=64` 主要服务旧版 update 查找路径里的 `Compare<int32_t, uint8_t>(..., 64)`。当前 lookup 主路径已经使用 `CompareScalar(..., 2048)`，因此 lookup 对 `TABLE_TILE` 不敏感。
-
-`QUERY_TILE=64` 主要用于：
-
-- 决定每个 work item 包含多少 query。
-- 决定输出 `outTile` 的大小。
-- 决定 `DataCopy(statesOut, outTile, QUERY_TILE)` 的粒度。
-- 决定 tile 数量和 core 调度粒度。
-
-调小 `QUERY_TILE` 不会减少单个 query 的 compare 数量。因为每个 query 仍然执行一次：
-
-```text
-CompareScalar(table_keys[0:2048], qk)
-```
-
-调小 `QUERY_TILE` 只会增加 query tile 数，让调度粒度更细；调大 `QUERY_TILE` 会减少 tile 数和输出 DataCopy 次数，但 req 数少时可能不容易喂满 core。
-
-当前建议：
-
-- `TABLE_TILE` 先保持 64。
-- `QUERY_TILE` 先保持 64。
-- 如果要实验，可以单独测试 `QUERY_TILE=32/64/128`，但要注意这需要重新编译 kernel。
-
-## Update 当前实现
-
-update kernel 每个 req 由一个 core 顺序处理：
-
-1. 把该 req 的 `table_keys/table_states` 搬到 UB。
-2. 根据 `seed` 和 `update_percent` 选择一批 query 位置。
-3. 对选中的 key 查找 table index。
-4. 在 UB 中更新 state。
-5. 把整个 2048 长度的 `table_states` 写回 HBM。
-
-update 没有在同一个 req 内多 core 并行写 state，原因是要避免重复 key、写冲突和 last-writer 语义问题。当前阶段它更偏向简单可验证的仿真实现。
+update 的调度更简单：一个 req 由一个 core 顺序处理，`req_num=50` 时最多使用 50 个 core。
 
 ## 后续可能方向
 
-当前 lookup 是“每 req 独立表 + 全表向量匹配”。这对 2048 长度索引很适合做 baseline，因为：
+当前 demo 的目的只是快速估计 token 粒度索引放在 HBM 后的 lookup/update IO 成本。后续如果要更贴近真实系统，可以在不改变接口形态的前提下逐步替换 `state` 编码：
 
-- 表可以完整放入 UB。
-- 访问连续。
-- vector core 利用率高。
-- profile 稳定，方便估算算子开销。
+- 用 state 表示 HBM hit / backend miss。
+- 用 state 保存 `physical_block_id` 和 block 内 offset。
+- 输出 miss token 列表，给 NPU 侧后端读取接口消费。
+- update 在加载完成后写回新的 physical slot。
 
-如果未来要真正减少单个 query 的比较范围，可以考虑每 req 内 bucket 化索引：
-
-```text
-bucket_keys[req, bucket_num, bucket_size]
-bucket_states[req, bucket_num, bucket_size]
-```
-
-查询时：
-
-```text
-bucket = Hash32(qk) % bucket_num
-只和 bucket_keys[req, bucket, :] 做 CompareScalar
-```
-
-例如：
-
-```text
-bucket_num = 32
-bucket_size = 64
-```
-
-单 query 的比较范围可以从 2048 降到 64，同时仍然保持连续 vector compare。但这需要重新设计 HBM 索引布局，并处理 bucket 冲突、overflow 和 update 插入策略。当前阶段可以先把 full-table vector compare 作为 baseline。
+这些都可以先保持 `query_keys -> table_states` 的直接索引结构，避免在概要摸测阶段引入复杂 hash/bucket 维护逻辑。

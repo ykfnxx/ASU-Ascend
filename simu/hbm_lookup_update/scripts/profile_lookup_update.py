@@ -8,6 +8,7 @@ from contextlib import nullcontext
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 KERNEL_LIB_NAME = "libhbm_lookup_update_kernels_npu.so"
+INDEX_SIZE = 128 * 1024
 
 
 def parse_args():
@@ -62,20 +63,20 @@ def import_runtime(build_dir):
 
 
 def make_inputs(np, torch, req_num, query_len, seed):
-    table_size = 2048
-    rng = np.random.default_rng(seed)
-    table_keys_cpu = np.empty((req_num, table_size), dtype=np.int32)
-    table_states_cpu = np.empty((req_num, table_size), dtype=np.int32)
+    token_ids = np.arange(INDEX_SIZE, dtype=np.int32)
+    table_keys_cpu = np.empty((req_num, INDEX_SIZE), dtype=np.int32)
+    table_states_cpu = np.empty((req_num, INDEX_SIZE), dtype=np.int32)
     query_cpu = np.empty((req_num, query_len), dtype=np.int32)
     new_states_cpu = np.empty((req_num, query_len), dtype=np.int32)
 
     for req_id in range(req_num):
-        table_keys_cpu[req_id] = rng.permutation(np.arange(table_size, dtype=np.int32)).astype(np.int32)
+        table_keys_cpu[req_id] = token_ids
         table_states_cpu[req_id] = (
-            table_keys_cpu[req_id].astype(np.int64) * 3 + 1000 * req_id + 1
+            token_ids.astype(np.int64) + req_id * INDEX_SIZE
         ).astype(np.int32)
-        query_cpu[req_id] = rng.choice(
-            np.arange(table_size, dtype=np.int32), size=query_len, replace=True).astype(np.int32)
+        query_cpu[req_id] = (
+            np.arange(query_len, dtype=np.int64) + seed + req_id * 257
+        ) % INDEX_SIZE
         new_states_cpu[req_id] = (
             777000 + 10000 * req_id + np.arange(query_len, dtype=np.int32)
         ).astype(np.int32)

@@ -28,7 +28,7 @@ extern "C" void hbm_random_update_do(
     uint32_t updatePercent);
 
 namespace {
-constexpr int64_t TABLE_SIZE = 2048;
+constexpr int64_t INDEX_SIZE = 128 * 1024;
 constexpr int64_t QUERY_TILE = 64;
 
 struct LookupShape {
@@ -67,7 +67,7 @@ LookupShape CheckLookupShapes(
     const at::Tensor& newStates)
 {
     TORCH_CHECK(tableKeys.dim() == 1 || tableKeys.dim() == 2,
-                "table_keys must be 1-D [2048] or 2-D [req_num, 2048]");
+                "table_keys must be 1-D [128K] or 2-D [req_num, 128K]");
     TORCH_CHECK(tableStates.sizes() == tableKeys.sizes(),
                 "table_states must have the same shape as table_keys");
     TORCH_CHECK(newStates.sizes() == queryKeys.sizes(),
@@ -77,14 +77,14 @@ LookupShape CheckLookupShapes(
     int64_t reqNum = 1;
     int64_t queryLen = 0;
     if (singleReq) {
-        TORCH_CHECK(tableKeys.numel() == TABLE_SIZE,
-                    "table_keys must have exactly 2048 elements");
+        TORCH_CHECK(tableKeys.numel() == INDEX_SIZE,
+                    "table_keys must have exactly 128K elements");
         TORCH_CHECK(queryKeys.dim() == 1,
                     "query_keys must be 1-D when table_keys is 1-D");
         queryLen = queryKeys.numel();
     } else {
-        TORCH_CHECK(tableKeys.size(1) == TABLE_SIZE,
-                    "table_keys shape must be [req_num, 2048]");
+        TORCH_CHECK(tableKeys.size(1) == INDEX_SIZE,
+                    "table_keys shape must be [req_num, 128K]");
         TORCH_CHECK(queryKeys.dim() == 2,
                     "query_keys must be 2-D [req_num, query_len] when table_keys is 2-D");
         TORCH_CHECK(queryKeys.size(0) == tableKeys.size(0),
@@ -103,8 +103,8 @@ LookupShape CheckLookupShapes(
     int64_t queryTileNum = paddedQueryLen / QUERY_TILE;
     TORCH_CHECK(reqNum <= static_cast<int64_t>(UINT32_MAX) / queryTileNum,
                 "req_num * ceil(query_len / 64) is too large for this demo kernel");
-    TORCH_CHECK(reqNum <= static_cast<int64_t>(UINT32_MAX) / TABLE_SIZE,
-                "req_num * 2048 is too large for this demo kernel");
+    TORCH_CHECK(reqNum <= static_cast<int64_t>(UINT32_MAX) / INDEX_SIZE,
+                "req_num * 128K is too large for this demo kernel");
     if (queryLen > 0) {
         TORCH_CHECK(reqNum <= static_cast<int64_t>(UINT32_MAX) / queryLen,
                     "req_num * query_len is too large for this demo kernel");
@@ -237,7 +237,7 @@ void update_only(
 }
 
 PYBIND11_MODULE(hbm_lookup_update, m) {
-    m.doc() = "HBM resident table lookup + random update kernels for Ascend 910B";
+    m.doc() = "HBM resident token-index lookup + random update kernels for Ascend 910B";
     m.def("lookup_random_update", &lookup_random_update,
           pybind11::arg("table_keys"),
           pybind11::arg("table_states"),
@@ -248,7 +248,7 @@ PYBIND11_MODULE(hbm_lookup_update, m) {
           pybind11::arg("block_dim") = 8,
           pybind11::arg("not_found") = -1,
           pybind11::arg("do_update") = true,
-          "Lookup external query_keys by comparing against resident table_keys, "
+          "Lookup indexer token ids in resident per-request 128K table_states, "
           "return pre-update states, then update update_percent% of queried keys.");
     m.def("lookup_only", &lookup_only,
           pybind11::arg("table_keys"),
@@ -256,7 +256,7 @@ PYBIND11_MODULE(hbm_lookup_update, m) {
           pybind11::arg("query_keys"),
           pybind11::arg("block_dim") = 8,
           pybind11::arg("not_found") = -1,
-          "Lookup only, without state update.");
+          "Lookup token ids in table_states only, without state update.");
     m.def("update_only", &update_only,
           pybind11::arg("table_keys"),
           pybind11::arg("table_states"),
@@ -265,5 +265,5 @@ PYBIND11_MODULE(hbm_lookup_update, m) {
           pybind11::arg("seed"),
           pybind11::arg("update_percent") = 5,
           pybind11::arg("block_dim") = 8,
-          "Update resident table_states in place without running the lookup kernel.");
+          "Update resident token-index table_states in place without running the lookup kernel.");
 }

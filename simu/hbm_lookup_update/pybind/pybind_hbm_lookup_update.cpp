@@ -248,15 +248,16 @@ PYBIND11_MODULE(hbm_lookup_update, m) {
           pybind11::arg("block_dim") = 8,
           pybind11::arg("not_found") = -1,
           pybind11::arg("do_update") = true,
-          "Lookup indexer token ids in resident per-request 128K table_states, "
-          "return pre-update states, then update update_percent% of queried keys.");
+          "Lookup valid indexer token ids in resident per-request 128K table_states, "
+          "return pre-update states, then update update_percent% of queried keys. "
+          "not_found is kept for ABI compatibility and is ignored by the current kernel.");
     m.def("lookup_only", &lookup_only,
           pybind11::arg("table_keys"),
           pybind11::arg("table_states"),
           pybind11::arg("query_keys"),
           pybind11::arg("block_dim") = 8,
           pybind11::arg("not_found") = -1,
-          "Lookup token ids in table_states only, without state update.");
+          "Lookup valid token ids in table_states only, without state update.");
     m.def("update_only", &update_only,
           pybind11::arg("table_keys"),
           pybind11::arg("table_states"),

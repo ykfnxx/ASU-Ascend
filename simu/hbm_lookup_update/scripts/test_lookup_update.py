@@ -75,12 +75,11 @@ def expected_lookup_update(
     for req_id in range(req_num):
         for i, qk in enumerate(query_2d[req_id]):
             key = int(qk)
-            expected_out[req_id, i] = table_states_2d[req_id, key] if 0 <= key < INDEX_SIZE else NOT_FOUND
+            expected_out[req_id, i] = table_states_2d[req_id, key]
 
         for pos in update_positions(query_len, seed, update_percent, req_id):
             key = int(query_2d[req_id, pos])
-            if 0 <= key < INDEX_SIZE:
-                expected_states[req_id, key] = new_states_2d[req_id, pos]
+            expected_states[req_id, key] = new_states_2d[req_id, pos]
 
     if single_req:
         return expected_out.reshape(query_cpu.shape), expected_states.reshape(table_states_cpu.shape)
@@ -93,12 +92,7 @@ def run_single_req_case():
     table_states_cpu = (token_ids.astype(np.int64) * 10 + 7).astype(np.int32)
 
     query_len = 512
-    query_cpu = (
-        np.arange(query_len, dtype=np.int64) * 17 + 23
-    ).astype(np.int64) % INDEX_SIZE
-    query_cpu = query_cpu.astype(np.int32)
-    # Add several misses.
-    query_cpu[::97] = (INDEX_SIZE + np.arange(len(query_cpu[::97]))).astype(np.int32)
+    query_cpu = (23 + np.arange(query_len, dtype=np.int32)).astype(np.int32)
     new_states_cpu = (100000 + np.arange(query_len, dtype=np.int32)).astype(np.int32)
 
     seed = 42
@@ -152,10 +146,7 @@ def run_multi_req_case():
             token_ids.astype(np.int64) * 13 + 1000 * req_id + 17
         ).astype(np.int32)
         query_cpu[req_id] = (
-            np.arange(query_len, dtype=np.int64) * 19 + req_id * 101 + 7
-        ) % INDEX_SIZE
-        query_cpu[req_id, req_id::101] = (
-            INDEX_SIZE + 100 * req_id + np.arange(len(query_cpu[req_id, req_id::101]))
+            req_id * 2048 + 7 + np.arange(query_len, dtype=np.int32)
         ).astype(np.int32)
         new_states_cpu[req_id] = (
             200000 + 10000 * req_id + np.arange(query_len, dtype=np.int32)

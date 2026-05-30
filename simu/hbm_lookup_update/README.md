@@ -220,7 +220,7 @@ state = table_states[req, query_keys[req, i]]
 
 这更贴近当前要摸测的 IO 形式：
 
-- 每个 query 读取 1 个 `query_key`。
+- full query tile 用一次 `DataCopy` 把 64 个 `query_key` 搬到 UB，tail tile 走 scalar 读。
 - 每个 query 按 key 从全量 128K `table_states` 读取 1 个 state。
 - 每个 64-query tile 用一次 `DataCopy` 写回输出。
 

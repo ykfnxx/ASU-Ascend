@@ -210,6 +210,75 @@ python3 scripts/profile_lookup_update.py \
 
 当前摸底阶段建议先跑 `pipe`，需要进一步判断瓶颈时再分别跑 `memory` / `ub`。
 
+## Lookup 访存瓶颈分析
+
+如果重点是判断 lookup 是否已经卡在 GM 随机访存上，可以使用额外的 access-pattern profile：
+
+```bash
+PYTHONPATH=$PWD/build:$PYTHONPATH \
+python3 scripts/profile_lookup_memory.py \
+  --req-num 50 \
+  --query-len 2048 \
+  --block-dim 64 \
+  --warmup 20 \
+  --iters 100
+```
+
+该脚本只测 `lookup_only`，但会构造多种 `query_keys` 分布：
+
+- `fixed`：每个 req 内所有 query 访问同一个 key，用于观察极高复用/缓存命中情况下的下界。
+- `sequential`：顺序访问 key，用于观察连续 scalar 地址是否比随机地址好。
+- `stride`：固定步长访问，接近旧 bench 的输入形式。
+- `block`：把 key 限制在 `128K / kv_block_size` 个 block id 范围内，粗略模拟 block 粒度 metadata 查询。
+- `hotset`：在较小热点集合中随机访问，默认测试 `128,1024,8192` 三个 hotset size。
+- `random`：全 128K 范围随机访问，接近 token 粒度随机 lookup 压力。
+
+输出列：
+
+```text
+pattern req_num query_len block_dim unique_keys_avg unique_keys_max
+unique_kv_blocks_avg unique_kv_blocks_max host_ms_per_iter device_ms_per_iter
+lookup_qps_device global_ns_per_query core_ns_per_query
+state_load_gbps approx_query_state_out_gbps
+```
+
+重点看：
+
+- `device_ms_per_iter`：单次 lookup kernel 的 NPU event 时间。
+- `core_ns_per_query`：按 `block_dim` 摊回单 core 后的每 query 时间，适合观察 scalar GM load latency。
+- `state_load_gbps`：只按 `table_states` 的 4B 读取估算的有效带宽；如果这个值很低但时间很高，通常说明不是 HBM 带宽打满，而是随机 scalar load 延迟/发射受限。
+- `fixed/hotset` 和 `random` 的差距：如果 fixed/hotset 明显更快，说明 cache/复用对性能影响很大；如果 sequential 明显更快，说明访问连续性重要；如果都差不多，瓶颈可能更多在 scalar 指令/循环/同步开销。
+
+只跑部分 pattern：
+
+```bash
+PYTHONPATH=$PWD/build:$PYTHONPATH \
+python3 scripts/profile_lookup_memory.py \
+  --patterns fixed,block,random \
+  --req-num 16 \
+  --query-len 2048 \
+  --block-dim 64 \
+  --iters 100
+```
+
+同时抓 torch_npu profiler，并打印 `hbm_lookup` 相关 kernel 行：
+
+```bash
+PYTHONPATH=$PWD/build:$PYTHONPATH \
+python3 scripts/profile_lookup_memory.py \
+  --req-num 50 \
+  --query-len 2048 \
+  --block-dim 64 \
+  --iters 50 \
+  --profile-dir ./profile_lookup_memory \
+  --profile-pattern random \
+  --profiler-level level2 \
+  --aic-metrics memory \
+  --profile-rows 30
+```
+
+也可以把 `--aic-metrics` 改成 `l2cache` 或 `pipe`，分别观察 L2/cache 相关指标或 pipe 利用率。不同 CANN/torch_npu 版本导出的 profiler 文件名可能不同，脚本会递归查找包含 `hbm_lookup` 的 CSV/TSV/TXT 表并打印常见字段；如果没有打印出来，就直接查看 `profile_dir` 下的 profiler 原始输出。
+
 ## 当前实现
 
 lookup 不再做全表 compare，也不做 UB gather。kernel 直接把 `query_keys` 当成有效 token id，从对应 req 的全量 `table_states` 中读取 state 并写入输出 tile：

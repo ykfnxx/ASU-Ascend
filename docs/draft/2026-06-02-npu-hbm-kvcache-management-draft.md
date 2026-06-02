@@ -1,1266 +1,1006 @@
-# NPU HBM Token 粒度 KVCache 管理机制设计草稿
+# 基于 vLLM Block Table 的 ASU-backed Decode KVCache 管理设计草稿
 
-本文整理当前关于 vLLM + vLLM-Ascend 部署形态下，面向 DeepSeek V3/V3.2 类 DSA attention 的 NPU HBM KVCache 管理机制设计。
+本文重写此前关于 HBM KVCache 管理的设计草稿。
 
-当前设计口径：
+此前草稿默认要在 NPU HBM 上重新实现一套完整 token 粒度 KVCache 管理，并让 indexer 直接对这套新索引工作。这个前提不成立：当前 vLLM-Ascend 的 Lightning Indexer 依赖 vLLM block table 和 `kv_cache[2]` 的 PA_BSND HBM block 布局。如果直接把 `kv_cache[2]` 改成 ASU-backed、token 粒度拼接的布局，现有 indexer 会读错地址，topK 语义失效。
 
-```text
-token 粒度管理
-+ 全局 HBM KVCache token slot pool
-+ 每 req dense token_state 索引表
-+ 数组栈管理 free slots
-+ CLOCK / hotness 作为 baseline 淘汰方案
-+ Windowed LRU / Batched LRU 作为备选淘汰方案
-+ per-req soft quota 防止单个请求长期占满 HBM
-+ req generation 防止 reset 后异步 IO 写回污染新请求
-```
-
-本文暂时不把 token 粒度索引查询时延作为第一优先级约束。当前 `simu/hbm_lookup_update` 在 `50 req * 2K query` 场景下单算子约 350us，说明 token lookup hot path 后续仍需要优化；但本草稿先把 token 粒度缓存语义、辅助数据结构、索引维护、查询、reset、换入换出和 Ascend NPU 压力评估明确下来。
-
-## 1. 目标与约束
-
-目标是在 Ascend 910B 单卡 HBM 容量受限的情况下，提高 DeepSeek 类 DSA attention 的并发能力，同时尽量保持较高 HBM KVCache 命中率。
-
-关键约束：
-
-- 单张 Ascend 910B HBM 约 64G。
-- HBM 还需要承载权重 shard、workspace、ACL graph、通信 buffer 等，不能全部用于 KVCache。
-- 当前目标并发为 50，该目标可以根据 HBM 预算、后端 IO 压力和 miss rate 调整。
-- DSA indexer 输出 logical token id，因此 token 粒度管理与 indexer 输出语义最直接匹配。
-- 所有请求共享一个物理 HBM KVCache pool，不给每个 req 固定切分 pool。
-- 主要逻辑应在 NPU 上运行，控制面只做 req admission、finish、batch mapping 等必要调度信息下发。
-
-核心目标：
+本版设计采用新的边界：
 
 ```text
-在 HBM 中只保留所有活跃请求的 hot tokens。
-miss token 由 NPU 侧触发从后端读回 HBM。
-eviction 和 free slot 分配尽量使用连续数组扫描和批处理。
-避免链表、复杂分支、频繁随机指针跳转、per-hit 精确 LRU 维护。
+保留:
+  vLLM block table
+  indexer key cache: kv_cache[2]
+  lightning_indexer 的精确 topK 语义
+
+替换/增强:
+  sparse attention 实际消费的 full attention KV: kv_cache[0] / kv_cache[1]
+  为 full KV 增加 ASU 后端存储 + HBM residency cache
 ```
 
-## 2. 容量模型
+核心目标不是完全重写 vLLM KVCache，而是在现有 block table 机制上叠加一层 full KV 的驻留管理：
 
-DeepSeek MLA KVCache 的 per-token 成本大致为：
+```text
+block table 仍然描述逻辑 token/block 序列。
+indexer 仍然基于 kv_cache[2] + block table 计算 topK logical token indices。
+ASU 保存完整 full attention KV。
+HBM 只缓存 topK 和近期会被 attention 使用的 full attention KV。
+miss 时 NPU 通过参数面从 ASU 直接读入 HBM。
+```
 
-| KVCache 类型 | 估算成本 |
-| --- | ---: |
-| DeepSeek V3.2 `fp8_ds_mla` | 656 B / token / layer |
-| DeepSeek V4 fp8 MLA | 584 B / token / layer |
-| BF16 MLA | 1152 B / token / layer |
+## 1. 设计结论
 
-若按 61 层、50 并发粗算：
+本需求在以下边界内可行：
 
-| 可用于 KV 的 HBM | V3.2 fp8_ds_mla 可驻留 token / req | BF16 MLA 可驻留 token / req |
-| --- | ---: | ---: |
-| 64GiB | 约 34K | 约 19.5K |
-| 48GiB | 约 25.8K | 约 14.7K |
-| 40GiB | 约 21.5K | 约 12.2K |
-| 32GiB | 约 17.2K | 约 9.8K |
+1. **不替换 indexer key cache。** `kv_cache[2]` 必须保持现有 PA_BSND HBM block 布局，供 Lightning Indexer 使用。
+2. **只替换 full attention KV 的常驻策略。** `kv_cache[0] / kv_cache[1]` 不再要求完整上下文常驻 HBM，而是由 ASU + HBM token cache 管理。
+3. **vLLM block table 仍是主逻辑索引。** 新增 residency overlay 根据 `block_table + logical offset` 判断 full KV 是否在 HBM。
+4. **decode 阶段生效。** 本设计只覆盖 decode 节点上的 DSA sparse attention，不重新设计 prefill attention。
+5. **淘汰策略可由 CPU 在 step 间处理。** NPU step 内只执行数组查表、miss load、状态更新和 attention 所需的数据 materialize。
 
-如果目标上下文长度接近 128K，则 50 并发下 HBM 只能保存每个请求的一部分 KV。因此，全局 pool 的作用是保存跨请求的 hot token working set，而不是完整上下文。
+不可行或不建议作为第一版的边界：
+
+```text
+把 kv_cache[2] 也改成 ASU-backed token cache。
+```
+
+除非重写 Lightning Indexer，使其理解 ASU 地址、HBM residency 和 token 粒度 slot，否则不能改 `kv_cache[2]` 的布局。
+
+## 2. 当前代码事实
+
+### 2.1 indexer key cache 与 attention KV 是两套数据
+
+当前 Ascend SFA 代码中，indexer key 的生成路径是：
+
+```python
+k_proj, _ = self.wk(x)        # hidden_states -> [token, 128]
+k = self.k_norm(k_proj)
+q, k = rope_forward_triton(...)
+```
+
+随后写入：
+
+```python
+torch_npu.npu_scatter_nd_update_(
+    kv_cache[2].view(-1, k.shape[-1]),
+    attn_metadata.slot_mapping.view(-1, 1),
+    k.view(-1, k.shape[-1])
+)
+```
+
+Lightning Indexer 调用：
+
+```python
+topk_indices = torch.ops._C_ascend.npu_lightning_indexer(
+    query=q,
+    key=kv_cache[2],
+    weights=weights,
+    actual_seq_lengths_query=actual_seq_lengths_query,
+    actual_seq_lengths_key=actual_seq_lengths_key,
+    block_table=attn_metadata.block_tables,
+    layout_query="TND",
+    layout_key="PA_BSND",
+    sparse_count=2048,
+    sparse_mode=3,
+)
+```
+
+sparse attention 实际消费的是：
+
+```python
+attn_output = torch.ops._C_ascend.npu_sparse_flash_attention(
+    query=ql_nope,
+    key=kv_cache[0],
+    value=kv_cache[0],
+    sparse_indices=topk_indices,
+    block_table=attn_metadata.block_tables,
+    key_rope=kv_cache[1],
+    layout_kv="PA_BSND",
+)
+```
+
+因此：
+
+| 数据 | 当前张量 | 用途 | 是否可第一版替换 |
+| --- | --- | --- | --- |
+| indexer key cache | `kv_cache[2]` | Lightning Indexer 计算 topK | 不替换 |
+| full attention latent/value KV | `kv_cache[0]` | sparse attention 真实计算 | 可替换 |
+| full attention rope KV | `kv_cache[1]` | sparse attention 真实计算 | 可替换 |
+
+### 2.2 Lightning Indexer 强依赖 block table 物理地址语义
+
+当前 indexer kernel 读取 PA_BSND key 时使用类似逻辑：
+
+```cpp
+s2BlkId = logical_pos / kCacheBlockSize;
+s2BlkOffset = logical_pos % kCacheBlockSize;
+keyGmOffset =
+    block_table[batch, s2BlkId] * kCacheBlockSize * kHeadNum * headDim
+    + s2BlkOffset * headDim;
+```
+
+这说明 indexer 认为：
+
+```text
+block_table 指向 kv_cache[2] 中连续可读的 HBM PA block。
+```
+
+所以本设计必须保留这条语义。
+
+### 2.3 indexer 输出是 logical token index
+
+Lightning Indexer 输出的 `topk_indices` 是逻辑 token 位置，不是 HBM physical slot。后续 attention 再通过 block table 找到 full KV。
+
+这正好为本设计提供了接入点：
+
+```text
+indexer 输出 logical token id
+  -> 根据 block table 定位 logical block + offset
+  -> 查询 full KV residency overlay
+  -> HBM hit 直接用
+  -> HBM miss 从 ASU 读入 HBM
+```
 
 ## 3. 总体架构
 
-缓存层插入在 DSA indexer 输出之后、sparse attention 消费物理 KV slot 之前。
+系统拆成三层。
 
-```mermaid
-flowchart LR
-    V["vLLM scheduler<br/>active batch / req changes"] --> R["Req mapping table<br/>batch_idx -> req_slot"]
-    I["DSA indexer<br/>topK logical token ids"] --> L["NPU token cache lookup<br/>token_state[req_slot, token]"]
-    R --> L
-    L --> H{"HBM hit?"}
-    H -- "hit" --> P["physical slot ids"]
-    H -- "miss / loading" --> M["miss / wait lists"]
-    M --> A["allocator<br/>free_stack pop"]
-    A --> E{"free slots enough?"}
-    E -- "yes" --> IO["backend -> HBM load"]
-    E -- "no" --> C["eviction prepare<br/>CLOCK or Windowed LRU<br/>linear scan slot_state"]
-    C --> A
-    IO --> U["update token_state / slot_state"]
-    U --> P
-    P --> S["DSA sparse attention<br/>read HBM KVCache"]
-```
+### 3.1 vLLM 逻辑层
 
-设计原则：
-
-1. HBM 物理空间使用全局 token slot pool。
-2. 每个 req 只维护逻辑 token 到物理 slot 的状态映射。
-3. free slot 分配走数组栈，不通过链表，也不遍历 free bitmap。
-4. free slot 不足或低水位时才触发 eviction，eviction 使用连续扫描生成 victim buffer。
-5. 精确链表 LRU 不适合 NPU，默认使用 CLOCK / hotness，备选评估 Windowed LRU / Batched LRU。
-6. req reset 使用 generation 隔离异步 IO，避免旧请求 load/writeback 完成后污染复用后的 req slot。
-
-## 4. 辅助数据结构总览
-
-### 4.1 全局 HBM Token Slot Pool
-
-所有请求共享一组物理 token slots：
+vLLM 继续维护请求、动态 batch、block allocation 和 block table。
 
 ```text
-global_token_slot_pool:
-    slot 0
-    slot 1
-    ...
-    slot N-1
+block_table[req, logical_block_idx] -> kv_block_id
+slot_mapping[token] -> kv_block_id + block_offset
+seq_lens[req] -> current visible length
 ```
 
-每个 slot 表示一个 token 的 KVCache 物理位置：
+这里的 `kv_block_id` 继续作为逻辑 block id 使用。对 `kv_cache[2]` 来说，它也是现有 HBM PA block id；对 `kv_cache[0]/[1]` 来说，它是 ASU/HBM residency overlay 的 logical block id。
+
+### 3.2 indexer 层
+
+indexer 层保持现状：
 
 ```text
-slot_id -> kv_cache[:, slot_id, ...]
+kv_cache[2] 完整保留在 HBM
+layout_key = PA_BSND
+block_table 原样传给 npu_lightning_indexer
+topk_indices 仍表示 logical token positions
 ```
 
-逻辑 token 通过 `token_state[req_slot, token_id]` 指向物理 slot。物理 slot 通过 `slot_owner_req/token/generation` 反查 owner，供 eviction/reset 冷路径更新索引。
+这保证 indexer 的结果不因 full KV 的 HBM/ASU 迁移而变化。
+
+### 3.3 full attention KV residency 层
+
+新增 residency overlay 管理 `kv_cache[0]/[1]` 的 full KV：
+
+```text
+ASU:
+  保存完整 full attention KV。
+
+HBM:
+  只保存 hot full KV token slots。
+
+Residency metadata:
+  logical block + block offset -> HBM slot or ASU location
+```
+
+总体路径：
 
 ```mermaid
 flowchart TB
-    Pool["global_token_slot_pool<br/>slot 0..N-1"] --> S0["slot 0"]
-    Pool --> S1["slot 1"]
-    Pool --> S2["slot 2"]
-    Pool --> SN["slot N-1"]
+    A["vLLM scheduler / block table"] --> B["kv_cache[2]<br/>indexer key cache<br/>HBM PA blocks"]
+    B --> C["npu_lightning_indexer"]
+    A --> C
+    C --> D["topk_indices<br/>logical token positions"]
 
-    S0 --> O0["owner=req 7<br/>token=1024<br/>generation=13"]
-    S1 --> O1["owner=req 2<br/>token=889<br/>generation=5"]
-    S2 --> O2["FREE"]
-    SN --> ON["owner=req 18<br/>token=65536<br/>generation=9"]
+    D --> E["Full KV residency lookup<br/>block_table + offset"]
+    E --> F{"full KV in HBM?"}
+    F -- "hit" --> G["HBM full KV slot"]
+    F -- "miss" --> H["NPU ASU read<br/>load full KV into HBM slot"]
+    H --> G
+    G --> I["sparse attention<br/>consume kv_cache[0]/[1] data"]
 
-    T0["token_state[7,1024]=RESIDENT(0)"] --> S0
-    T1["token_state[2,889]=RESIDENT(1)"] --> S1
-    T2["token_state[18,65536]=RESIDENT(N-1)"] --> SN
+    J["CPU between steps"] --> K["eviction plan"]
+    K --> E
 ```
 
-如果后续存在多个 attention group 或不同 KV layout，可以扩展为：
+## 4. 与 vLLM Block Table 的结合方式
+
+### 4.1 block table 不被替代
+
+本设计不新增一套 request-to-token 主索引来替代 vLLM block table。逻辑地址仍然这样计算：
 
 ```text
-pool_id + slot_id
+logical_pos
+  -> logical_block_idx = logical_pos / block_size
+  -> block_offset      = logical_pos % block_size
+  -> kv_block_id       = block_table[req, logical_block_idx]
 ```
 
-第一版建议保持一个统一 token slot pool，降低管理复杂度。
+然后 full KV residency overlay 使用：
 
-### 4.2 数据结构清单
+```text
+(layer_id, kv_block_id, block_offset)
+```
 
-所有运行期核心元数据都按 SoA 连续数组组织。粒度需要分清，否则容易把 req 级、token 级和 slot 级状态混在一起。
+作为查询 key。
 
-| 数据结构 | 粒度 | 推荐位置 | 主要字段 | 作用 |
-| --- | --- | --- | --- | --- |
-| `req_slot_free_stack` | req slot | NPU/Host mirrored | `req_slot_id` | 分配内部 req slot，避免直接使用 vLLM request id 做数组索引 |
-| `req_table` | req | NPU GM | `state`, `seq_len`, `generation`, `backend_ctx`, `resident_count`, `soft_quota` | 描述一个活跃请求的缓存管理状态 |
-| `batch_req_slots` | batch item | NPU GM | `batch_idx -> req_slot` | vLLM 每步调度后下发，lookup 通过它找到 req_slot |
-| `token_state` | logical token | NPU GM | packed `state + slot_id/backend_id/inflight_id` | 逻辑 token 到 HBM slot 或后端位置的主索引 |
-| `backend_loc_table` | logical token 或 backend record | NPU GM / 后端元数据 | backend offset / object id | 当 `token_state` payload 不够表达后端位置时作为 side table |
-| `slot_state` | physical token slot | NPU GM | `FREE/RESIDENT/LOADING/EVICTING/PROTECTED/DIRTY/hotness` | 描述 HBM 物理 slot 状态 |
-| `slot_owner_req` | physical token slot | NPU GM | `req_slot` | eviction apply 时反查 owner req |
-| `slot_owner_token` | physical token slot | NPU GM | `token_id` | eviction apply 时反查 logical token |
-| `slot_owner_generation` | physical token slot | NPU GM | `generation` | 防止 req_slot reset 后旧 slot 更新新 req |
-| `slot_backend` | physical token slot | NPU GM | backend id / offset | clean eviction 后写回 token_state 的 backend 引用 |
-| `free_stack` | physical token slot | NPU GM | `slot_id[]`, `free_top` | O(1) 批量 pop/push free slots |
-| `clock_state` | global pool | NPU GM | `clock_hand`, `scan_len` | CLOCK 淘汰连续扫描游标 |
-| `last_access_step` | physical token slot | NPU GM，可选 | recent access timestamp | Windowed LRU 备选方案使用 |
-| `victim_buffers` | eviction candidate | NPU GM/UB staging | `victim_over_quota[]`, `victim_normal[]` | eviction_prepare 输出候选 slot |
-| `load_job_table` | IO job | NPU GM | `(req, token, generation, target_slot, backend)` | backend -> HBM 换入任务 |
-| `writeback_job_table` | IO job | NPU GM | `(slot, req, token, generation, backend)` | dirty slot HBM -> backend 写回任务 |
-| `step_buffers` | inference step | NPU GM/UB staging | hit/miss/wait/touched/released lists | 每步 lookup、mark、alloc、apply 的临时列表 |
-| `cache_stats` | global / req | NPU GM/Host readable | hit/miss/evict/reuse counters | 命中率、miss reason、quota 调参依据 |
+### 4.2 block table 的双重语义
+
+同一个 `kv_block_id` 在两类 cache 中含义不同：
+
+| cache | `kv_block_id` 含义 |
+| --- | --- |
+| `kv_cache[2]` | HBM PA block id，indexer 直接用它读连续 HBM block |
+| `kv_cache[0]/[1]` | full KV logical block id，用于查 ASU 地址和 HBM residency |
+
+这要求 attention 路径不能继续把原始 block table 当成 `kv_cache[0]/[1]` 的完整 HBM PA block table 使用。否则它会假设 full KV 全部在 HBM，和本设计冲突。
+
+### 4.3 attention 接入方式
+
+第一版有两个实现选项。
+
+**方案 A：新增 ASU-aware sparse attention 接口。**
+
+attention op 接收：
+
+```text
+query
+topk_indices
+block_table
+full_kv_residency_metadata
+asu_handles
+hbm_slot_pool
+```
+
+op 内部或前置 materialize kernel 完成：
+
+```text
+topk logical token -> full KV HBM slot
+miss -> ASU read -> HBM slot
+attention compute
+```
+
+优点是数据路径清晰，不需要把 sparse indices 改写成临时 block table 语义。缺点是需要改 attention kernel 或增加一个新的 kernel group。
+
+**方案 B：先 materialize topK KV 到临时 workspace，再调用现有 attention。**
+
+前置 kernel 将 topK full KV gather 到一个 compact workspace：
+
+```text
+topk_indices -> compact_topk_kv_workspace
+```
+
+然后 attention 对 compact workspace 计算。这个方案可能复用部分现有 attention 代码，但需要改 sparse index 语义和 workspace block table，复杂度不一定更低。
+
+推荐第一版按方案 A 设计接口，具体实现可以先拆成两个 kernel：
+
+```text
+kernel 1: materialize_topk_full_kv
+kernel 2: sparse_attention_from_materialized_slots
+```
+
+这样可以先把 ASU/HBM residency 问题和 attention 算子问题解耦。
+
+## 5. 数据结构
+
+### 5.1 现有 vLLM 数据结构
+
+这些结构继续由 vLLM/vLLM-Ascend 维护：
+
+| 数据结构 | 粒度 | 作用 |
+| --- | --- | --- |
+| `block_table` | req x logical block | 逻辑 block 到 `kv_block_id` 的映射 |
+| `slot_mapping` | 当前 step token | 新 token 写入现有 KV cache 的位置 |
+| `seq_lens` | req | 当前可见历史长度 |
+| `cum_query_lens` | batch | indexer/attention 的 query 分段 |
+| `kv_cache[2]` | layer x block x token | indexer key cache，完整 HBM 常驻 |
+
+### 5.2 新增 ASU/HBM residency 数据结构
+
+新增结构只服务 `kv_cache[0]/[1]` 的 full KV。
+
+第一版建议按 layer 独立管理，因为每层 indexer topK 可能不同，每层 full KV 的访问热度也不同。后续可以评估 layer-group 或 all-layer bundle，以换取更大的 ASU IO 合并粒度。
+
+| 数据结构 | 粒度 | 推荐位置 | 作用 |
+| --- | --- | --- | --- |
+| `asu_block_base[layer, kv_block_id]` | block | NPU GM / Host mirrored | full KV 在 ASU 中的 block 起始地址 |
+| `block_epoch[layer, kv_block_id]` | block | NPU GM | 防止 block id 复用后的 stale IO 污染 |
+| `resident_bitmap[layer, kv_block_id]` | block offset bitset | NPU GM | 表示 block 内哪些 token offset 的 full KV 在 HBM |
+| `hbm_slot_table[layer, kv_block_id, offset]` | token | NPU GM | resident token 对应的 HBM slot id |
+| `hbm_slot_state[layer, slot]` | HBM slot | NPU GM | FREE / RESIDENT / LOADING / DIRTY / PROTECTED |
+| `hbm_slot_owner_block[layer, slot]` | HBM slot | NPU GM | slot 属于哪个 logical block |
+| `hbm_slot_owner_offset[layer, slot]` | HBM slot | NPU GM | slot 属于 block 内哪个 offset |
+| `hbm_slot_owner_epoch[layer, slot]` | HBM slot | NPU GM | slot 写入时的 block epoch |
+| `free_slot_stack[layer]` | HBM slot pool | NPU GM | 空闲 full KV HBM slot 栈 |
+| `load_job_table[layer]` | IO job | NPU GM | ASU -> HBM miss load 任务 |
+| `writeback_job_table[layer]` | IO job | NPU GM | HBM -> ASU dirty writeback 任务 |
+| `touch_ring[layer]` | token access event | NPU GM -> CPU | NPU 上报每步 hit/miss/touch 信息 |
+| `eviction_plan[layer]` | HBM slot list | CPU -> NPU GM | CPU 在 step 间生成的待淘汰 slot 列表 |
+| `cache_stats[layer]` | global / req / layer | NPU GM / Host readable | hit rate、miss reason、eviction 统计 |
 
 结构关系：
 
 ```mermaid
 flowchart TB
-    subgraph Req["Req 粒度"]
-        RT["req_table[req_slot]<br/>state / seq_len / generation / quota"]
-        BM["batch_req_slots[batch_idx]"]
-    end
+    BT["vLLM block_table<br/>req, logical_block -> kv_block_id"]
+    TK["topk_indices<br/>logical token positions"]
 
-    subgraph Token["Logical token 粒度"]
-        TS["token_state[req_slot, token_id]<br/>INVALID/BACKEND/LOADING/RESIDENT/EVICTING"]
-        BL["backend_loc_table"]
-    end
+    TK --> L1["logical_block_idx / block_offset"]
+    BT --> L1
+    L1 --> RB["resident_bitmap[layer, kv_block_id]"]
+    L1 --> ST["hbm_slot_table[layer, kv_block_id, offset]"]
+    L1 --> AB["asu_block_base[layer, kv_block_id]"]
 
-    subgraph Slot["Physical slot 粒度"]
-        SS["slot_state[slot_id]<br/>state / protected / dirty / hotness"]
-        OR["slot_owner_req[slot_id]"]
-        OT["slot_owner_token[slot_id]"]
-        OG["slot_owner_generation[slot_id]"]
-        SB["slot_backend[slot_id]"]
-    end
+    RB --> Q{"resident?"}
+    ST --> Q
+    AB --> Q
 
-    subgraph Pool["Pool 粒度"]
-        FS["free_stack + free_top"]
-        CK["clock_hand + victim buffers"]
-    end
+    Q -- "yes" --> HS["HBM full KV slot"]
+    Q -- "no" --> LD["load_job_table<br/>ASU -> HBM"]
+    LD --> HS
 
-    BM --> RT
-    RT --> TS
-    TS -- "RESIDENT(slot)" --> SS
-    TS -- "BACKEND(id)" --> BL
-    SS --> OR
-    SS --> OT
-    SS --> OG
-    SS --> SB
-    FS --> SS
-    CK --> SS
+    HS --> OW["slot owner<br/>block/offset/epoch"]
+    HS --> ATTN["sparse attention"]
 ```
 
-## 5. 状态编码与不变量
+### 5.3 HBM slot 的物理含义
 
-`token_state[req_slot, token_id]` 推荐使用 int32 packed state：
+`hbm_slot` 表示某一层 full attention KV 的一个 token 粒度物理位置，包含该层 sparse attention 需要的 `kv_cache[0]` 和 `kv_cache[1]` 数据。
 
 ```text
-bits 31..28: state
-bits 27..0 : slot_id / backend_id / inflight_id
+hbm_slot[layer, slot_id]:
+  kv_nope / latent value part  -> 对应当前 kv_cache[0] 的 token 数据
+  k_rope part                  -> 对应当前 kv_cache[1] 的 token 数据
 ```
 
-状态定义：
-
-| 状态 | 含义 |
-| --- | --- |
-| `INVALID` | token 尚未产生、请求已 reset，或该 token 不可访问 |
-| `BACKEND(id)` | token KV 不在 HBM，后端有副本 |
-| `LOADING(id)` | token 正在从后端换入 |
-| `RESIDENT(slot)` | token KV 在 HBM slot 中 |
-| `EVICTING(id)` | token 正在写回后端或等待释放 HBM slot |
-
-`slot_state[slot_id]` 推荐使用 bitset 或小整数：
+如果实现上仍保留两个独立 tensor，可以用同一个 `slot_id` 同时索引两份 tensor：
 
 ```text
-bit 0      FREE
-bit 1      RESIDENT
-bit 2      LOADING
-bit 3      EVICTING
-bit 4      PROTECTED
-bit 5      DIRTY
-bits 8..11 HOTNESS / second-chance counter
-bits 16..31 optional segment / debug flags
+full_kv_hbm0[layer][slot_id]  # kv_cache[0] equivalent
+full_kv_hbm1[layer][slot_id]  # kv_cache[1] equivalent
 ```
 
-必须满足的不变量：
+## 6. Decode 数据流
+
+### 6.1 第一轮 decode
+
+第一轮 decode 的输入来自 prefill 节点。
+
+设计要求：
+
+1. prefill 节点将完整 full attention KV 写入 ASU。
+2. prefill 节点将预测的 topK 传输给 decode 节点。
+3. decode 节点根据预测 topK 从 ASU 预取 full KV 到 HBM。
+4. decode 节点必须拥有当前候选范围所需的 `kv_cache[2]` indexer key cache，才能在后续 step 本地运行 Lightning Indexer。
+
+第 4 点是关键约束。当前 Lightning Indexer 需要完整候选范围的 indexer key cache。如果 decode 节点只有 prefill 预测 topK 的 full KV，而没有完整 `kv_cache[2]`，则第一步可以使用 prefill 给出的 topK，但第二步开始无法在 decode 节点上精确重算 indexer。
+
+因此第一版有一个硬性要求：
 
 ```text
-1. token_state == RESIDENT(slot) 时:
-      slot_state[slot] 必须是 RESIDENT，且 owner(req, token, generation) 匹配。
-
-2. slot_state == FREE 时:
-      slot_owner_req/token/generation 不参与语义判断，可置为 -1 便于 debug。
-
-3. LOADING / EVICTING 的 job 必须携带 req_generation。
-      完成回调只在 generation 匹配时更新 token_state。
-
-4. req reset 后 generation 必须递增。
-      旧 generation 的 inflight IO 完成后只能释放 slot，不能写入新 req 的 token_state。
-
-5. PROTECTED、LOADING、EVICTING slot 不允许被 eviction 选中。
+prefill -> decode handoff 必须使 decode 节点获得完整候选范围的 kv_cache[2]。
 ```
+
+实现方式可以是：
+
+| 方式 | 描述 | 代价 |
+| --- | --- | --- |
+| 直接传输 `kv_cache[2]` | prefill 节点把 indexer key cache 交给 decode 节点 | 占用 HBM 和传输带宽，但不改 indexer |
+| ASU 存一份 indexer key cache，decode 加载到 HBM | ASU 作为 handoff 介质 | 增加一次加载，但仍保持 indexer 不变 |
+| 重写 indexer 读取 ASU indexer key | 不要求 `kv_cache[2]` 完整 HBM | 不属于第一版，复杂度高 |
+
+第一版推荐前两种，具体取决于 prefill/decode 分离的通信代价。
+
+第一轮 decode 流程：
+
+```mermaid
+sequenceDiagram
+    participant P as Prefill Node
+    participant A as ASU
+    participant D as Decode Node
+    participant N as NPU
+
+    P->>A: write full attention KV for prompt
+    P->>D: send predicted topK
+    P->>D: handoff or enable loading of kv_cache[2]
+    D->>N: load predicted topK full KV from ASU to HBM
+    D->>N: run first decode attention
+    N->>A: write newly generated full KV
+    N->>D: append indexer key to kv_cache[2]
+```
+
+### 6.2 后续 decode step
+
+后续 step 的精确路径：
+
+```text
+1. vLLM 更新 batch metadata、block_table、seq_lens。
+2. 当前 layer 根据 hidden_states 生成当前 token 的 indexer key。
+3. 将当前 token 的 indexer key 写入 kv_cache[2]。
+4. Lightning Indexer 读取 kv_cache[2] + block_table，输出 topk_indices。
+5. materialize_topk_full_kv 根据 topk_indices 查询 full KV residency。
+6. HBM hit: 返回 HBM slot。
+7. HBM miss: NPU 从 ASU 读取 full KV 到 HBM slot，更新 residency。
+8. sparse attention 消费 materialized HBM full KV。
+9. 当前新 token 的 full KV 写入 HBM，并写穿或异步写入 ASU。
+10. CPU 在 step 间根据 touch_ring 更新 eviction_plan。
+```
+
+流程图：
+
+```mermaid
+flowchart TB
+    A["step start<br/>vLLM metadata ready"] --> B["write current token<br/>indexer key -> kv_cache[2]"]
+    B --> C["npu_lightning_indexer<br/>kv_cache[2] + block_table"]
+    C --> D["topk_indices"]
+    D --> E["materialize_topk_full_kv"]
+    E --> F{"HBM residency hit?"}
+    F -- "yes" --> G["return hbm_slot"]
+    F -- "no" --> H["allocate hbm_slot<br/>ASU read full KV"]
+    H --> I["update resident_bitmap<br/>hbm_slot_table"]
+    I --> G
+    G --> J["sparse attention"]
+    J --> K["new token full KV<br/>HBM + ASU write"]
+    K --> L["touch_ring stats"]
+    L --> M["CPU between steps<br/>eviction planning"]
+```
+
+## 7. 新生成 token 的管理
+
+新生成 token 会产生两类状态。
+
+### 7.1 indexer key
+
+保持现有路径：
+
+```text
+hidden_states -> indexer.wk/k_norm/rope -> kv_cache[2]
+```
+
+写入位置由 vLLM `slot_mapping` 和 block table 控制。它必须立即对下一步 indexer 可见。
+
+### 7.2 full attention KV
+
+新 token 的 full attention KV 需要同时进入 HBM 和 ASU：
+
+```text
+1. vLLM 为新 token 分配 logical block + offset。
+2. residency layer 为该 token 分配 HBM slot。
+3. 当前 layer full KV 写入 HBM slot。
+4. resident_bitmap[layer, kv_block_id].set(offset)。
+5. hbm_slot_table[layer, kv_block_id, offset] = slot。
+6. slot owner 写入 block/offset/epoch。
+7. full KV 写入 ASU。
+8. ASU 写完成前 slot 标记 DIRTY。
+9. ASU 写完成后清 DIRTY，slot 可被 clean eviction。
+```
+
+推荐策略：
+
+```text
+新生成 token 默认进入 HBM。
+最近 tail window 内 token 默认 protected 或高 hotness。
+ASU 写采用 write-through 或异步 write-behind，但 dirty slot 不允许直接释放。
+```
+
+原因：
+
+1. 新 token 很可能在后续若干 step 被 indexer 选中。
+2. tail window 对模型质量和命中率都重要。
+3. 新 token 若不及时写 ASU，发生 eviction 或 req 迁移时会丢状态。
 
 状态机：
 
 ```mermaid
 stateDiagram-v2
-    [*] --> INVALID
-    INVALID --> LOADING: backend load
-    BACKEND --> LOADING: backend load
-    LOADING --> RESIDENT: load done, generation match
-    LOADING --> BACKEND: load fail
-    LOADING --> INVALID: req reset/cancel
-    RESIDENT --> EVICTING: dirty eviction
-    EVICTING --> BACKEND: writeback done, generation match
-    RESIDENT --> BACKEND: clean eviction
-    RESIDENT --> INVALID: req reset/finish
+    [*] --> NEW_TOKEN
+    NEW_TOKEN --> HBM_DIRTY: write full KV to HBM
+    HBM_DIRTY --> ASU_WRITING: enqueue ASU write
+    ASU_WRITING --> HBM_CLEAN: ASU write done
+    HBM_CLEAN --> EVICTABLE: attention step done / unprotected
+    HBM_DIRTY --> WRITEBACK_REQUIRED: eviction requested
+    WRITEBACK_REQUIRED --> HBM_CLEAN: writeback done
 ```
 
-```mermaid
-stateDiagram-v2
-    [*] --> FREE
-    FREE --> LOADING: allocate for miss
-    FREE --> RESIDENT: allocate for new token
-    LOADING --> RESIDENT: load done
-    LOADING --> FREE: load fail or stale generation
-    RESIDENT --> EVICTING: dirty eviction
-    EVICTING --> FREE: writeback done
-    RESIDENT --> FREE: clean eviction or req reset
-```
+## 8. 查询与 Materialize 流程
 
-## 6. vLLM Req 变化时的数据维护
+`topk_indices` 是 logical token position。materialize 阶段把它变成 attention 可消费的 HBM full KV。
 
-vLLM scheduler 每步可能改变 batch 内 req 的集合和顺序。KVCache manager 不能依赖 batch_idx 稳定，只能依赖内部 `req_slot`。
+### 8.1 输入输出
 
-### 6.1 新 req admission
-
-新请求进入时：
+输入：
 
 ```text
-1. 从 req_slot_free_stack 分配 req_slot。
-2. req_generation[req_slot] += 1。
-3. 初始化 req_table[req_slot]:
-      state = ACTIVE
-      seq_len = prompt_len 或 0
-      resident_count = 0
-      soft_quota = current_global_quota
-      backend_ctx = request backend handle
-4. token_state[req_slot, 0:max_model_len] 置 INVALID。
-5. Host/vLLM 侧记录 vllm_request_id -> req_slot。
-6. 当前 step 的 batch_req_slots[batch_idx] 写入 req_slot。
+topk_indices[layer, batch, query, k]
+block_table[batch, logical_block_idx]
+resident_bitmap[layer, kv_block_id]
+hbm_slot_table[layer, kv_block_id, offset]
+asu_block_base[layer, kv_block_id]
+free_slot_stack[layer]
 ```
 
-如果 prompt 的部分 KV 已由 prefill 直接写入 HBM，则在 prefill insert 阶段逐 token 更新 `token_state` 和 slot owner；如果 prompt KV 先落后端，则将对应 token 置为 `BACKEND(id)`。
-
-### 6.2 batch reorder / reschedule
-
-batch 顺序变化时只更新：
+输出：
 
 ```text
-batch_req_slots[batch_idx] = req_slot
+materialized_slot_indices[layer, batch, query, k]
+miss_job_list[layer]
+touch_list[layer]
 ```
 
-不移动 KV，不移动 `token_state` row，不改变 `slot_owner_*`。这是配合 vLLM 动态 batching 的关键点。
-
-### 6.3 decode append 新 token
-
-每个 req decode 生成新 token KV 后：
+### 8.2 查询逻辑
 
 ```text
-1. allocator 申请一个 free slot。
-2. KV insert 写入 kv_cache[:, slot, ...]。
-3. token_state[req, token] = RESIDENT(slot)。
-4. slot_owner_req[slot] = req。
-5. slot_owner_token[slot] = token。
-6. slot_owner_generation[slot] = req_generation[req]。
-7. slot_state[slot] = RESIDENT | PROTECTED | hotness=max。
-8. req_resident_count[req] += 1。
-9. attention 使用完成后清 PROTECTED。
-```
+for each topk logical_pos:
+    logical_block_idx = logical_pos / block_size
+    offset = logical_pos % block_size
+    kv_block_id = block_table[batch, logical_block_idx]
 
-### 6.4 pause / preempt
-
-请求被 vLLM 暂停或抢占时：
-
-```text
-1. req_table[req].state = PAUSED。
-2. 清理该 req 当前 step 的 PROTECTED 标记。
-3. 不立即扫描释放全部 token。
-4. 后续 eviction 可自然淘汰该 req 的 cold tokens。
-```
-
-这样可以避免 pause 时出现一次性大规模随机更新。若后端压力允许，也可在低优先级 stream 中主动扫描该 req 的 `token_state` row，把超 quota 的 resident token 逐步释放。
-
-### 6.5 finish / cancel / reset
-
-请求结束或取消时进入 reset 流程。reset 是 req slot 复用前必须执行的索引清理流程，详见第 9 节。
-
-Req 生命周期：
-
-```mermaid
-flowchart TB
-    A["vLLM admits request"] --> B["allocate req_slot<br/>generation++"]
-    B --> C["init req_table<br/>token_state row INVALID"]
-    C --> D["ACTIVE"]
-    D --> E["batch reorder"]
-    E --> D
-    D --> F["decode append token"]
-    F --> D
-    D --> G["pause / preempt"]
-    G --> D
-    D --> H["finish / cancel"]
-    H --> I["RESETTING<br/>generation guard active"]
-    I --> J["release resident slots<br/>cancel/stale inflight jobs"]
-    J --> K["req_slot back to req_slot_free_stack"]
-```
-
-## 7. 索引查询流程
-
-查询输入来自 DSA indexer：
-
-```text
-topk_token_ids[batch_idx, query_idx, k]
-batch_req_slots[batch_idx]
-```
-
-查询输出：
-
-```text
-physical_topk_indices
-hit_mask
-miss_token_list
-wait_token_list
-touched_slot_list
-```
-
-查询 kernel 语义：
-
-```text
-for each (batch_idx, query_idx, k):
-    req = batch_req_slots[batch_idx]
-    token = topk_token_ids[batch_idx, query_idx, k]
-    state = token_state[req, token]
-
-    if state is RESIDENT(slot):
-        physical_topk_indices[...] = slot
-        hit_mask[...] = 1
-        touched_slot_list.append(slot)
-
-    elif state is LOADING(inflight_id):
-        hit_mask[...] = 0
-        wait_token_list.append(req, token, inflight_id)
-
-    elif state is BACKEND(backend_id):
-        hit_mask[...] = 0
-        miss_token_list.append(req, token, backend_id)
-
+    if resident_bitmap[layer, kv_block_id].test(offset):
+        slot = hbm_slot_table[layer, kv_block_id, offset]
+        materialized_slot_indices[...] = slot
+        touch_list.append(slot)
     else:
-        hit_mask[...] = 0
-        miss_token_list.append(req, token, INVALID_BACKEND)
+        slot = allocate_hbm_slot()
+        asu_addr = asu_block_base[layer, kv_block_id] + offset * full_kv_stride
+        enqueue_load(asu_addr, slot)
+        materialized_slot_indices[...] = slot
 ```
 
-查询流程图：
+### 8.3 Miss 去重与 IO 合并
+
+同一个 step 内，多个 query/head 可能访问同一个 logical token。materialize 需要去重：
+
+```text
+(layer, kv_block_id, offset) unique
+```
+
+建议优先采用排序/分段压缩，而不是 hash table：
+
+```text
+1. 生成 miss candidates。
+2. 按 kv_block_id、offset 排序或局部分桶。
+3. 去重。
+4. 对连续 offset 合并 ASU read。
+```
+
+这样更符合 Ascend NPU 的连续访问和批处理特性。
+
+### 8.4 Free slot 不足处理
+
+NPU step 内不应临时做复杂淘汰扫描。第一版采用水位线机制：
+
+```text
+CPU 在 step 间保证:
+  free_slot_count[layer] >= next_step_miss_budget[layer] + reserve_margin
+```
+
+如果 step 内仍然 free slot 不足：
+
+1. 优先使用 reserve slots。
+2. reserve 仍不足时执行 bounded emergency eviction，只从 CPU 已下发的 `eviction_plan` 中 pop victim。
+3. 如果 eviction_plan 也不足，当前 step 回退为同步等待 CPU 生成 plan 或触发 admission 降载。
+
+也就是说，NPU 不遍历 free 表，不做链表，不做全局 LRU 更新。
 
 ```mermaid
 flowchart TB
-    A["DSA indexer 输出 topK logical tokens"] --> B["读取 batch_req_slots<br/>batch_idx -> req_slot"]
-    B --> C["GM 读取 token_state[req_slot, token_id]"]
-    C --> D{"state"}
-    D -- "RESIDENT(slot)" --> E["写 physical_topk_indices<br/>追加 touched_slot_list"]
-    D -- "LOADING(id)" --> F["追加 wait_token_list<br/>复用 inflight load"]
-    D -- "BACKEND(id)" --> G["追加 miss_token_list"]
-    D -- "INVALID" --> G
-    E --> H["mark kernel 批量设置 hotness / PROTECTED"]
-    F --> I["等待或调度依赖处理"]
-    G --> J["miss 去重后进入 load 流程"]
-```
-
-NPU 友好约束：
-
-- lookup hot path 只读 `token_state`，不做链表移动。
-- hit 不立即随机写 `slot_state`，先生成 `touched_slot_list`。
-- `touched_slot_list` 在 UB 或临时 GM buffer 中按 step 去重，再批量 mark。
-- `miss_token_list` 建议按 `(req, token)` sort/unique 或分段去重，避免 hash 表随机探测。
-- `wait_token_list` 用于处理同一 token 被多 query 命中但 load 尚未完成的情况。
-
-## 8. 索引维护流程
-
-索引维护分四类：hit mark、miss load、new token insert、eviction apply。原则是 hot path 少写，冷路径批量写。
-
-### 8.1 Hit mark
-
-lookup 生成 `touched_slot_list` 后：
-
-```text
-1. 对 touched_slot_list 去重。
-2. 批量读取 slot_state。
-3. 对仍然 RESIDENT 且 generation 匹配的 slot:
-      hotness = max_hotness
-      PROTECTED = 1
-4. attention 完成后:
-      PROTECTED = 0
-```
-
-流程图：
-
-```mermaid
-flowchart LR
-    A["touched_slot_list"] --> B["unique / compact"]
-    B --> C["read slot_state + owner_generation"]
-    C --> D{"valid resident?"}
-    D -- "yes" --> E["set hotness=max<br/>PROTECTED=1"]
-    D -- "no" --> F["drop stale touch"]
-    E --> G["attention done"]
-    G --> H["clear PROTECTED"]
-```
-
-### 8.2 Miss load 与索引更新
-
-miss token 从后端读回 HBM：
-
-```text
-1. miss_token_list 按 (req, token) 去重。
-2. 对每个 miss:
-      如果 token_state 已经是 LOADING，复用 inflight load。
-      否则设置 token_state = LOADING(inflight_id)。
-3. 从 free_stack 分配 target slots。
-4. free slots 不足时触发 eviction_prepare + eviction_apply。
-5. NPU 发起 backend -> HBM slot 读取。
-6. load 完成后检查 req_generation。
-7. generation 匹配:
-      token_state[req, token] = RESIDENT(slot)
-      slot_owner_req/token/generation 更新
-      slot_backend[slot] = backend_id
-      slot_state[slot] = RESIDENT | PROTECTED | hotness=max
-      req_resident_count[req] += 1
-8. generation 不匹配:
-      slot_state[slot] = FREE
-      slot push 回 free_stack
-      不更新 token_state
-```
-
-流程图：
-
-```mermaid
-flowchart TB
-    A["miss_token_list"] --> B["unique by req/token"]
-    B --> C{"token_state 已是 LOADING?"}
-    C -- "yes" --> D["wait_token_list 复用 inflight_id"]
-    C -- "no" --> E["reserve inflight_id<br/>token_state=LOADING"]
-    E --> F["allocator 分配 target_slot"]
-    F --> G{"free slots enough?"}
-    G -- "no" --> H["eviction prepare/apply"]
-    H --> F
-    G -- "yes" --> I["backend -> HBM load"]
-    I --> J{"generation match?"}
-    J -- "yes" --> K["token_state=RESIDENT(slot)<br/>slot owner/state 更新"]
-    J -- "no" --> L["释放 target_slot<br/>丢弃 stale load"]
-```
-
-### 8.3 New token insert
-
-decode append 或 prefill 产生新 KV 时，本质上是直接写入 HBM 的 load：
-
-```text
-1. allocator 分配 slot。
-2. KV writer 写 kv_cache[:, slot, ...]。
-3. token_state[req, new_token] = RESIDENT(slot)。
-4. slot_owner_req/token/generation 更新。
-5. slot_state = RESIDENT | PROTECTED | DIRTY | hotness=max。
-6. 如果后端立即有副本，可清 DIRTY 并设置 slot_backend。
-```
-
-如果新 token 尚未落后端，则 DIRTY 表示 eviction 时需要 writeback。
-
-### 8.4 Eviction apply 与索引回写
-
-`eviction_prepare` 只生成 victim slot，不直接改 `token_state`。`eviction_apply` 批量处理 victim：
-
-```text
-for slot in victim_buffer:
-    req = slot_owner_req[slot]
-    token = slot_owner_token[slot]
-    gen = slot_owner_generation[slot]
-
-    if gen != req_generation[req]:
-        slot_state[slot] = FREE
-        released_slots.append(slot)
-        continue
-
-    if DIRTY:
-        token_state[req, token] = EVICTING(writeback_id)
-        enqueue writeback_job(slot, req, token, gen)
-    else:
-        token_state[req, token] = BACKEND(slot_backend[slot])
-        slot_state[slot] = FREE
-        released_slots.append(slot)
-        req_resident_count[req] -= 1
-```
-
-writeback 完成后：
-
-```text
-if generation match:
-    token_state[req, token] = BACKEND(new_backend_loc)
-
-slot_state[slot] = FREE
-released_slots.append(slot)
-free_stack push released_slots
-```
-
-流程图：
-
-```mermaid
-flowchart TB
-    A["victim_buffer"] --> B["read owner req/token/generation"]
-    B --> C{"generation match?"}
-    C -- "no" --> D["slot FREE<br/>push free_stack"]
-    C -- "yes" --> E{"DIRTY?"}
-    E -- "no" --> F["token_state=BACKEND<br/>slot FREE"]
-    E -- "yes" --> G["token_state=EVICTING<br/>enqueue writeback"]
-    G --> H["writeback done"]
-    H --> I{"generation match?"}
-    I -- "yes" --> J["token_state=BACKEND(new loc)"]
-    I -- "no" --> K["skip token_state update"]
-    J --> D
-    K --> D
-    F --> D
-```
-
-## 9. Reset 流程
-
-reset 用于 req finish/cancel 后释放 HBM slot 并复用 req_slot。reset 不能依赖 per-req linked list，因此推荐扫描该 req 的 dense `token_state` row。该扫描是连续访问，适合放在非关键 stream 或分 chunk 执行。
-
-reset 输入：
-
-```text
-req_slot
-old_generation = req_generation[req_slot]
-seq_len
-```
-
-reset 步骤：
-
-```text
-1. req_table[req].state = RESETTING。
-2. req_generation[req] += 1，使旧 inflight IO 立即变成 stale。
-3. 分 chunk 扫描 token_state[req, 0:seq_len]。
-4. 对 RESIDENT(slot):
-      如果 slot_owner_generation[slot] == old_generation:
-          slot_state[slot] = FREE
-          released_slots.append(slot)
-5. 对 LOADING/EVICTING:
-      标记 job stale；完成回调只释放 slot，不更新 token_state。
-6. token_state[req, 0:seq_len] 置 INVALID。
-7. released_slots 批量 push 到 free_stack。
-8. req_resident_count[req] = 0。
-9. req_table[req].state = FREE。
-10. req_slot push 回 req_slot_free_stack。
-```
-
-reset 流程图：
-
-```mermaid
-flowchart TB
-    A["finish / cancel req"] --> B["state=RESETTING<br/>generation++"]
-    B --> C["chunk scan token_state row"]
-    C --> D{"token state"}
-    D -- "RESIDENT(slot)" --> E{"slot generation == old_generation?"}
-    E -- "yes" --> F["slot_state=FREE<br/>append released_slots"]
-    E -- "no" --> G["skip stale slot"]
-    D -- "LOADING/EVICTING" --> H["mark inflight job stale"]
-    D -- "BACKEND/INVALID" --> I["no slot release"]
-    F --> J["token_state entry=INVALID"]
-    G --> J
-    H --> J
-    I --> J
-    J --> K{"more chunks?"}
-    K -- "yes" --> C
-    K -- "no" --> L["released_slots push free_stack"]
-    L --> M["req_table reset<br/>req_slot push free stack"]
-```
-
-reset 的关键风险是异步 IO 完成与 req_slot 复用乱序。因此 `generation` 是必须的数据结构，不建议省略。
-
-## 10. Free Slot 分配与淘汰
-
-free slot 分配不通过链表，也不应该每次遍历 free bitmap。
-
-推荐使用数组栈：
-
-```text
-free_stack[N] int32
-free_top      int32
-```
-
-分配 K 个 slot：
-
-```text
-slots = free_stack[free_top - K : free_top]
-free_top -= K
-```
-
-释放 K 个 slot：
-
-```text
-free_stack[free_top : free_top + K] = released_slots
-free_top += K
-```
-
-这是连续数组尾部读写，不是链表。
-
-### 10.1 分配 fast path
-
-```mermaid
-flowchart TB
-    A["需要 K 个 slots"] --> B{"free_top >= K?"}
-    B -- "yes" --> C["从 free_stack 直接 pop K 个<br/>无扫描"]
-    B -- "no" --> D["触发 eviction_prepare<br/>连续扫描 slot_state"]
-    D --> E["生成 victim_buffer"]
-    E --> F["eviction_apply 释放 victims"]
-    F --> G["released slots push free_stack"]
+    A["miss needs slot"] --> B{"free_slot_stack enough?"}
+    B -- "yes" --> C["pop free slot"]
+    B -- "no" --> D{"reserve slots enough?"}
+    D -- "yes" --> E["use reserve slot"]
+    D -- "no" --> F{"eviction_plan has victim?"}
+    F -- "yes" --> G["apply planned victim<br/>free slot"]
+    F -- "no" --> H["backpressure<br/>CPU plan or admission throttle"]
     G --> C
+    E --> C
 ```
 
-关键点：
+## 9. 淘汰机制
+
+淘汰逻辑放在 step 间由 CPU 处理，NPU 只应用 plan。
+
+### 9.1 CPU 侧输入
+
+CPU 每步读取或接收：
 
 ```text
-分配空位不遍历。
-只有 free slots 不足或低水位时，才连续扫描 slot_state 生成 victims。
+touch_ring:
+  hit slots
+  miss loaded slots
+  new token slots
+  per-req / per-layer hit miss counters
+
+slot state snapshot:
+  FREE / RESIDENT / LOADING / DIRTY / PROTECTED
+  owner block / offset / epoch
+
+vLLM scheduler state:
+  active reqs
+  paused reqs
+  finished reqs
+  seq_lens
 ```
 
-`free_bitmap` 可以保留用于 debug、一致性检查、异常恢复，但不作为运行时主分配结构。
+### 9.2 淘汰优先级
 
-### 10.2 淘汰策略
+目标命中率 95% 时，淘汰优先级不能只看“最老”。需要保护 DSA 最可能再次访问的 token。
 
-淘汰策略保留两套可评估方案：
+推荐优先级从不能淘汰到优先淘汰：
 
-```text
-方案 A: CLOCK / hotness
-    当前推荐 baseline。逻辑简单，NPU 友好，牺牲一部分 LRU 精度。
-
-方案 B: Windowed LRU / Batched LRU
-    LRU 备选方案。用 last_access_step 表达最近访问时间，
-    淘汰时在连续扫描窗口内选择最老 token。
-```
-
-严格 global linked-list LRU 只作为对照方案，不建议作为 NPU 第一版实现。
-
-两套方案共享相同的触发条件：
-
-```text
-if free_top < needed_slots:
-    eviction_prepare()
-
-if free_top < low_watermark:
-    background_eviction_prepare()
-```
-
-其中：
-
-```text
-needed_slots = unique_miss_tokens_to_load + decode_new_tokens_to_write
-shortage = max(0, needed_slots - free_top)
-target_victims = shortage + refill_margin
-```
-
-`refill_margin` 用于避免刚释放完马上再次触发淘汰。
-
-扫描方式不是随机选一段，而是确定性的环形顺序扫描：
-
-```text
-start = clock_hand
-end = clock_hand + scan_len
-
-if end <= total_slots:
-    scan slot_state[start:end]
-else:
-    scan slot_state[start:total_slots]
-    scan slot_state[0:end % total_slots]
-
-clock_hand = end % total_slots
-```
-
-这保证 `eviction_prepare` 的主访问是连续 GM 读，适合 Ascend NPU 做 tile、vector mask 和 compact。
-
-#### 10.2.1 方案 A: CLOCK / hotness
-
-CLOCK / hotness 方案用小整数近似访问热度。命中时把 `hotness` 设置到最大值；淘汰扫描时遇到热 token 只递减热度，不立即淘汰。
-
-额外元数据：
-
-```text
-clock_hand
-scan_len
-slot_state[slot].hotness     2-bit 或 3-bit counter
-victim_over_quota_clean[]
-victim_normal_clean[]
-victim_over_quota_dirty[]
-victim_normal_dirty[]
-```
-
-hit mark 流程：
-
-```text
-1. lookup 只输出 touched_slot_list，不直接写 slot_state。
-2. mark kernel 对 touched_slot_list 去重。
-3. 对 unique touched slot:
-      hotness = max_hotness
-      PROTECTED = 1
-4. attention 完成后:
-      PROTECTED = 0
-```
-
-`eviction_prepare` 连续扫描：
-
-```text
-scan range = [clock_hand, clock_hand + scan_len)
-
-for slot in scan range:
-    state = slot_state[slot]
-
-    if slot is not RESIDENT:
-        skip
-
-    if slot is LOADING or EVICTING or PROTECTED:
-        skip
-
-    if hotness > 0:
-        hotness -= 1
-        skip
-
-    owner_req = slot_owner_req[slot]
-    over_quota = req_resident_count[owner_req] > req_soft_quota[owner_req]
-
-    if over_quota and clean:
-        append victim_over_quota
-    elif clean:
-        append victim_normal
-    elif over_quota and dirty:
-        append victim_dirty_over_quota
-    else:
-        append victim_dirty_normal
-```
-
-CLOCK / hotness 的淘汰优先级：
-
-```text
-1. cold + over_quota + clean
-2. cold + normal_quota + clean
-3. cold + over_quota + dirty
-4. cold + normal_quota + dirty
-5. emergency: warm + over_quota
-```
-
-优先级原则：
-
-```text
-安全状态 > hotness > req quota > clean/dirty > scan age
-```
-
-`hotness` 建议先使用 2-bit 或 3-bit counter，而不是单 bit refbit。命中后设置到 max，淘汰扫描每轮递减。这样比单次 second-chance 更接近 DSA token 重用模式，但仍然保持连续扫描和简单分支。
-
-流程图：
-
-```mermaid
-flowchart TB
-    A["free_top < needed_slots"] --> B["从 clock_hand 顺序扫描 slot_state window"]
-    B --> C{"slot safe?<br/>RESIDENT && !PROTECTED && !LOADING && !EVICTING"}
-    C -- "no" --> D["skip"]
-    C -- "yes" --> E{"hotness > 0?"}
-    E -- "yes" --> F["hotness -= 1<br/>skip"]
-    E -- "no" --> G["读取 owner_req<br/>判断 over_quota / dirty"]
-    G --> H["按优先级写入 victim buffers"]
-    H --> I{"victim_count >= target?"}
-    I -- "no" --> B
-    I -- "yes" --> J["eviction_apply<br/>释放 clean / writeback dirty"]
-    D --> I
-    F --> I
-```
-
-该方案的 NPU 压力主要在：
-
-```text
-1. eviction_prepare 对 slot_state/owner 数组做连续读。
-2. hotness > 0 时需要写回 hotness--，这是连续窗口内的批量写。
-3. eviction_apply 对 victim 对应的 token_state[req, token] 做随机写。
-```
-
-优点：
-
-```text
-1. 数据结构简单。
-2. 不需要 per-hit 维护 LRU 链表。
-3. 扫描和 hotness 衰减都发生在连续窗口内。
-4. 容易控制每 step 最大扫描预算。
-```
-
-缺点：
-
-```text
-1. 只能近似 recency，无法严格选择最久未访问 token。
-2. hotness counter 粒度有限，可能无法区分多个较老 token 的先后顺序。
-3. 如果 hotness 设置过高，会导致扫描效率下降。
-```
-
-#### 10.2.2 方案 B: Windowed LRU / Batched LRU
-
-Windowed LRU 不维护全局 LRU 链表，而是给每个 physical slot 记录最近访问 step。淘汰时仍然顺序扫描一个窗口，只是在窗口候选里选择 `last_access_step` 最老的 slot。
-
-额外元数据：
-
-```text
-global_cache_step          uint64
-last_access_step[N]        uint32 / uint64
-last_mark_step[N]          uint32，可选，用于同 step 重复 touch 过滤
-lru_candidate_slots[M]     int32
-lru_candidate_score[M]     int32
-lru_victim_buffer[K]       int32
-```
-
-hit mark 流程：
-
-```text
-1. lookup 输出 touched_slot_list。
-2. touched_slot_list 去重。
-3. 对 unique touched slot:
-      last_access_step[slot] = global_cache_step
-      PROTECTED = 1
-4. attention 完成后:
-      PROTECTED = 0
-5. step 完成:
-      global_cache_step += 1
-```
-
-Windowed LRU 的关键点是：hit hot path 仍然不做链表移动，只做批量 timestamp 写入。
-
-淘汰候选过滤：
-
-```text
-candidate =
-    RESIDENT
-  & !PROTECTED
-  & !LOADING
-  & !EVICTING
-```
-
-候选评分：
-
-```text
-age = global_cache_step - last_access_step[slot]
-
-score =
-    age
-  + over_quota_bonus
-  - dirty_penalty
-  - protected_penalty
-```
-
-其中 `protected_penalty` 在正常情况下不需要，因为 `PROTECTED` 已经过滤掉；保留该项主要用于 emergency 策略。
-
-victim 选择可以有两种实现：
-
-```text
-1. topK select:
-      在候选窗口内选 score 最大的 K 个。
-      精度更高，但需要 selection / partial sort。
-
-2. bucket select:
-      按 age 高位或 age range 分桶。
-      先取 oldest bucket，再按 quota/dirty 优先级取 victim。
-      精度略低，但更适合 NPU vector compact。
-```
-
-建议第一版 Windowed LRU 使用 bucket select，不做完整排序。
-
-流程图：
-
-```mermaid
-flowchart TB
-    A["free_top < needed_slots"] --> B["从 clock_hand 顺序扫描 slot_state window"]
-    B --> C["过滤 safe resident slots"]
-    C --> D["连续读取 last_access_step"]
-    D --> E["计算 age / score"]
-    E --> F{"选择策略"}
-    F -- "topK select" --> G["选 score 最大的 K 个"]
-    F -- "bucket select" --> H["按 age bucket compact<br/>优先 oldest buckets"]
-    G --> I["lru_victim_buffer"]
-    H --> I
-    I --> J["eviction_apply<br/>释放 clean / writeback dirty"]
-```
-
-该方案的 NPU 压力主要在：
-
-```text
-1. mark kernel 需要随机批量写 last_access_step[slot]。
-2. eviction_prepare 需要连续读取 last_access_step window。
-3. topK select 或 bucket compact 比 CLOCK 判断更重。
-4. eviction_apply 仍然有 token_state[req, token] 随机写。
-```
-
-优点：
-
-```text
-1. 比 CLOCK 更接近 LRU，能区分更细的 recency。
-2. 在 DSA working set 有明显时间局部性时，可能提升命中率。
-3. 仍然避免链表，淘汰扫描仍然是连续窗口。
-4. 可通过 age bucket 限制 NPU 上的 selection 复杂度。
-```
-
-缺点：
-
-```text
-1. hit mark 多一个 last_access_step 随机批量写。
-2. eviction_prepare 需要读 timestamp 并计算 score。
-3. 如果 touched_slot_list 很大，timestamp 写放大可能明显。
-4. topK select 实现复杂度高于 CLOCK。
-```
-
-#### 10.2.3 严格 Global LRU 对照方案
-
-严格 LRU 需要维护全局双向链表：
-
-```text
-lru_prev[N]
-lru_next[N]
-lru_head
-lru_tail
-```
-
-每次 hit 都要把 slot 移到链表头：
-
-```text
-prev = lru_prev[slot]
-next = lru_next[slot]
-
-lru_next[prev] = next
-lru_prev[next] = prev
-lru_prev[old_head] = slot
-lru_next[slot] = old_head
-lru_prev[slot] = INVALID
-lru_head = slot
-```
-
-这个方案语义最精确，但不适合作为 Ascend NPU 首版：
-
-```text
-1. 每次 hit 都有多次 data-dependent random read/write。
-2. topK hit 数量大时，LRU 更新会进入 hot path。
-3. 并发 mark 同一 slot 或相邻节点需要 atomic/CAS/lock。
-4. 链表节点跳转破坏连续访存。
-5. request reset/eviction 时链表删除也需要随机更新前后节点。
-```
-
-因此严格 LRU 只建议用于 CPU simulator 或离线评估，作为判断 CLOCK/Windowed LRU 命中率差距的 upper bound。
-
-#### 10.2.4 两种可实现方案对比
-
-| 维度 | CLOCK / hotness | Windowed LRU / Batched LRU |
+| 优先级 | 类别 | 处理 |
 | --- | --- | --- |
-| 访问热度表达 | 2-bit/3-bit hotness counter | `last_access_step` timestamp |
-| hit 维护 | unique touch 后设置 hotness=max | unique touch 后写 last_access_step=current_step |
-| 淘汰扫描 | 连续扫描 slot_state | 连续扫描 slot_state + last_access_step |
-| victim 选择 | hotness==0 后按 quota/dirty 分 buffer | 在窗口内选 age 最大或 oldest bucket |
-| NPU 实现复杂度 | 低 | 中 |
-| 随机写压力 | touched slot 写 hotness | touched slot 写 timestamp |
-| 命中率潜力 | 中 | 中高 |
-| 适合作为第一版 | 是 | 可作为对比实验 |
+| P0 | 当前 step topK / attention 正在使用 | 禁止淘汰，`PROTECTED` |
+| P1 | 新生成 tail window | 强保护或高 hotness |
+| P2 | prefill 预测 topK / next-step 预测 topK | 高 hotness，优先保留 |
+| P3 | 近期多次被 indexer 选中的 token | 根据 touch 计数保留 |
+| P4 | 普通 clean resident token | 可淘汰 |
+| P5 | paused req 的非近期 token | 优先淘汰 |
+| P6 | 超出 soft quota req 的冷 token | 优先淘汰 |
+| P7 | stale epoch / finished req token | 立即释放 |
 
-推荐策略：
+### 9.3 Baseline：CPU Windowed LRU
 
-```text
-1. 第一版实现 CLOCK / hotness。
-2. 同时保留 last_access_step 的可选编译/运行开关。
-3. 通过真实 DSA trace 对比:
-      CLOCK hit rate
-      Windowed LRU hit rate
-      eviction scan efficiency
-      mark kernel 写放大
-4. 如果 Windowed LRU 命中率提升明显，且 mark/selection 成本可接受，再切为默认。
-```
+第一版推荐 CPU 侧 Windowed LRU，而不是 NPU 侧精确 LRU。
 
-### 10.3 Per-Req Soft Quota
-
-全局 pool 不固定切给每个 req，但需要防止单个请求占满 HBM。
-
-维护：
+CPU 维护：
 
 ```text
+last_touch_step[layer, slot]
+touch_count_window[layer, slot]
 req_resident_count[req]
-req_soft_quota[req] = total_slots / target_concurrency
+layer_free_watermark[layer]
 ```
 
-这是 soft quota，不是 hard partition：
+每个 step 间：
 
 ```text
-1. 全局 free slots 充足时，长请求可以超过 soft quota。
-2. free slots 紧张时，淘汰优先从超过 soft quota 的 req 里选 cold tokens。
-3. 未超过 quota 的 req 仍可能被淘汰，但优先级更低。
+1. 消费 touch_ring，更新 last_touch_step 和 touch_count_window。
+2. 计算每层 free slot 缺口。
+3. 优先选择 stale / paused / over-quota 的 clean cold slots。
+4. 避开 PROTECTED / LOADING / DIRTY。
+5. 生成 eviction_plan[layer]，按 slot id 数组下发给 NPU。
 ```
 
-## 11. 推理中的 step 级维护流程
+这里的 LRU 不要求每次 hit 都修改链表。hit 只写 touch ring；排序和选择在 CPU step 间完成。
 
-推荐 step 级流程：
+### 9.4 备选：CLOCK / Hotness
+
+如果 CPU LRU 维护成本过高，可以退化为 CLOCK / hotness：
+
+```text
+slot.hotness:
+  hit/new/predicted topK -> set max
+  CPU 每轮扫描候选时 hotness--
+  hotness==0 且 clean 且 unprotected -> victim
+```
+
+这个方案更简单，但对 95% 命中率的可控性弱于 Windowed LRU。
+
+### 9.5 Dirty slot 处理
+
+dirty slot 不能直接释放。
+
+```text
+if victim is DIRTY:
+    enqueue writeback to ASU
+    state = EVICTING
+    writeback done:
+        clear resident_bitmap
+        clear hbm_slot_table
+        push free_slot_stack
+else:
+    clear resident_bitmap
+    clear hbm_slot_table
+    push free_slot_stack
+```
+
+推荐新 token write-through 到 ASU，尽量缩短 dirty 时间，使 eviction 大多是 clean eviction。
+
+淘汰应用流程：
 
 ```mermaid
-sequenceDiagram
-    participant V as vLLM Scheduler
-    participant I as DSA Indexer
-    participant L as Lookup Kernel
-    participant M as Mark Kernel
-    participant A as Allocator
-    participant E as Eviction
-    participant B as Backend IO
-    participant S as Sparse Attention
-    participant W as KV Writer
-
-    V->>L: batch_req_slots
-    I->>L: topK token ids
-    L->>L: token_state lookup
-    L->>M: touched_slot_list
-    L->>A: miss_token_list
-    M->>M: set hotness / PROTECTED
-    A->>A: pop free_stack if enough
-    A->>E: request victims if free slots insufficient
-    E->>E: linear scan slot_state
-    E->>A: released slots -> free_stack
-    A->>B: allocate target slots for miss tokens
-    B->>B: backend -> HBM
-    B->>L: update token_state to RESIDENT
-    L->>S: physical slot ids
-    S->>S: sparse attention reads KV
-    S->>M: clear PROTECTED
-    S->>W: decode output KV
-    W->>A: allocate slot for new token
-    W->>W: write KV + update token_state
+flowchart TB
+    A["CPU eviction_plan[layer]"] --> B["NPU apply victim slots"]
+    B --> C{"slot protected/loading?"}
+    C -- "yes" --> D["skip victim"]
+    C -- "no" --> E{"epoch valid?"}
+    E -- "no" --> F["free stale slot"]
+    E -- "yes" --> G{"DIRTY?"}
+    G -- "yes" --> H["writeback to ASU<br/>state=EVICTING"]
+    H --> I["writeback done"]
+    I --> J["clear bitmap/table<br/>push free stack"]
+    G -- "no" --> J
+    F --> J
 ```
 
-拆分成批处理 kernel：
+## 10. Req 变化时的数据维护
+
+### 10.1 Admission
+
+请求进入 decode 节点时：
 
 ```text
-lookup:          生成 hit/miss/wait/touched 列表
-mark:            批量设置 hotness / PROTECTED
-allocator:       从数组栈批量分配 free slots
-evict_prepare:   连续扫描 slot_state，生成 victim buffers
-evict_apply:     批量更新 token_state / slot_state / free_stack
-io_submit:       生成 backend load/writeback jobs
-io_complete:     generation check 后更新索引
-reset:           chunk 扫描 token_state row，释放 req slots
-stats:           汇总 hit/miss/evict/reuse 指标
+1. vLLM 建立 request metadata。
+2. vLLM block table 描述 prompt 的 logical blocks。
+3. full KV 的 ASU block base 已由 prefill 写入，或 decode 从 handoff metadata 获得。
+4. 初始化 resident_bitmap = 0。
+5. 如果有 prefill predicted topK，decode 预取这些 token 的 full KV 到 HBM。
+6. decode 节点准备完整候选范围的 kv_cache[2]。
 ```
 
-## 12. Ascend NPU 压力评估
+### 10.2 Batch reorder / reschedule
 
-### 12.1 元数据容量压力
-
-元数据容量相对 KV 本体较小。
+vLLM 动态 batch 重排时：
 
 ```text
-token_state = max_req_slots * max_model_len * 4B
-
-50 req, 128K max_model_len:
-    50 * 128K * 4B = 25MB
+只更新 batch metadata 和 block_table view。
+不移动 ASU full KV。
+不移动 HBM full KV slots。
+不改变 kv_cache[2] 的 block 语义。
 ```
 
-物理 slot 元数据估算：
+### 10.3 Append 新 block
+
+当 decode 生成 token 导致 vLLM 分配新 logical block：
 
 ```text
-slot_meta ~= 24B 到 32B / slot
-free_stack = 4B / slot
+1. vLLM block allocator 分配 kv_block_id。
+2. block_epoch[layer, kv_block_id]++。
+3. 为 full KV 分配或记录 asu_block_base[layer, kv_block_id]。
+4. resident_bitmap[layer, kv_block_id] 清零。
+5. 后续新 token insert 逐 offset 写入 HBM/ASU。
 ```
 
-以 48GiB KV、61 层、V3.2 fp8_ds_mla 估算，总 slot 数约 1.28M：
+### 10.4 Finish / cancel / reset
+
+请求结束时，不能只释放 vLLM block table，还要清理 full KV residency。
+
+推荐按 block 清理，而不是全局扫描 slot pool：
 
 ```text
-slot_meta 约 31MB 到 41MB
-free_stack 约 5MB
+for kv_block_id in request block_table:
+    epoch = block_epoch[layer, kv_block_id]
+    bitmap = resident_bitmap[layer, kv_block_id]
+    for each set offset in bitmap:
+        slot = hbm_slot_table[layer, kv_block_id, offset]
+        if hbm_slot_owner_epoch[layer, slot] == epoch:
+            mark slot FREE
+            push free_slot_stack
+    resident_bitmap[layer, kv_block_id] = 0
+    invalidate hbm_slot_table entries
+    block_epoch[layer, kv_block_id]++
 ```
 
-因此 HBM 容量压力主要来自 KV 本体，不是索引元数据。
+block size 通常较小，扫描一个 block 的 bitmap 是连续访问；这比维护 per-req linked list 更适合 NPU/CPU 混合控制。
 
-### 12.2 算子与访存压力
+reset 流程：
 
-| 压力点 | 来源 | 风险 | 缓解 |
-| --- | --- | --- | --- |
-| `token_state` 随机 GM 读 | indexer 输出 token id 离散 | lookup hot path 时延高，当前已观测到 350us 级别 | int32 packed state、按 req/query 分 tile、减少返回字段、后续再做 token id 排序/分桶优化 |
-| hit 后随机 GM 写 | 每个命中 token 更新热度 | 写放大严重，影响 lookup | lookup 只产出 `touched_slot_list`，mark kernel 去重后批量写 |
-| miss list 去重 | 同 token 可能被多个 query 访问 | 重复 load、重复分配 slot | 使用 sort/unique 或分段 compact，避免 hash 随机探测 |
-| free slot 分配 | 多 token 同时申请 slot | `free_top` 原子竞争 | 每 step 单 allocator kernel 批量 pop，避免 per-token atomic |
-| eviction scan | free slots 不足时扫描 slot_state | 扫描过多影响 step latency | low_watermark 后台预淘汰，固定 scan_len，victim buffer 复用 |
-| eviction apply 随机写 `token_state` | victim slot owner 分散 | 冷路径随机写 | 只在 free 不足时发生，按 victim buffer 批量处理 |
-| reset 扫描 | finish/cancel 时扫描 req row | 长上下文 reset 可能阻塞 | chunk reset，非关键 stream，generation 先递增 |
-| backend IO | miss load / dirty writeback | IO latency 影响 attention | IO job batch 化，双 buffer，prefetch，loading 状态复用 |
-| PROTECTED 同步 | attention 与 eviction 并发 | 正在使用的 slot 被释放 | step 级 mark/clear，eviction 跳过 PROTECTED/LOADING/EVICTING |
+```mermaid
+flowchart TB
+    A["req finish/cancel"] --> B["iterate request block_table"]
+    B --> C["read resident_bitmap per block"]
+    C --> D["enumerate set offsets"]
+    D --> E["slot = hbm_slot_table[block, offset]"]
+    E --> F{"epoch match?"}
+    F -- "yes" --> G["slot FREE<br/>push free_stack"]
+    F -- "no" --> H["skip stale"]
+    G --> I["clear bitmap/table"]
+    H --> I
+    I --> J["block_epoch++"]
+    J --> K["vLLM releases logical blocks"]
+```
 
-### 12.3 对 Ascend 友好的设计点
+## 11. ASU 存储内容
 
-当前设计刻意保留以下 NPU 友好特征：
+ASU 至少保存完整 full attention KV：
 
 ```text
-1. 所有主数据结构都是连续数组。
-2. free 分配是 free_stack 尾部批量 pop，不遍历。
-3. 淘汰是 slot_state 连续扫描，不使用链表。
-4. hit hot path 不维护精确 LRU，不做 per-hit slot_state 写。
-5. reset 扫描 token_state row，是连续地址访问。
-6. 复杂状态更新拆成 lookup / mark / apply / complete 多个批处理 kernel。
-7. generation check 把异步 IO 的一致性问题变成简单整数比较。
+ASU full KV:
+  layer
+  kv_block_id
+  block_offset
+  kv_cache[0] equivalent
+  kv_cache[1] equivalent
 ```
 
-仍然不友好的部分：
+建议 ASU 也保存 indexer key cache 作为 handoff/rebuild 介质：
 
 ```text
-1. token_state[req, token] 查询本质上是随机读。
-2. eviction apply 回写 token_state 是随机写。
-3. IO completion 更新 token_state/slot_state 是随机写。
-4. miss 去重如果使用 hash，会引入随机探测。
+ASU indexer key cache:
+  layer
+  kv_block_id
+  block_offset
+  kv_cache[2] equivalent
 ```
 
-第一版接受这些压力，因为它们要么是语义必需，要么发生在冷路径。后续优化重点仍然应放在 lookup hot path：按 req 分组、按 token id 分桶、topK 排序、查询批量化、减少输出写回量。
+但第一版 runtime indexer 仍然从 HBM `kv_cache[2]` 读取，不直接从 ASU 读取 indexer key。
 
-## 13. 命中率目标与调参
-
-95% HBM 命中率不能只靠淘汰策略保证，取决于 DSA indexer 的 working set、上下文长度、并发、KV HBM 预算和后端 load latency。
-
-必须维护以下统计：
+ASU 地址建议按 block 连续组织：
 
 ```text
-global_hit_count
-global_miss_count
-per_req_hit_count[req]
-per_req_miss_count[req]
-miss_reason:
-    never_loaded
-    evicted_then_reused
-    loading_inflight
-    backend_load_failed
-evicted_reused_count
-reuse_distance_histogram
-topK_overlap_between_steps
-free_top_watermark
-eviction_scan_efficiency = victims / scanned_slots
+asu_block_base[layer, kv_block_id]
+  + block_offset * full_kv_stride
 ```
 
-调参判断：
+这样 topK miss 如果落在相邻 offset，可以合并 IO。
+
+## 12. 容量与压力评估
+
+### 12.1 HBM 容量拆分
+
+HBM 中仍然需要保留：
 
 ```text
-1. 如果 miss 主要是 never_loaded:
-      淘汰策略帮助有限，需要预取、admission control 或降低并发。
-
-2. 如果 miss 主要是 evicted_then_reused:
-      提高 hotness max，降低 hotness 衰减速度，增大 low_watermark，
-      或提高该类 req 的 soft_quota。
-
-3. 如果 eviction_scan_efficiency 很低:
-      protected/hot token 太多，说明 HBM working set 已接近容量上限，
-      需要降低并发或扩大 KV 预算。
-
-4. 如果 loading_inflight 占比高:
-      IO latency 成为瓶颈，需要复用 inflight、提前 prefetch、增加 IO batch。
+模型权重 shard
+workspace / graph / communication buffers
+kv_cache[2] indexer key cache
+full KV HBM cache slots
+residency metadata
 ```
 
-## 14. 待验证问题
+因此本设计降低的是 `kv_cache[0]/[1]` 的 HBM 常驻量，不是把所有 KV 相关 HBM 全部降为零。
 
-后续 prototype 需要验证：
+以 DeepSeek V3.2 近似估算：
 
-- token_state dense lookup 在真实 DSA topK 分布下的时延。
-- `touched_slot_list` 去重的成本。
-- `miss_token_list` 使用 sort/unique 还是分段 compact 更适合 Ascend。
-- `free_stack` 批量分配是否需要单 kernel 串行化，还是可用低开销原子加减。
-- `eviction_prepare` 的 scan_len 取值，避免扫描不足或扫描过量。
-- `victim_over_quota` 与 `victim_normal` 多 buffer 是否能稳定控制单 req 占用。
-- clean eviction 比例。如果大多数 token 已有后端副本，淘汰只需更新索引。
-- dirty token writeback 与 backend load 的流控方式。
-- request reset 的 chunk 大小与调度 stream，避免影响 decode step latency。
-- 50 并发目标下，为达到 95% 命中率需要的 KV HBM 预算和实际 DSA working set。
+| 项 | 估算 |
+| --- | ---: |
+| full attention KV | 约 656 B / token / layer |
+| indexer key cache | 约 132 B / token / layer |
+| 层数 | 约 61 |
 
-## 15. 当前设计结论
+则：
 
-当前推荐设计为：
+| 场景 | token 总数 | full KV 常驻成本 | indexer key 常驻成本 |
+| --- | ---: | ---: | ---: |
+| 50 req x 2K | 100K | 约 3.7 GiB | 约 0.75 GiB |
+| 50 req x 32K | 1.6M | 约 59.6 GiB | 约 12.0 GiB |
+| 50 req x 128K | 6.4M | 约 238 GiB | 约 48.0 GiB |
+
+结论：
 
 ```text
-token 粒度 KVCache manager
-    + global HBM token slot pool
-    + per-req dense token_state table
-    + req generation guard
-    + SoA slot metadata arrays
-    + array-based free_stack
-    + CLOCK / hotness linear-scan eviction as baseline
-    + optional Windowed LRU / Batched LRU eviction for comparison
-    + victim_buffer batch apply
-    + per-req soft quota
-    + chunk reset by token_state row scan
+在 50 req x 2K 这类目标场景下，保留 kv_cache[2] 是可接受的。
+在 50 req x 128K 这类长上下文场景下，kv_cache[2] 本身也会成为 HBM 大项。
 ```
 
-明确不推荐：
+因此第一版设计可行，但它不是无限长上下文的最终形态。如果目标扩展到 50 并发、128K 级上下文，并且 64G HBM 内还要放权重，则后续必须继续处理 indexer key cache：
+
+1. 压缩 `kv_cache[2]`。
+2. 分层/分段保留 indexer key。
+3. 重写 ASU-aware indexer。
+4. 或引入近似 candidate selection。
+
+这些不属于第一版。
+
+### 12.2 NPU 侧压力
+
+保留现有 indexer 后，当前 `hbm_lookup_update` 的 350us 问题不会由本设计自动消失。新的 full KV materialize 会额外引入：
 
 ```text
-per-req 固定 pool
-global linked-list LRU
-per-req linked-list LRU
-pointer-based free list
-每次分配遍历 free bitmap
-每次 token hit 都维护精确 LRU
-reset 时依赖 per-req resident linked list
+topK residency metadata lookup
+miss 去重
+ASU read job 生成
+HBM slot state 更新
 ```
 
-关键判断：
+NPU 压力控制原则：
+
+1. hit path 只读 bitmap/table，避免链表和复杂分支。
+2. hit touch 不直接更新 LRU 链表，只写 touch ring。
+3. miss 按 block/offset 排序去重，尽量合并 ASU IO。
+4. free slot 分配只 pop 数组栈。
+5. 淘汰选择放 CPU step 间，NPU 只应用 victim 数组。
+6. 通过 watermark 保证 step 内大多数情况下不触发 emergency eviction。
+
+### 12.3 命中率目标
+
+95% hit rate 不能只靠被动 LRU。需要结合 DSA 的访问形态：
 
 ```text
-空位分配不遍历，直接从 free_stack pop。
-空位不足时，才连续扫描 slot_state 生成 victim_buffer。
-索引查询只读 token_state，hit mark 延后到批处理 kernel。
-req reset 使用 generation + chunk scan，避免异步 IO 污染复用后的 req_slot。
-Ascend NPU 压力的核心仍是 token_state 随机读和后端 IO，不是元数据容量。
+保留 recent tail。
+保留 prefill 预测 topK。
+保留上一轮和近期高频 topK。
+对 paused / over-quota / 长时间未触达 token 优先淘汰。
 ```
+
+命中率统计应按层、req、step 分开记录：
+
+```text
+hit_rate[layer]
+hit_rate[req]
+miss_by_reason:
+  cold_start
+  evicted
+  first_decode_not_prefetched
+  dirty_writeback_blocked
+  free_slot_shortage
+```
+
+## 13. 调度与内存 accounting
+
+如果 vLLM scheduler 仍按完整 full KV HBM blocks 估算并发，则本设计不能提升并发。需要调整内存 accounting：
+
+```text
+必须计入:
+  kv_cache[2] indexer key cache HBM
+  full KV HBM cache budget
+  metadata
+
+不再按完整 kv_cache[0]/[1] 上下文 HBM 常驻计入:
+  full attention KV 的冷数据在 ASU
+```
+
+也就是说，vLLM block allocator 仍然要分配 logical blocks，但这些 logical blocks 的 full KV 后端是 ASU，不应全部消耗 HBM full KV page。
+
+推荐抽象：
+
+```text
+LogicalBlock:
+  由 vLLM block table 管理，用于序列语义。
+
+IndexerBlock:
+  对应 kv_cache[2] HBM page，必须常驻。
+
+FullKVResidency:
+  对应 kv_cache[0]/[1] 的 ASU-backed HBM token slots。
+```
+
+## 14. 第一版落地范围
+
+第一版建议只做以下事情：
+
+1. 保持 `kv_cache[2]` 和 Lightning Indexer 不变。
+2. 定义 full KV ASU 地址表和 residency metadata。
+3. 在 indexer 输出后增加 `materialize_topk_full_kv`。
+4. 改造 sparse attention 输入，使其消费 materialized HBM full KV slots。
+5. 新 token full KV write-through 到 ASU，并进入 HBM recent tail。
+6. CPU step 间生成 eviction plan，NPU 只应用。
+7. 调整 vLLM decode 节点的 KV memory accounting，把 full KV 冷数据算到 ASU，不算 HBM 常驻。
+
+第一版不做：
+
+```text
+不重写 Lightning Indexer。
+不把 kv_cache[2] 迁移到 ASU-backed token cache。
+不在 NPU 上实现精确 LRU 链表。
+不让 step 内 NPU 做大范围 victim 扫描。
+不改变 indexer topK 的数学语义。
+```
+
+## 15. 关键风险
+
+### 15.1 indexer key cache 仍占 HBM
+
+如果目标上下文很长，`kv_cache[2]` 可能成为新的 HBM 瓶颈。第一版用它换取 indexer 不重写，这是明确 trade-off。
+
+### 15.2 sparse attention 不能完全原样复用
+
+当前 `npu_sparse_flash_attention` 通过原始 block table 读取 `kv_cache[0]/[1]`。如果 full KV 不完整常驻 HBM，就必须改 attention 入口或增加 materialize workspace。
+
+### 15.3 first decode handoff 不只是 predicted topK
+
+prefill 只给 predicted topK full KV 不够。decode 节点后续要精确运行 indexer，必须拥有完整候选范围的 `kv_cache[2]`。
+
+### 15.4 ASU miss 延迟会直接影响 step latency
+
+即使命中率 95%，在 `50 req x topK 2048` 下，5% miss 仍可能是大量 token-layer IO。需要 prefetch、tail retention 和 CPU eviction policy 一起工作。
+
+## 16. 最终设计摘要
+
+```text
+这不是完全重写 KVCache 管理。
+
+vLLM block table 继续作为主逻辑索引。
+kv_cache[2] 继续作为 indexer key cache 常驻 HBM。
+Lightning Indexer 继续输出精确 logical topK。
+ASU 保存完整 full attention KV。
+HBM 只缓存 full attention KV 的 hot token slots。
+topK logical token 通过 block table 查询 full KV residency。
+hit 直接 attention。
+miss 由 NPU 从 ASU 读入 HBM 后 attention。
+CPU 在 decode step 间生成 eviction plan。
+新生成 token 同时更新 kv_cache[2]、HBM full KV 和 ASU full KV。
+```
+
+这版设计的核心价值是：在不破坏现有 indexer 语义和 vLLM block table 机制的前提下，降低 `kv_cache[0]/[1]` 的 HBM 常驻量，从而提升 64G HBM 约束下的 decode 并发能力。

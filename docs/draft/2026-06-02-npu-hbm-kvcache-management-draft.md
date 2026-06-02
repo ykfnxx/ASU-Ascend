@@ -1,25 +1,38 @@
-# NPU HBM KVCache 管理机制设计草稿
+# NPU HBM Token 粒度 KVCache 管理机制设计草稿
 
-本文整理当前关于 vLLM + vLLM-Ascend 部署形态下，面向 DeepSeek V3/V3.2 类 DSA attention 的 NPU HBM KVCache 管理机制设计。该文档是草稿，重点描述管理机制、索引结构、换入换出策略和与 DSA indexer / sparse attention 的对接方式。
+本文整理当前关于 vLLM + vLLM-Ascend 部署形态下，面向 DeepSeek V3/V3.2 类 DSA attention 的 NPU HBM KVCache 管理机制设计。
 
-## 1. 背景与约束
+当前设计口径已经调整为：
 
-目标是在 Ascend 910B 单卡 HBM 容量受限的情况下，提高 DeepSeek 类 DSA attention 的服务并发能力，同时尽量保持较高 HBM KVCache 命中率。
+```text
+token 粒度管理
++ 全局 HBM KVCache token slot pool
++ 每 req dense token_state 索引表
++ 数组栈 / 环形队列管理 free slots
++ 全局 CLOCK 连续扫描淘汰
++ per-req soft quota 防止单个请求占满 HBM
+```
 
-当前关键约束：
+本文暂时不把 token 粒度索引查询时延作为核心约束。`simu/hbm_lookup_update` 中 `50 req * 2K query` 的 token lookup 约 350us，说明后续仍需要优化 lookup hot path；但本草稿先完善 token 粒度的缓存语义、空间管理、换入换出和 free slot 分配机制。
+
+## 1. 背景与目标
+
+目标是在 Ascend 910B 单卡 HBM 容量受限的情况下，提高 DeepSeek 类 DSA attention 的并发能力，同时尽量保持较高 HBM KVCache 命中率。
+
+关键约束：
 
 - 单张 Ascend 910B HBM 约 64G。
 - HBM 还需要承载权重 shard、workspace、ACL graph、通信 buffer 等，不能全部用于 KVCache。
-- 当前目标并发为 50，该目标可以随实际 miss 率、后端 IO 带宽和 HBM 预算动态调整。
-- DSA indexer 输出 topK logical token id，典型 query 长度为 2K。
-- `simu/hbm_lookup_update` 中 token 粒度 `table_states[req, token_id]` 独立 lookup，在 `50 req * 2K query` 下单算子约 350us，说明 token 粒度 GM random scalar lookup 不适合作为最终 hot path。
+- 当前目标并发为 50，该目标可以根据 HBM 预算、后端 IO 压力和 miss rate 调整。
+- DSA indexer 输出 logical token id，因此 token 粒度管理与 indexer 输出语义最直接匹配。
+- 所有请求共享同一个物理 HBM KVCache pool，不能给每个 req 固定切一块 pool。
 
-因此，设计目标不是让每个请求完整 KV 常驻 HBM，而是：
+核心目标：
 
 ```text
-所有活跃请求共享一个 HBM KV page pool。
-每个请求只在 HBM 中保留 DSA 当前或近期高概率访问的 hot KV pages。
-miss 的 KV page 由 NPU 发起从后端存储读入，并更新 HBM 索引。
+在 HBM 中只保留所有活跃请求的 hot tokens。
+miss token 由 NPU 侧触发从后端读回 HBM。
+eviction 和 free slot 分配尽量使用连续数组扫描和批处理，避免链表、复杂分支、随机指针跳转。
 ```
 
 ## 2. 容量模型
@@ -27,7 +40,7 @@ miss 的 KV page 由 NPU 发起从后端存储读入，并更新 HBM 索引。
 DeepSeek MLA KVCache 的 per-token 成本大致为：
 
 | KVCache 类型 | 估算成本 |
-| --- | --- |
+| --- | ---: |
 | DeepSeek V3.2 `fp8_ds_mla` | 656 B / token / layer |
 | DeepSeek V4 fp8 MLA | 584 B / token / layer |
 | BF16 MLA | 1152 B / token / layer |
@@ -41,350 +54,583 @@ DeepSeek MLA KVCache 的 per-token 成本大致为：
 | 40GiB | 约 21.5K | 约 12.2K |
 | 32GiB | 约 17.2K | 约 9.8K |
 
-如果目标上下文长度接近 128K，则 50 并发下 HBM 只能保存每个请求的一部分 KV。因此，缓存管理应围绕 working set，而不是完整上下文。
+如果目标上下文长度接近 128K，则 50 并发下 HBM 只能保存每个请求的一部分 KV。因此，全局 pool 的作用是保存跨请求的 hot token working set，而不是完整上下文。
 
 ## 3. 总体架构
 
-推荐把缓存层插入在 DSA indexer 输出之后、sparse attention 消费物理 KV slot 之前。
+缓存层插入在 DSA indexer 输出之后、sparse attention 消费物理 KV slot 之前。
 
 ```mermaid
 flowchart LR
-    A["DSA indexer<br/>输出 topK token ids"] --> B["NPU HBM cache lookup<br/>token_id -> page_id + offset"]
-    B --> C{"page 在 HBM?"}
-    C -- "hit" --> D["生成 physical slot ids<br/>给 sparse attention"]
-    C -- "miss" --> E["写 miss_page_list"]
-    E --> F["NPU 发起后端读<br/>backend -> HBM page slot"]
-    F --> G["更新 page_state<br/>BACKEND -> RESIDENT"]
-    G --> D
-    D --> H["DSA sparse attention<br/>读取 HBM KVCache"]
+    A["DSA indexer<br/>topK logical token ids"] --> B["NPU token cache lookup<br/>token_state[req, token]"]
+    B --> C{"token 在 HBM?"}
+    C -- "hit" --> D["生成 physical slot ids"]
+    C -- "miss" --> E["生成 miss_token_list"]
+    E --> F["从全局 free slots 分配目标 slot"]
+    F --> G["NPU 发起 backend -> HBM slot 读取"]
+    G --> H["更新 token_state 为 RESIDENT(slot)"]
+    H --> D
+    D --> I["DSA sparse attention<br/>读取 HBM KVCache"]
 ```
 
-该架构有两个原则：
+设计原则：
 
-1. cache lookup / miss list / 状态更新尽量完全在 NPU 上完成。
-2. sparse attention 只消费已解析好的 physical slot ids，不在 attention 主计算路径内承担复杂 cache 管理。
+1. HBM 物理空间使用全局 token slot pool。
+2. 每个 req 只维护逻辑 token 到物理 slot 的状态映射。
+3. free slot 分配走数组栈或环形队列，不通过链表。
+4. free slot 不足时才触发 eviction，eviction 使用连续扫描生成 victim buffer。
+5. 精确 LRU 不适合 NPU，使用 CLOCK / second-chance 近似淘汰。
 
-## 4. 缓存粒度
+## 4. 全局 HBM Token Slot Pool
 
-缓存对象定义为 logical KV page：
+所有请求共享一组物理 token slots：
 
 ```text
-cache key       = (req_id, logical_page_id)
-logical_page_id = token_id / page_tokens
-offset          = token_id % page_tokens
+global_token_slot_pool:
+    slot 0
+    slot 1
+    ...
+    slot N-1
 ```
 
-候选 page 粒度：
-
-| page_tokens | 优点 | 问题 |
-| --- | --- | --- |
-| 64 / 128 | 容易对齐 vLLM block table 和现有 paged KVCache | DSA topK 稀疏访问时容量放大明显 |
-| 16 | 容量放大较小，仍保持一定连续性 | 需要额外 micro-page 到物理 slot 的映射 |
-| 8 | 更适合高并发和稀疏 topK | attention 侧最好支持 direct physical slot ids |
-
-推荐方向：
-
-- 原型集成可先用 64 或 128 token page，对齐现有 vLLM block。
-- 面向 64G HBM + 50 并发的目标，最终应评估 8 或 16 token micro-page。
-
-## 5. 核心数据结构
-
-HBM 侧维护以下表：
+每个 slot 表示一个 token 的 KVCache 物理位置：
 
 ```text
-page_state[req_id, logical_page_id] -> int32 packed state
-slot_owner[hbm_slot_id]             -> req_id + logical_page_id
-slot_refbit[hbm_slot_id]            -> CLOCK / hot page 标记
-slot_epoch[hbm_slot_id]             -> 最近访问 step 或版本号
-backend_loc[req_id, logical_page_id]-> 后端存储位置
-free_slot_queue                     -> 空闲 HBM page slot
-miss_page_list                      -> 当前 step 需要换入的去重 page
+slot_id -> kv_cache[:, slot_id, ...]
 ```
 
-`page_state` 是 hot path 的主索引。建议使用 packed int32：
+如果后续存在多个 attention group 或不同 KV 布局，可以扩展为：
 
 ```text
-RESIDENT(slot_id)
-BACKEND(backend_compact_id 或 marker)
-LOADING(inflight_load_id)
-INVALID
+pool_id + slot_id
 ```
 
-hot path 尽量只访问 `page_state`。`backend_loc` 只在 miss handling 中访问，避免 lookup kernel 每个 topK 条目携带较大状态。
+第一版建议保持一个统一 token slot pool，降低管理复杂度。
 
-核心索引关系如下：
+全局 pool 与 req 的关系：
 
 ```mermaid
 flowchart TB
-    T["token_id"] --> P["page_id = token_id / page_tokens"]
-    T --> O["offset = token_id % page_tokens"]
+    Pool["global_token_slot_pool<br/>slot 0..N-1"] --> S0["slot 0"]
+    Pool --> S1["slot 1"]
+    Pool --> S2["slot 2"]
+    Pool --> SN["slot N-1"]
 
-    P --> S["page_state[req_id, page_id]"]
+    S0 --> O0["owner = req 7, token 1024"]
+    S1 --> O1["owner = req 2, token 889"]
+    S2 --> O2["owner = FREE"]
+    SN --> ON["owner = req 18, token 65536"]
 
-    S --> R1["RESIDENT<br/>hbm_slot_id"]
-    S --> R2["BACKEND<br/>backend_location"]
-    S --> R3["LOADING<br/>inflight load id"]
-    S --> R4["INVALID"]
-
-    R1 --> H["HBM page pool"]
-    R2 --> B["后端存储 location table"]
-
-    H --> M["slot_owner[hbm_slot]<br/>req_id + page_id"]
-    H --> E["slot_epoch / refbit<br/>换出策略使用"]
+    R0["token_state[req 7, 1024]"] --> S0
+    R1["token_state[req 2, 889]"] --> S1
+    R2["token_state[req 18, 65536]"] --> SN
 ```
 
-## 6. Lookup Hot Path
+## 5. 每 Req Token State 表
 
-当前 token 粒度 prototype 的问题是：
+每个请求维护一张 dense token_state 表：
 
 ```text
-50 req * 2K query = 约 100K token lookups
-每个 token lookup 都是一次 data-dependent GM random scalar load
-有效读取只有几百 KB，但耗时约 350us
+token_state[req_id, token_id] -> int32 packed state
 ```
 
-新设计需要把访存模式改为连续 DataCopy + UB 内 gather。
-
-```mermaid
-flowchart TB
-    subgraph Old["当前 token 级查表"]
-        A1["50 req * 2K query<br/>约 100K token lookups"] --> A2["每个 token 一次<br/>GM random GetValue"]
-        A2 --> A3["AI Core 访存不连续<br/>350us 级别"]
-    end
-
-    subgraph New["page 级两级查表"]
-        B1["每个 req 搬 page_state table"] --> B2["GM -> UB 连续 DataCopy"]
-        B2 --> B3["UB 内 token->page gather"]
-        B3 --> B4["输出 hit/miss/physical slots"]
-    end
-```
-
-lookup kernel 流程：
+以 `max_model_len = 128K` 估算：
 
 ```text
-for each req assigned to core group:
-    CopyIn:
-        DataCopy page_state[req, :] from GM to UB
-
-    Compute:
-        for topK token ids:
-            page_id = token_id / page_tokens
-            offset  = token_id % page_tokens
-            state   = UB_page_state[page_id]
-
-            if state is RESIDENT:
-                physical_slot = slot_id * page_tokens + offset
-                output physical_topk_indices
-                set slot_refbit / update access metadata
-            else:
-                mark page_id in UB miss bitset
-                output placeholder
-
-    CopyOut:
-        output physical_topk_indices
-        output compact miss_page_list
+128K * 4B = 512KB / req
+50 req = 25MB
 ```
 
-示例容量：
+索引容量可以接受。该表与 DSA indexer 输出 token id 直接对接。
+
+`token_state` 推荐编码：
 
 ```text
-max_model_len = 128K
-page_tokens   = 8
-page_count    = 16K
-page_state    = 16K * 4B = 64KB / req
-50 req         = 3.2MB total page_state
+bits 31..28: state
+bits 27..0 : slot_id / backend_id / inflight_id
 ```
 
-单 req 的 page_state row 可按 tile 搬入 UB，避免 topK 每项随机读 GM。
+状态定义：
 
-## 7. Miss Handling 与换入
+| 状态 | 含义 |
+| --- | --- |
+| `INVALID` | token 尚未产生或不可访问 |
+| `BACKEND(id)` | token KV 不在 HBM，后端有副本 |
+| `LOADING(id)` | token 正在从后端换入 |
+| `RESIDENT(slot)` | token KV 在 HBM slot 中 |
+| `EVICTING(id)` | token 正在写回后端或释放 HBM slot |
 
-lookup 输出：
+## 6. 全局 Slot 元数据
+
+物理 slot 需要反查 owner 和维护淘汰状态。建议使用 SoA 连续数组，而不是结构体链表。
+
+```text
+slot_state[N]       uint32
+slot_owner_req[N]   int32
+slot_owner_token[N] int32
+slot_backend[N]     int32
+```
+
+`slot_state` 可打包：
+
+```text
+bit 0      FREE
+bit 1      RESIDENT
+bit 2      LOADING
+bit 3      EVICTING
+bit 4      PROTECTED
+bit 5      REFBIT
+bit 6      DIRTY
+bits 8..15 AGE / segment
+```
+
+核心要求：
+
+- 连续数组便于 NPU 做线性扫描。
+- `slot_owner_req/token` 只在 eviction apply 冷路径中用于回写 `token_state[req, token]`。
+- hit hot path 不维护链表，不做 per-hit LRU 移动。
+
+## 7. Lookup 与 Miss 流程
+
+DSA indexer 输出：
+
+```text
+topk_token_ids[req, query, topk]
+```
+
+lookup kernel 语义：
+
+```text
+for each topK token:
+    state = token_state[req, token_id]
+
+    if state is RESIDENT:
+        slot = decode(state)
+        physical_topk_indices.append(slot)
+        touched_slot_list.append(slot)
+
+    elif state is LOADING:
+        wait_token_list.append(req, token_id, inflight_id)
+
+    elif state is BACKEND or INVALID:
+        miss_token_list.append(req, token_id)
+```
+
+输出：
 
 ```text
 physical_topk_indices
 hit_mask
-miss_page_list
+miss_token_list
+wait_token_list
+touched_slot_list
 ```
 
-miss handling 流程：
+命中标记不要每个 token 都随机写 `slot_state`。建议在 UB 内先对 `touched_slot_list` 去重，再由单独 mark kernel 批量设置：
+
+```text
+slot_state[slot].REFBIT = 1
+```
+
+这把随机写数量从 topK token 数降低到本 step 唯一命中的 slot 数。
+
+## 8. 新 Token 写入
+
+decode 或 prefill 新产生 KV 时，流程如下：
+
+```text
+1. 申请 free slot。
+2. KV insert 将新 token KV 写入该 slot。
+3. token_state[req, token] = RESIDENT(slot)。
+4. slot_owner_req[slot] = req。
+5. slot_owner_token[slot] = token。
+6. slot_state[slot] = RESIDENT | REFBIT。
+7. req_resident_count[req] += 1。
+```
+
+如果 free slot 不足，先触发 eviction 生成可用 slot。
+
+## 9. Miss 换入
+
+miss token 从后端读回 HBM：
+
+```text
+1. miss_token_list 去重。
+2. 对每个 miss token:
+      if token_state 已经是 LOADING:
+          复用 inflight load。
+      else:
+          token_state = LOADING(inflight_id)。
+
+3. 从全局 free slot 管理器分配目标 slots。
+4. NPU 发起 backend -> HBM slot 读取。
+5. load 完成:
+      token_state[req, token] = RESIDENT(slot)
+      slot_owner_req[slot] = req
+      slot_owner_token[slot] = token
+      slot_state[slot] = RESIDENT | REFBIT
+      req_resident_count[req] += 1
+```
+
+load 失败时：
+
+```text
+token_state 回退 BACKEND 或 INVALID
+slot_state[slot] = FREE
+slot 释放回 free slot 管理器
+```
+
+## 10. Free Slot 分配
+
+free slot 分配不通过链表，也不应该每次遍历 free bitmap。
+
+推荐使用数组栈：
+
+```text
+free_stack[N] int32
+free_top      int32
+```
+
+分配 K 个 slot：
+
+```text
+slots = free_stack[free_top - K : free_top]
+free_top -= K
+```
+
+释放 K 个 slot：
+
+```text
+free_stack[free_top : free_top + K] = released_slots
+free_top += K
+```
+
+这是连续数组尾部读写，不是链表。
+
+也可以使用环形队列：
+
+```text
+free_queue[N]
+free_head
+free_tail
+```
+
+但第一版建议使用数组栈，接口更简单。
+
+free slot 处理分为 fast path 和 slow path：
+
+```mermaid
+flowchart TB
+    A["需要 K 个 slots"] --> B{"free_top >= K?"}
+    B -- "yes" --> C["从 free_stack 直接 pop K 个<br/>无扫描"]
+    B -- "no" --> D["触发 eviction_prepare<br/>连续扫描 slot_state"]
+    D --> E["生成 victim_buffer"]
+    E --> F["eviction_apply 释放 victims"]
+    F --> G["released slots push 到 free_stack"]
+    G --> C
+```
+
+关键点：
+
+```text
+分配空位不遍历。
+只有 free slots 不足时，才连续扫描 slot_state 生成 victims。
+```
+
+`free_bitmap` 可以保留用于 debug、一致性检查、异常恢复，但不作为运行时主分配结构。
+
+## 11. 为什么不用链表
+
+不建议使用 global LRU linked list、per-req linked list 或 pointer-based free list。
+
+链表的问题：
+
+```text
+1. next / prev 指针跳转是 data-dependent random access。
+2. 插入删除需要多次随机读写 next / prev。
+3. 命中时维护精确 LRU 会把 hot path 变成随机写元数据。
+4. 多 kernel 并发更新需要 atomic / CAS / lock，复杂度高。
+5. 与 Ascend NPU 的连续 DataCopy + UB 批处理模型不匹配。
+```
+
+数组栈和环形队列不是链表。它们是连续数组：
+
+```text
+free_stack[index]
+free_queue[index]
+```
+
+访问位置由 `free_top`、`free_head`、`free_tail` 控制，不需要通过 slot 内部指针跳转。
+
+## 12. 淘汰策略
+
+不做精确 LRU。推荐全局 CLOCK / second-chance。
+
+元数据：
+
+```text
+clock_hand          int32
+victim_buffer[M]    int32
+victim_count        int32
+scan_len            fixed, e.g. 4K / 8K / 16K slots
+```
+
+淘汰只在 free slots 不足或低水位时触发：
+
+```text
+if free_top < needed_slots:
+    eviction_prepare()
+
+if free_top < low_watermark:
+    background_eviction_prepare()
+```
+
+`eviction_prepare` 连续扫描：
+
+```text
+scan range = [clock_hand, clock_hand + scan_len)
+
+for slot in scan range:
+    state = slot_state[slot]
+
+    if slot is not RESIDENT:
+        skip
+
+    if slot is LOADING or EVICTING or PROTECTED:
+        skip
+
+    if REFBIT == 1:
+        clear REFBIT
+        skip
+
+    if REFBIT == 0:
+        append slot to victim_buffer
+```
+
+向量化条件可写成：
+
+```text
+candidate =
+    RESIDENT
+    & !LOADING
+    & !EVICTING
+    & !PROTECTED
+    & !REFBIT
+```
+
+`REFBIT=1` 的 slot 只清零，给第二次机会。
+
+## 13. Eviction Apply
+
+`eviction_prepare` 只生成 victim slot 列表，不直接完成所有状态更新。
+
+`eviction_apply` 批量处理：
+
+```text
+for slot in victim_buffer:
+    req   = slot_owner_req[slot]
+    token = slot_owner_token[slot]
+
+    if DIRTY:
+        token_state[req, token] = EVICTING(writeback_id)
+        enqueue HBM -> backend writeback
+    else:
+        token_state[req, token] = BACKEND(slot_backend[slot])
+        slot_state[slot] = FREE
+        released_slots.append(slot)
+        req_resident_count[req] -= 1
+```
+
+writeback 完成后：
+
+```text
+token_state[req, token] = BACKEND(new_backend_loc)
+slot_state[slot] = FREE
+released_slots.append(slot)
+req_resident_count[req] -= 1
+```
+
+最后：
+
+```text
+free_stack[free_top : free_top + released_count] = released_slots
+free_top += released_count
+```
+
+这里对 `token_state[req, token]` 的更新是随机写，但它只发生在冷路径，数量等于 victim token 数，不是 topK token 数。
+
+## 14. Protected 与 Refbit
+
+`PROTECTED` 用于避免正在被 attention 或 IO 使用的 slot 被淘汰。
+
+建议批量设置：
+
+```text
+当前 step attention 需要的 hit slots -> PROTECTED = 1
+LOADING slots                        -> PROTECTED = 1
+EVICTING slots                       -> PROTECTED = 1
+decode tail / sink tokens             -> PROTECTED = 1
+```
+
+attention 完成后批量清理：
+
+```text
+PROTECTED = 0
+REFBIT    = 1
+```
+
+`REFBIT` 是近似热度。它不记录精确访问顺序，只记录最近是否被访问过。
+
+## 15. Per-Req Soft Quota
+
+全局 pool 不固定切给每个 req，但需要防止单个请求占满 HBM。
+
+维护：
+
+```text
+req_resident_count[req]
+req_soft_quota[req] = total_slots / target_concurrency
+```
+
+这是 soft quota，不是 hard partition：
+
+```text
+1. 全局 free slots 充足时，长请求可以超过 soft quota。
+2. free slots 紧张时，淘汰优先从超过 soft quota 的 req 里选 cold tokens。
+3. 未超过 quota 的 req 仍可能被淘汰，但优先级更低。
+```
+
+在 `eviction_prepare` 连续扫描时，可加入简单偏好：
+
+```text
+owner_req = slot_owner_req[slot]
+over_quota = req_resident_count[owner_req] > req_soft_quota[owner_req]
+```
+
+推荐生成两个 victim buffer：
+
+```text
+victim_over_quota[]
+victim_normal[]
+```
+
+分配时优先使用 `victim_over_quota`。这样不需要 per-req 链表，也能实现 quota 约束。
+
+## 16. 状态机
+
+token_state 状态机：
+
+```mermaid
+stateDiagram-v2
+    [*] --> INVALID
+    INVALID --> LOADING: backend load
+    BACKEND --> LOADING: backend load
+    LOADING --> RESIDENT: load done
+    LOADING --> BACKEND: load fail
+    LOADING --> INVALID: request cancelled
+    RESIDENT --> EVICTING: dirty eviction
+    EVICTING --> BACKEND: writeback done
+    RESIDENT --> BACKEND: clean eviction
+    RESIDENT --> INVALID: request finished
+```
+
+slot_state 状态机：
+
+```mermaid
+stateDiagram-v2
+    [*] --> FREE
+    FREE --> LOADING: allocate for miss
+    FREE --> RESIDENT: allocate for new token
+    LOADING --> RESIDENT: load done
+    LOADING --> FREE: load fail
+    RESIDENT --> EVICTING: dirty eviction
+    EVICTING --> FREE: writeback done
+    RESIDENT --> FREE: clean eviction or request finished
+```
+
+## 17. NPU 友好的批处理流程
+
+推荐 step 级流程：
 
 ```mermaid
 sequenceDiagram
     participant I as DSA Indexer
-    participant L as Lookup Kernel on NPU
-    participant P as HBM Page Pool
-    participant B as Backend Storage
-    participant A as Sparse Attention
+    participant L as Lookup Kernel
+    participant M as Mark Kernel
+    participant A as Allocator
+    participant E as Eviction
+    participant B as Backend IO
+    participant S as Sparse Attention
 
     I->>L: topK token ids
-    L->>L: token ids 转 page ids
-    L->>L: UB 内查 page_state
-    L->>A: hit 的 physical slot ids
-    L->>P: 标记 hit page refbit/epoch
-    L->>B: miss_page_list
-    B->>P: 读取 KV pages 到空闲 HBM slots
-    P->>L: 更新 page_state 为 RESIDENT
-    L->>A: 补齐 miss 后的 physical slot ids
-    A->>P: 读取 KVCache 做 attention
+    L->>L: token_state lookup
+    L->>M: touched_slot_list
+    L->>A: miss_token_list
+    M->>M: set REFBIT / PROTECTED
+    A->>A: pop free_stack if enough
+    A->>E: request victims if free slots insufficient
+    E->>E: linear scan slot_state
+    E->>A: victim slots -> free_stack
+    A->>B: allocate target slots for miss tokens
+    B->>B: backend -> HBM
+    B->>L: update token_state to RESIDENT
+    L->>S: physical slot ids
+    S->>S: sparse attention
 ```
 
-详细状态机：
+该流程把复杂操作拆成批处理 kernel：
 
 ```text
-BACKEND -> LOADING -> RESIDENT
-INVALID -> LOADING -> RESIDENT
-RESIDENT -> BACKEND
-LOADING -> BACKEND / INVALID  // load fail 或 request cancelled
+lookup:       生成 hit/miss/touched 列表
+mark:         批量设置 REFBIT / PROTECTED
+allocator:    从数组栈批量分配 free slots
+eviction:     连续扫描 slot_state，生成 victim buffer
+apply:        批量更新 token_state / slot_state / free_stack
 ```
 
-要求：
+## 18. 待验证问题
 
-- miss page 必须去重，避免同一 page 被重复加载。
-- `LOADING` 状态必须存在，避免多个 query token 或多个 kernel 对同一 page 重复发起后端读。
-- load 完成前，consumer 需要等待该 page 的 completion event 或在下一轮调度中重试。
-- 如果 attention 必须同 step 完成，则 miss handling 需要在 attention 前完成；如果允许 pipeline，则可以把 miss page 放入下一 step 预取。
+后续 prototype 需要验证：
 
-## 8. 换出策略
+- token_state dense lookup 在真实 DSA topK 分布下的时延。
+- `touched_slot_list` 去重的成本。
+- `free_stack` 批量分配是否需要单 kernel 串行化，还是可用原子加减。
+- `eviction_prepare` 的 scan_len 取值，避免扫描不足或扫描过量。
+- `victim_over_quota` 与 `victim_normal` 双 buffer 是否能稳定控制单 req 占用。
+- clean eviction 比例。如果大多数 token 已有后端副本，淘汰只需更新索引。
+- writeback 和 backend load 与 attention 的同步方式。
+- request finished 时如何批量释放该 req 的 resident slots。
 
-换出不放在 lookup hot path 里做，只在以下时机触发：
-
-```text
-free_slots < low_watermark
-或者
-current_miss_pages > free_slots
-```
-
-推荐使用 segmented CLOCK / approximate LRU：
-
-```text
-protected:
-    当前 step attention 正在使用的 page
-    LOADING page
-    decode tail / sink / 特殊保留 page
-
-hot:
-    最近被 DSA 命中的 page，refbit = 1
-
-cold:
-    refbit = 0，可作为换出候选
-```
-
-换出流程：
-
-```text
-1. eviction kernel 扫描 slot_refbit / slot_epoch。
-2. 跳过 protected / LOADING page。
-3. 对 refbit=1 的 page 清零，给第二次机会。
-4. 选择 refbit=0 的 cold page。
-5. 若后端已有副本且 KV page clean，只更新 page_state 为 BACKEND。
-6. 若 page dirty，则发起 HBM -> backend 写回，再更新 page_state。
-7. 清理 slot_owner，将 slot 放回 free_slot_queue。
-```
-
-推理 KV 通常 append 后只读。对于已经成功落后端的历史 KV page，大多数换出可以视为 clean eviction，只需要更新索引。
-
-## 9. 并发控制
-
-并发 50 不应是固定硬门槛，而应作为目标值，由调度器根据 HBM resident budget 和 miss 压力动态调整。
-
-```mermaid
-flowchart TB
-    H["910B HBM 64G"] --> W["weights / workspace / graph / comm buffer"]
-    H --> K["可用于 KV resident cache 的预算<br/>例如 40G-48G"]
-
-    K --> Pool["全局 HBM page pool"]
-
-    Pool --> Q1["req 0<br/>hot pages"]
-    Pool --> Q2["req 1<br/>hot pages"]
-    Pool --> Q3["..."]
-    Pool --> Q50["req 49<br/>hot pages"]
-
-    Q1 --> S1["soft quota<br/>可借用全局空闲"]
-    Q50 --> S2["soft quota<br/>可被回收"]
-
-    Pool --> Evict["segmented CLOCK / approximate LRU"]
-    Evict --> Backend["冷 page 换出到后端"]
-```
-
-admission control 建议：
-
-```text
-admit if:
-    active_reqs <= target_concurrency
-    and resident_pages <= HBM_budget
-    and expected_miss_pages_this_step <= backend_io_budget
-```
-
-每个 request 设置 soft quota：
-
-```text
-req_soft_quota = HBM_page_budget / target_concurrency
-```
-
-但不要硬切 50 份。空闲 page 应允许被 hot request 借用；当其他 request 需要资源时，再通过 eviction 收回。
-
-## 10. 与 vLLM / vLLM-Ascend 对接
-
-推荐插入点：
-
-```text
-DSA indexer
-    -> NPU cache lookup / miss load
-    -> physical_topk_indices
-    -> sparse attention
-```
-
-不推荐：
-
-```text
-DSA indexer
-    -> 独立 token-level metadata lookup kernel
-    -> sparse attention 内再次做 block_table / KV gather
-```
-
-原因是独立 lookup 无法和 KV gather、softmax、matmul pipeline 摊销随机 metadata 访问成本。现有 `hbm_lookup_update` 的 350us 已经说明这条路径风险很高。
-
-更合理的集成方向：
-
-1. 第一阶段：做 page-level lookup kernel，输出 physical_topk_indices 和 miss_page_list。
-2. 第二阶段：把 lookup 与 SFA 的 MergeKv 阶段融合，让 resident KV gather 和 miss 检测共享同一轮 topK 遍历。
-3. 第三阶段：加入 NPU 侧 backend load、eviction、prefetch，并把调度器的 admission control 与 HBM page budget 对齐。
-
-## 11. 待验证参数
-
-后续 prototype 需要重点验证：
-
-- `page_tokens = 8 / 16 / 64 / 128` 的容量放大与 lookup latency。
-- page_state 连续搬入 UB 后，50 req * 2K query 的 lookup 时间。
-- miss_page_list 的 NPU 侧去重成本。
-- eviction kernel 扫描 slot_refbit / epoch 的成本。
-- 后端读 page 的延迟、带宽和并发度。
-- hit rate 与 DSA topK 分布的关系。
-- direct physical slot ids 是否能被当前 SFA 路径高效消费。
-- 如果仍需保持 vLLM block_table 语义，micro-page 与 block_table 的兼容方式。
-
-## 12. 当前设计结论
+## 19. 当前设计结论
 
 当前推荐设计为：
 
 ```text
-NPU resident page-level KVCache manager
-    + HBM global page pool
-    + per-request page_state table
-    + NPU-side lookup / miss list / load completion update
-    + segmented CLOCK eviction
-    + scheduler-side soft quota and admission control
+token 粒度 KVCache manager
+    + global HBM token slot pool
+    + per-req dense token_state table
+    + SoA slot metadata arrays
+    + array-based free_stack
+    + CLOCK linear-scan eviction
+    + victim_buffer batch apply
+    + per-req soft quota
 ```
 
-该设计直接服务两个核心指标：
-
-1. 相同 HBM 限制下支持更高并发：通过 page-level working set cache 避免完整 KV 常驻。
-2. HBM 命中率尽量高：通过 DSA topK 访问反馈、refbit/epoch 和 request soft quota 保留 hot pages。
-
-最关键的工程判断是：
+明确不推荐：
 
 ```text
-不要把 token 粒度 GM random scalar lookup 作为最终 hot path。
-索引结构必须适配 Ascend NPU 的连续 DataCopy + UB 内计算模型。
+per-req 固定 pool
+global linked-list LRU
+per-req linked-list LRU
+pointer-based free list
+每次分配遍历 free bitmap
+每次 token hit 都维护精确 LRU
+```
+
+关键判断：
+
+```text
+空位分配不遍历，直接从 free_stack pop。
+空位不足时，才连续扫描 slot_state 生成 victim_buffer。
+淘汰使用近似 CLOCK，不使用链表维护精确 LRU。
 ```

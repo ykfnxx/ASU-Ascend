@@ -23,8 +23,9 @@
 block table 仍然描述逻辑 token/block 序列。
 indexer 仍然基于 kv_cache[2] + block table 计算 topK logical token indices。
 ASU 保存完整 full attention KV。
-HBM 只缓存 topK 和近期会被 attention 使用的 full attention KV。
-miss 时 NPU 通过参数面从 ASU 直接读入 HBM。
+HBM 中的新生成 / tail token 保持原始 vLLM full-KV block layout。
+HBM 中的旧 hot token 使用 managed token slots。
+旧 token miss 时 NPU 通过参数面从 ASU 直接读入 managed slot。
 ```
 
 ## 1. 设计结论
@@ -32,10 +33,10 @@ miss 时 NPU 通过参数面从 ASU 直接读入 HBM。
 本需求在以下边界内可行：
 
 1. **不替换 indexer key cache。** `kv_cache[2]` 必须保持现有 PA_BSND HBM block 布局，供 Lightning Indexer 使用。
-2. **只替换 full attention KV 的常驻策略。** `kv_cache[0] / kv_cache[1]` 不再要求完整上下文常驻 HBM，而是由 ASU + HBM token cache 管理。
-3. **vLLM block table 仍是主逻辑索引。** 新增 residency overlay 根据 `block_table + logical offset` 判断 full KV 是否在 HBM。
+2. **只替换 full attention KV 的常驻策略。** `kv_cache[0] / kv_cache[1]` 不再要求完整上下文常驻 HBM，而是由 original full-KV blocks、managed token slots 和 ASU 共同管理。
+3. **vLLM block table 仍是主逻辑索引。** 新增 residency overlay 根据 `block_table + logical offset` 判断 full KV source 是原始 block、managed slot 还是 ASU。
 4. **decode 阶段生效。** 本设计只覆盖 decode 节点上的 DSA sparse attention，不重新设计 prefill attention。
-5. **淘汰策略可由 CPU 在 step 间处理。** NPU step 内只执行数组查表、miss load、状态更新和 attention 所需的数据 materialize。
+5. **淘汰策略和淘汰应用都由 CPU 在 step 间处理。** NPU step 内只执行数组查表、miss load、状态更新和 attention 所需的数据 materialize，不参与 victim 选择或淘汰应用。
 
 不可行或不建议作为第一版的边界：
 
@@ -178,10 +179,12 @@ ASU:
   保存完整 full attention KV。
 
 HBM:
-  只保存 hot full KV token slots。
+  保存两类 full KV:
+    1. 新生成 / tail token 所在的原始 vLLM full-KV blocks。
+    2. 旧 block demote 后，从 ASU miss-load 回来的 managed token slots。
 
 Residency metadata:
-  logical block + block offset -> HBM slot or ASU location
+  logical block + block offset -> original block / managed slot / ASU location
 ```
 
 总体路径：
@@ -194,13 +197,16 @@ flowchart TB
     C --> D["topk_indices<br/>logical token positions"]
 
     D --> E["Full KV residency lookup<br/>block_table + offset"]
-    E --> F{"full KV in HBM?"}
-    F -- "hit" --> G["HBM full KV slot"]
-    F -- "miss" --> H["NPU ASU read<br/>load full KV into HBM slot"]
-    H --> G
-    G --> I["sparse attention<br/>consume kv_cache[0]/[1] data"]
+    E --> F{"block_mode"}
+    F -- "ORIG_HBM_*" --> G["original full-KV block"]
+    F -- "MIXED_MANAGED hit" --> H["managed token slot"]
+    F -- "ASU_ONLY / miss" --> L["NPU ASU read<br/>load into managed slot"]
+    L --> H
+    G --> I["materialize attention input"]
+    H --> I
+    I --> S["sparse attention"]
 
-    J["CPU between steps"] --> K["eviction plan"]
+    J["CPU between steps"] --> K["update residency metadata<br/>prepare next-step free slots"]
     K --> E
 ```
 
@@ -240,7 +246,7 @@ logical_pos
 
 第一版有两个实现选项。
 
-**方案 A：新增 ASU-aware sparse attention 接口。**
+**方案 A：resolver 生成 hybrid source refs，attention 直接支持多来源。**
 
 attention op 接收：
 
@@ -250,34 +256,37 @@ topk_indices
 block_table
 full_kv_residency_metadata
 asu_handles
-hbm_slot_pool
+original_full_kv_blocks
+managed_slot_pool
 ```
 
-op 内部或前置 materialize kernel 完成：
+op 内部根据 source 直接取数：
 
 ```text
-topk logical token -> full KV HBM slot
-miss -> ASU read -> HBM slot
+topk logical token -> original block / managed slot / ASU
+miss -> ASU read -> managed slot
 attention compute
 ```
 
-优点是数据路径清晰，不需要把 sparse indices 改写成临时 block table 语义。缺点是需要改 attention kernel 或增加一个新的 kernel group。
+优点是少一次 compact workspace 拷贝。缺点是 attention kernel 内部要理解 source type，分支和地址生成更复杂。
 
-**方案 B：先 materialize topK KV 到临时 workspace，再调用现有 attention。**
+**方案 B：resolver 先 materialize topK KV 到 compact workspace，再调用 attention。**
 
 前置 kernel 将 topK full KV gather 到一个 compact workspace：
 
 ```text
-topk_indices -> compact_topk_kv_workspace
+topk_indices
+  -> original block / managed slot / ASU load
+  -> compact_topk_kv_workspace
 ```
 
-然后 attention 对 compact workspace 计算。这个方案可能复用部分现有 attention 代码，但需要改 sparse index 语义和 workspace block table，复杂度不一定更低。
+然后 attention 对 compact workspace 计算。这个方案多一次 materialize，但 attention 不需要同时理解原始 block table 和 managed slot table。
 
-推荐第一版按方案 A 设计接口，具体实现可以先拆成两个 kernel：
+推荐第一版按方案 B 落地，具体实现拆成两个 kernel：
 
 ```text
-kernel 1: materialize_topk_full_kv
-kernel 2: sparse_attention_from_materialized_slots
+kernel 1: resolve_and_materialize_topk_full_kv
+kernel 2: sparse_attention_from_compact_workspace
 ```
 
 这样可以先把 ASU/HBM residency 问题和 attention 算子问题解耦。
@@ -298,26 +307,46 @@ kernel 2: sparse_attention_from_materialized_slots
 
 ### 5.2 新增 ASU/HBM residency 数据结构
 
-新增结构只服务 `kv_cache[0]/[1]` 的 full KV。
+新增结构只服务 `kv_cache[0]/[1]` 的 full KV，但它不再假设所有 HBM resident token 都在 managed token slots 中。
 
-第一版建议按 layer 独立管理，因为每层 indexer topK 可能不同，每层 full KV 的访问热度也不同。后续可以评估 layer-group 或 all-layer bundle，以换取更大的 ASU IO 合并粒度。
+第一版采用 hybrid residency：
+
+```text
+新生成 / tail block:
+  full KV 保持原始 vLLM block layout，按 kv_cache[0]/[1][kv_block_id, offset] 读取。
+
+已释放原始 full-KV block 的旧 token:
+  full KV 在 ASU 中保留完整副本。
+  如果后续 topK 命中，再 miss-load 到 managed token slot。
+```
+
+因此需要同时描述 block 级状态和 managed token slot 状态。
 
 | 数据结构 | 粒度 | 推荐位置 | 作用 |
 | --- | --- | --- | --- |
 | `asu_block_base[layer, kv_block_id]` | block | NPU GM / Host mirrored | full KV 在 ASU 中的 block 起始地址 |
 | `block_epoch[layer, kv_block_id]` | block | NPU GM | 防止 block id 复用后的 stale IO 污染 |
-| `resident_bitmap[layer, kv_block_id]` | block offset bitset | NPU GM | 表示 block 内哪些 token offset 的 full KV 在 HBM |
-| `hbm_slot_table[layer, kv_block_id, offset]` | token | NPU GM | resident token 对应的 HBM slot id |
-| `hbm_slot_state[layer, slot]` | HBM slot | NPU GM | FREE / RESIDENT / LOADING / DIRTY / PROTECTED |
-| `hbm_slot_owner_block[layer, slot]` | HBM slot | NPU GM | slot 属于哪个 logical block |
-| `hbm_slot_owner_offset[layer, slot]` | HBM slot | NPU GM | slot 属于 block 内哪个 offset |
-| `hbm_slot_owner_epoch[layer, slot]` | HBM slot | NPU GM | slot 写入时的 block epoch |
-| `free_slot_stack[layer]` | HBM slot pool | NPU GM | 空闲 full KV HBM slot 栈 |
-| `load_job_table[layer]` | IO job | NPU GM | ASU -> HBM miss load 任务 |
-| `writeback_job_table[layer]` | IO job | NPU GM | HBM -> ASU dirty writeback 任务 |
-| `touch_ring[layer]` | token access event | NPU GM -> CPU | NPU 上报每步 hit/miss/touch 信息 |
-| `eviction_plan[layer]` | HBM slot list | CPU -> NPU GM | CPU 在 step 间生成的待淘汰 slot 列表 |
-| `cache_stats[layer]` | global / req / layer | NPU GM / Host readable | hit rate、miss reason、eviction 统计 |
+| `block_mode[layer, kv_block_id]` | block | NPU GM / Host mirrored | full KV 当前来源：原始 HBM block、ASU-only、或 managed slots |
+| `orig_dirty_bitmap[layer, kv_block_id]` | block offset bitset | NPU GM / Host mirrored | 原始 HBM block 中尚未写入 ASU 的 dirty token |
+| `managed_bitmap[layer, kv_block_id]` | block offset bitset | NPU GM | block 已脱离原始布局后，哪些 offset 已在 managed slot 中 |
+| `managed_slot_table[layer, kv_block_id, offset]` | token | NPU GM | managed resident token 对应的 HBM slot id |
+| `managed_slot_state[layer, slot]` | managed HBM slot | NPU GM | FREE / RESIDENT / LOADING / PROTECTED |
+| `managed_slot_owner_block[layer, slot]` | managed HBM slot | NPU GM | slot 属于哪个 logical block |
+| `managed_slot_owner_offset[layer, slot]` | managed HBM slot | NPU GM | slot 属于 block 内哪个 offset |
+| `managed_slot_owner_epoch[layer, slot]` | managed HBM slot | NPU GM | slot 写入时的 block epoch |
+| `free_slot_buffer[layer]` | managed HBM slot pool | NPU GM | CPU step 间准备好的下一步可用 managed slot 数组 |
+| `load_job_table[layer]` | IO job | NPU GM | ASU -> managed HBM slot 的 miss load 任务 |
+| `touch_ring[layer]` | token access event | NPU GM -> CPU | NPU 上报每步 source touch / miss / load 信息 |
+| `cache_stats[layer]` | global / req / layer | NPU GM / Host readable | hit rate、miss reason、demotion、managed eviction 统计 |
+
+`block_mode` 定义：
+
+| 状态 | 含义 | attention source |
+| --- | --- | --- |
+| `ORIG_HBM_DIRTY` | full KV 在原始 vLLM HBM block，至少一个 valid offset 尚未写入 ASU | 原始 `kv_cache[0]/[1]` block |
+| `ORIG_HBM_CLEAN` | full KV 在原始 vLLM HBM block，ASU 已有完整副本 | 原始 `kv_cache[0]/[1]` block |
+| `ASU_ONLY` | 原始 full-KV HBM block 已释放，ASU 有完整副本 | miss-load 到 managed slot |
+| `MIXED_MANAGED` | 原始 full-KV HBM block 已释放，ASU 有完整副本，部分 offset 已在 managed slot | managed hit 或 ASU miss-load |
 
 结构关系：
 
@@ -328,38 +357,49 @@ flowchart TB
 
     TK --> L1["logical_block_idx / block_offset"]
     BT --> L1
-    L1 --> RB["resident_bitmap[layer, kv_block_id]"]
-    L1 --> ST["hbm_slot_table[layer, kv_block_id, offset]"]
+    L1 --> BM["block_mode[layer, kv_block_id]"]
     L1 --> AB["asu_block_base[layer, kv_block_id]"]
+    L1 --> MB["managed_bitmap[layer, kv_block_id]"]
+    L1 --> MS["managed_slot_table[layer, kv_block_id, offset]"]
 
-    RB --> Q{"resident?"}
-    ST --> Q
-    AB --> Q
+    BM --> Q{"source?"}
+    Q -- "ORIG_HBM_*" --> OB["original full-KV block<br/>kv_cache[0]/[1][kv_block_id, offset]"]
+    Q -- "ASU_ONLY" --> LD["ASU -> managed slot"]
+    Q -- "MIXED_MANAGED" --> MH{"managed hit?"}
+    MB --> MH
+    MS --> MH
+    MH -- "yes" --> SS["managed HBM slot"]
+    MH -- "no" --> LD
+    LD --> SS
 
-    Q -- "yes" --> HS["HBM full KV slot"]
-    Q -- "no" --> LD["load_job_table<br/>ASU -> HBM"]
-    LD --> HS
-
-    HS --> OW["slot owner<br/>block/offset/epoch"]
-    HS --> ATTN["sparse attention"]
+    OB --> MAT["materialized KV for attention"]
+    SS --> MAT
+    MAT --> ATTN["sparse attention"]
 ```
 
-### 5.3 HBM slot 的物理含义
+### 5.3 两类 HBM 位置
 
-`hbm_slot` 表示某一层 full attention KV 的一个 token 粒度物理位置，包含该层 sparse attention 需要的 `kv_cache[0]` 和 `kv_cache[1]` 数据。
+full KV 在 HBM 中有两类物理位置。
+
+第一类是原始 vLLM block layout：
 
 ```text
-hbm_slot[layer, slot_id]:
-  kv_nope / latent value part  -> 对应当前 kv_cache[0] 的 token 数据
-  k_rope part                  -> 对应当前 kv_cache[1] 的 token 数据
+original_full_kv_block[layer, kv_block_id, offset]:
+  kv_cache[0] equivalent
+  kv_cache[1] equivalent
 ```
 
-如果实现上仍保留两个独立 tensor，可以用同一个 `slot_id` 同时索引两份 tensor：
+这类位置主要承载新生成 token 和 recent tail block。只要 `block_mode` 是 `ORIG_HBM_DIRTY` 或 `ORIG_HBM_CLEAN`，topK 命中该 block 内任意 token 时，都按原始 block 地址取数。
+
+第二类是 managed token slot：
 
 ```text
-full_kv_hbm0[layer][slot_id]  # kv_cache[0] equivalent
-full_kv_hbm1[layer][slot_id]  # kv_cache[1] equivalent
+managed_slot[layer, slot_id]:
+  kv_cache[0] equivalent for one token
+  kv_cache[1] equivalent for one token
 ```
+
+这类位置只承载已经脱离原始 block layout 的旧 token。它由 `managed_bitmap + managed_slot_table` 管理，主要用于 ASU miss-load 后的 hot token cache。
 
 ## 6. Decode 数据流
 
@@ -371,7 +411,7 @@ full_kv_hbm1[layer][slot_id]  # kv_cache[1] equivalent
 
 1. prefill 节点将完整 full attention KV 写入 ASU。
 2. prefill 节点将预测的 topK 传输给 decode 节点。
-3. decode 节点根据预测 topK 从 ASU 预取 full KV 到 HBM。
+3. decode 节点根据预测 topK 从 ASU 预取 full KV 到 managed HBM slots。
 4. decode 节点必须拥有当前候选范围所需的 `kv_cache[2]` indexer key cache，才能在后续 step 本地运行 Lightning Indexer。
 
 第 4 点是关键约束。当前 Lightning Indexer 需要完整候选范围的 indexer key cache。如果 decode 节点只有 prefill 预测 topK 的 full KV，而没有完整 `kv_cache[2]`，则第一步可以使用 prefill 给出的 topK，但第二步开始无法在 decode 节点上精确重算 indexer。
@@ -404,7 +444,7 @@ sequenceDiagram
     P->>A: write full attention KV for prompt
     P->>D: send predicted topK
     P->>D: handoff or enable loading of kv_cache[2]
-    D->>N: load predicted topK full KV from ASU to HBM
+    D->>N: load predicted topK full KV from ASU to managed slots
     D->>N: run first decode attention
     N->>A: write newly generated full KV
     N->>D: append indexer key to kv_cache[2]
@@ -416,15 +456,16 @@ sequenceDiagram
 
 ```text
 1. vLLM 更新 batch metadata、block_table、seq_lens。
-2. 当前 layer 根据 hidden_states 生成当前 token 的 indexer key。
-3. 将当前 token 的 indexer key 写入 kv_cache[2]。
-4. Lightning Indexer 读取 kv_cache[2] + block_table，输出 topk_indices。
-5. materialize_topk_full_kv 根据 topk_indices 查询 full KV residency。
-6. HBM hit: 返回 HBM slot。
-7. HBM miss: NPU 从 ASU 读取 full KV 到 HBM slot，更新 residency。
-8. sparse attention 消费 materialized HBM full KV。
-9. 当前新 token 的 full KV 写入 HBM，并写穿或异步写入 ASU。
-10. CPU 在 step 间根据 touch_ring 更新 eviction_plan。
+2. 当前 layer 按原有 vLLM full-KV insert 逻辑，将当前 token 的 `kv_cache[0]/[1]` 写入原始 HBM block。
+3. 当前 layer 根据 hidden_states 生成当前 token 的 indexer key，并写入 `kv_cache[2]`。
+4. Lightning Indexer 读取 `kv_cache[2] + block_table`，输出 `topk_indices`。
+5. `resolve_topk_full_kv` 根据 `topk_indices + block_table + block_mode` 判断每个 topK token 的 full KV 来源。
+6. 如果来源是 `ORIG_HBM_*`，直接读取原始 `kv_cache[0]/[1][kv_block_id, offset]`。
+7. 如果来源是 `MIXED_MANAGED` 且 managed hit，读取 managed slot。
+8. 如果来源是 `ASU_ONLY` 或 managed miss，NPU 从 ASU 读取 full KV 到 CPU 预留的 managed slot。
+9. materialize 层将 original block / managed slot 的 KV 统一整理给 sparse attention。
+10. 当前新 token 的 full KV 写入 ASU；写完成前对应 original block 保持 dirty，不可 demote。
+11. CPU 在 step 间根据 touch_ring 完成 original block demotion、managed slot eviction，并准备下一 step 的 free slot buffer。
 ```
 
 流程图：
@@ -432,18 +473,21 @@ sequenceDiagram
 ```mermaid
 flowchart TB
     A["step start<br/>vLLM metadata ready"] --> B["write current token<br/>indexer key -> kv_cache[2]"]
+    A --> X["write current token full KV<br/>original kv_cache[0]/[1] block"]
+    X --> Y["enqueue ASU write<br/>orig_dirty_bitmap set"]
     B --> C["npu_lightning_indexer<br/>kv_cache[2] + block_table"]
     C --> D["topk_indices"]
-    D --> E["materialize_topk_full_kv"]
-    E --> F{"HBM residency hit?"}
-    F -- "yes" --> G["return hbm_slot"]
-    F -- "no" --> H["allocate hbm_slot<br/>ASU read full KV"]
-    H --> I["update resident_bitmap<br/>hbm_slot_table"]
-    I --> G
-    G --> J["sparse attention"]
-    J --> K["new token full KV<br/>HBM + ASU write"]
+    D --> E["resolve_topk_full_kv"]
+    E --> F{"block_mode"}
+    F -- "ORIG_HBM_*" --> G["source = original block"]
+    F -- "MIXED_MANAGED hit" --> H["source = managed slot"]
+    F -- "ASU_ONLY / managed miss" --> I["ASU read -> managed slot"]
+    I --> H
+    G --> J["materialize attention input"]
+    H --> J
+    J --> K["sparse attention"]
     K --> L["touch_ring stats"]
-    L --> M["CPU between steps<br/>eviction planning"]
+    L --> M["CPU between steps<br/>demotion + managed eviction<br/>free slot preparation"]
 ```
 
 ## 7. 新生成 token 的管理
@@ -462,50 +506,73 @@ hidden_states -> indexer.wk/k_norm/rope -> kv_cache[2]
 
 ### 7.2 full attention KV
 
-新 token 的 full attention KV 需要同时进入 HBM 和 ASU：
+新 token 的 full attention KV 不进入 managed token slot。它继续按原有 vLLM full-KV block layout 写入原始 HBM block：
 
 ```text
 1. vLLM 为新 token 分配 logical block + offset。
-2. residency layer 为该 token 分配 HBM slot。
-3. 当前 layer full KV 写入 HBM slot。
-4. resident_bitmap[layer, kv_block_id].set(offset)。
-5. hbm_slot_table[layer, kv_block_id, offset] = slot。
-6. slot owner 写入 block/offset/epoch。
-7. full KV 写入 ASU。
-8. ASU 写完成前 slot 标记 DIRTY。
-9. ASU 写完成后清 DIRTY，slot 可被 clean eviction。
+2. full KV writer 按原有逻辑写入 `kv_cache[0]/[1][kv_block_id, offset]`。
+3. 若该 block 是新分配或仍在 tail window，`block_mode = ORIG_HBM_DIRTY`。
+4. 设置 `orig_dirty_bitmap[layer, kv_block_id].set(offset)`。
+5. 异步或同步将该 token 的 full KV 写入 ASU。
+6. ASU 写完成后清对应 dirty bit。
+7. 当 block 内 valid offsets 都已写入 ASU，`block_mode` 可变为 `ORIG_HBM_CLEAN`。
+8. CPU step 间可将 cold 的 `ORIG_HBM_CLEAN` block demote 为 `ASU_ONLY`，释放原始 full-KV HBM block。
 ```
 
 推荐策略：
 
 ```text
-新生成 token 默认进入 HBM。
+新生成 token 默认保留在原始 HBM block。
 最近 tail window 内 token 默认 protected 或高 hotness。
-ASU 写采用 write-through 或异步 write-behind，但 dirty slot 不允许直接释放。
+ASU 写采用 write-through 或异步 write-behind。
+dirty original block 不允许 demote。
+managed 索引只接管已经 demote 的旧 block/token。
 ```
 
 原因：
 
 1. 新 token 很可能在后续若干 step 被 indexer 选中。
-2. tail window 对模型质量和命中率都重要。
-3. 新 token 若不及时写 ASU，发生 eviction 或 req 迁移时会丢状态。
+2. 新 token 按原始 block layout 写入，能最大限度复用 vLLM 现有写入路径。
+3. tail window 对模型质量和命中率都重要，整 block 保留比逐 token 重排更简单。
+4. 新 token 若不及时写 ASU，发生 demotion、req 迁移或故障恢复时会丢状态。
 
 状态机：
 
 ```mermaid
 stateDiagram-v2
     [*] --> NEW_TOKEN
-    NEW_TOKEN --> HBM_DIRTY: write full KV to HBM
-    HBM_DIRTY --> ASU_WRITING: enqueue ASU write
-    ASU_WRITING --> HBM_CLEAN: ASU write done
-    HBM_CLEAN --> EVICTABLE: attention step done / unprotected
-    HBM_DIRTY --> WRITEBACK_REQUIRED: eviction requested
-    WRITEBACK_REQUIRED --> HBM_CLEAN: writeback done
+    NEW_TOKEN --> ORIG_HBM_DIRTY: write full KV to original block
+    ORIG_HBM_DIRTY --> ASU_WRITING: enqueue ASU write
+    ASU_WRITING --> ORIG_HBM_CLEAN: ASU write done for valid offsets
+    ORIG_HBM_CLEAN --> ASU_ONLY: CPU demotes cold original block
+    ASU_ONLY --> MIXED_MANAGED: topK miss-loads some offsets
 ```
 
 ## 8. 查询与 Materialize 流程
 
-`topk_indices` 是 logical token position。materialize 阶段把它变成 attention 可消费的 HBM full KV。
+`topk_indices` 是 logical token position。检索层的职责不是简单判断 token 是否在 managed slot 中，而是解析每个 topK token 的 full KV 当前来源：
+
+```text
+logical token
+  -> block_table
+  -> kv_block_id + offset
+  -> block_mode
+  -> original full-KV block / managed slot / ASU miss-load
+```
+
+这层可以称为 `resolve_topk_full_kv`。它输出统一的 attention 输入，避免 sparse attention kernel 自己理解多套地址语义。
+
+第一版推荐 materialize 到 compact workspace：
+
+```text
+original block source
+managed slot source
+ASU miss-load source
+  -> compact_topk_kv_workspace
+  -> sparse attention reads workspace
+```
+
+如果后续 attention kernel 支持 hybrid source，也可以不拷贝到 workspace，而是直接消费 `(source_type, source_index)`。但 draft 的基础语义仍以 resolver 为准。
 
 ### 8.1 输入输出
 
@@ -514,91 +581,205 @@ stateDiagram-v2
 ```text
 topk_indices[layer, batch, query, k]
 block_table[batch, logical_block_idx]
-resident_bitmap[layer, kv_block_id]
-hbm_slot_table[layer, kv_block_id, offset]
+block_mode[layer, kv_block_id]
+managed_bitmap[layer, kv_block_id]
+managed_slot_table[layer, kv_block_id, offset]
 asu_block_base[layer, kv_block_id]
-free_slot_stack[layer]
+free_slot_buffer[layer]
 ```
 
 输出：
 
 ```text
-materialized_slot_indices[layer, batch, query, k]
+resolved_source[layer, batch, query, k]
+compact_topk_kv_workspace 或 materialized source refs
 miss_job_list[layer]
 touch_list[layer]
 ```
 
-### 8.2 查询逻辑
+`resolved_source` 至少需要表达：
+
+```text
+source_type:
+  ORIG_BLOCK
+  MANAGED_SLOT
+  ASU_LOAD_TO_MANAGED
+
+source_payload:
+  ORIG_BLOCK:    kv_block_id + offset
+  MANAGED_SLOT:  managed_slot_id
+  ASU_LOAD:      asu_addr + target_managed_slot
+```
+
+### 8.2 检索逻辑
+
+核心逻辑：
 
 ```text
 for each topk logical_pos:
     logical_block_idx = logical_pos / block_size
     offset = logical_pos % block_size
     kv_block_id = block_table[batch, logical_block_idx]
+    mode = block_mode[layer, kv_block_id]
 
-    if resident_bitmap[layer, kv_block_id].test(offset):
-        slot = hbm_slot_table[layer, kv_block_id, offset]
-        materialized_slot_indices[...] = slot
-        touch_list.append(slot)
-    else:
-        slot = allocate_hbm_slot()
-        asu_addr = asu_block_base[layer, kv_block_id] + offset * full_kv_stride
-        enqueue_load(asu_addr, slot)
-        materialized_slot_indices[...] = slot
+    if mode == ORIG_HBM_DIRTY or mode == ORIG_HBM_CLEAN:
+        source = ORIG_BLOCK(kv_block_id, offset)
+        touch_list.append(original block, kv_block_id, offset)
+        materialize_from_original_block(source)
+        continue
+
+    if mode == MIXED_MANAGED:
+        if managed_bitmap[layer, kv_block_id].test(offset):
+            slot = managed_slot_table[layer, kv_block_id, offset]
+            source = MANAGED_SLOT(slot)
+            touch_list.append(managed slot, slot)
+            materialize_from_managed_slot(source)
+            continue
+
+    # mode == ASU_ONLY, or mode == MIXED_MANAGED but managed miss
+    slot = allocate_managed_slot_from_prepared_buffer()
+    asu_addr = asu_block_base[layer, kv_block_id] + offset * full_kv_stride
+    enqueue_load(asu_addr, slot)
+    managed_bitmap[layer, kv_block_id].set(offset)
+    managed_slot_table[layer, kv_block_id, offset] = slot
+    block_mode[layer, kv_block_id] = MIXED_MANAGED
+    source = ASU_LOAD_TO_MANAGED(asu_addr, slot)
+    materialize_after_load(source)
 ```
 
-### 8.3 Miss 去重与 IO 合并
-
-同一个 step 内，多个 query/head 可能访问同一个 logical token。materialize 需要去重：
+这个逻辑直接回答新生成 token 的处理：
 
 ```text
-(layer, kv_block_id, offset) unique
+如果 topK 命中新生成 token:
+  该 token 所在 block 仍是 ORIG_HBM_DIRTY / ORIG_HBM_CLEAN。
+  resolver 返回 ORIG_BLOCK。
+  attention 输入从原始 kv_cache[0]/[1] block materialize。
+  不查询 managed_bitmap，不占用 managed slot。
 ```
 
-建议优先采用排序/分段压缩，而不是 hash table：
+### 8.3 Source 去重与 IO 合并
+
+同一个 step 内，多个 query/head 可能访问同一个 logical token。resolver 需要按来源去重。
 
 ```text
-1. 生成 miss candidates。
-2. 按 kv_block_id、offset 排序或局部分桶。
-3. 去重。
-4. 对连续 offset 合并 ASU read。
+logical source unique key:
+  ORIG_BLOCK:    (layer, kv_block_id, offset)
+  MANAGED_SLOT:  (layer, slot_id)
+  ASU_LOAD:      (layer, kv_block_id, offset)
+```
+
+建议优先采用排序/分段压缩，而不是 hash table。
+
+```text
+1. 生成 resolved candidates。
+2. 按 source_type 分段。
+3. ORIG_BLOCK 段按 kv_block_id、offset 排序，合并连续读。
+4. MANAGED_SLOT 段按 slot_id 去重。
+5. ASU_LOAD 段按 kv_block_id、offset 排序，去重并合并连续 ASU read。
 ```
 
 这样更符合 Ascend NPU 的连续访问和批处理特性。
 
-### 8.4 Free slot 不足处理
+### 8.4 给 attention 的方式
 
-NPU step 内不应临时做复杂淘汰扫描。第一版采用水位线机制：
+第一版推荐 compact materialize：
+
+```text
+for each resolved source:
+    if source is ORIG_BLOCK:
+        copy/read kv_cache[0]/[1][kv_block_id, offset] -> compact workspace
+
+    if source is MANAGED_SLOT:
+        copy/read managed_slot[slot] -> compact workspace
+
+    if source is ASU_LOAD_TO_MANAGED:
+        wait/load ASU -> managed_slot[slot]
+        copy/read managed_slot[slot] -> compact workspace
+
+sparse_attention(query, compact_topk_kv_workspace)
+```
+
+这样 sparse attention 不需要同时理解原始 block table 和 managed slot table。它只消费统一 workspace。
+
+如果后续为了减少拷贝改造 attention kernel，可以把 workspace 替换成 source refs：
+
+```text
+source_type[] = ORIG_BLOCK / MANAGED_SLOT
+source_index[] = kv_block_id+offset / slot_id
+```
+
+但无论哪种方式，所有 topK token 都必须先经过 resolver，不能在 attention 内部靠 token 是否新生成来走隐式分支。
+
+### 8.5 Free slot 预算与不足处理
+
+这里的 free slot 只指 managed token slot，不包括原始 vLLM full-KV block。
+
+NPU step 内不做淘汰。第一版采用水位线和预分配机制：
 
 ```text
 CPU 在 step 间保证:
-  free_slot_count[layer] >= next_step_miss_budget[layer] + reserve_margin
+  managed_free_slot_count[layer] >= next_step_managed_miss_budget[layer] + reserve_margin
 ```
+
+CPU 在 step 开始前把可用 slot 写入 `free_slot_buffer[layer]`，NPU miss path 只从这个连续数组中取 slot。这个动作是分配，不是淘汰。
 
 如果 step 内仍然 free slot 不足：
 
-1. 优先使用 reserve slots。
-2. reserve 仍不足时执行 bounded emergency eviction，只从 CPU 已下发的 `eviction_plan` 中 pop victim。
-3. 如果 eviction_plan 也不足，当前 step 回退为同步等待 CPU 生成 plan 或触发 admission 降载。
+1. 使用 CPU 预留的 reserve slots。
+2. reserve 仍不足时，不在 NPU 上触发 emergency eviction。
+3. 当前 step 进入 backpressure：等待下一 step CPU 回收更多 free slots，或由 scheduler 降低并发/减少 admission。
 
-也就是说，NPU 不遍历 free 表，不做链表，不做全局 LRU 更新。
+也就是说，NPU 不遍历 free 表，不做链表，不做全局 LRU 更新，也不应用 victim。
 
 ```mermaid
 flowchart TB
-    A["miss needs slot"] --> B{"free_slot_stack enough?"}
+    A["miss needs slot"] --> B{"prepared free_slot_buffer enough?"}
     B -- "yes" --> C["pop free slot"]
     B -- "no" --> D{"reserve slots enough?"}
     D -- "yes" --> E["use reserve slot"]
-    D -- "no" --> F{"eviction_plan has victim?"}
-    F -- "yes" --> G["apply planned victim<br/>free slot"]
-    F -- "no" --> H["backpressure<br/>CPU plan or admission throttle"]
-    G --> C
+    D -- "no" --> F["backpressure<br/>next-step CPU reclaim<br/>or admission throttle"]
     E --> C
 ```
 
 ## 9. 淘汰机制
 
-淘汰逻辑放在 step 间由 CPU 处理，NPU 只应用 plan。
+淘汰逻辑和淘汰应用都放在 step 间由 CPU 处理。NPU 不参与 victim 选择，不执行 eviction apply，不处理 dirty slot 的释放。NPU 只消费 CPU 已经准备好的 metadata snapshot 和 `free_slot_buffer`。
+
+hybrid 设计下，淘汰分两类：
+
+```text
+1. original block demotion:
+     ORIG_HBM_CLEAN -> ASU_ONLY
+     释放原始 full-KV HBM block。
+     block_table 和 kv_cache[2] 不变。
+
+2. managed slot eviction:
+     MIXED_MANAGED 中的冷 token managed slot -> FREE
+     清 managed_bitmap / managed_slot_table。
+```
+
+第一类是主要 HBM 降占用手段；第二类是为后续 ASU miss-load 准备 managed token slots。
+
+基本时序：
+
+```text
+step N 执行中:
+  NPU 记录 touch_ring:
+    ORIG_BLOCK touch
+    MANAGED_SLOT touch
+    ASU miss/load
+    new token original block write
+
+step N 结束后:
+  CPU 读取 touch_ring、block_mode、orig_dirty_bitmap、managed slot metadata。
+  CPU 更新 block 和 managed slot 的 LRU/hotness/req quota。
+  CPU demote cold ORIG_HBM_CLEAN blocks。
+  CPU evict cold managed slots。
+  CPU 写入 next-step metadata snapshot 和 free_slot_buffer。
+
+step N+1 开始:
+  NPU 使用 metadata snapshot 和 free_slot_buffer。
+```
 
 ### 9.1 CPU 侧输入
 
@@ -612,8 +793,13 @@ touch_ring:
   per-req / per-layer hit miss counters
 
 slot state snapshot:
-  FREE / RESIDENT / LOADING / DIRTY / PROTECTED
-  owner block / offset / epoch
+  block_mode
+  orig_dirty_bitmap
+  managed_slot_state
+  managed owner block / offset / epoch
+
+ASU write status:
+  original block / offset 的 ASU 写完成情况
 
 vLLM scheduler state:
   active reqs
@@ -630,88 +816,166 @@ vLLM scheduler state:
 
 | 优先级 | 类别 | 处理 |
 | --- | --- | --- |
-| P0 | 当前 step topK / attention 正在使用 | 禁止淘汰，`PROTECTED` |
-| P1 | 新生成 tail window | 强保护或高 hotness |
-| P2 | prefill 预测 topK / next-step 预测 topK | 高 hotness，优先保留 |
-| P3 | 近期多次被 indexer 选中的 token | 根据 touch 计数保留 |
-| P4 | 普通 clean resident token | 可淘汰 |
-| P5 | paused req 的非近期 token | 优先淘汰 |
-| P6 | 超出 soft quota req 的冷 token | 优先淘汰 |
-| P7 | stale epoch / finished req token | 立即释放 |
+| P0 | 当前 step topK 正在使用的 source | 禁止 demote/evict，`PROTECTED` |
+| P1 | `ORIG_HBM_DIRTY` block | 禁止 demote，等待 ASU 写完成 |
+| P2 | 新生成 tail window 的 original block | 强保护或高 hotness |
+| P3 | prefill 预测 topK / next-step 预测 topK source | 高 hotness，优先保留 |
+| P4 | 近期多次被 indexer 选中的 original block / managed slot | 根据 touch 计数保留 |
+| P5 | cold `ORIG_HBM_CLEAN` block | 可 demote，释放整块 full-KV HBM |
+| P6 | cold managed slot | 可 evict，释放 managed token slot |
+| P7 | paused req / over-quota req 的 clean original block 或 managed slot | 优先 demote/evict |
+| P8 | stale epoch / finished req source | 立即释放 |
 
 ### 9.3 Baseline：CPU Windowed LRU
 
 第一版推荐 CPU 侧 Windowed LRU，而不是 NPU 侧精确 LRU。
 
-CPU 维护：
+CPU 维护两套 recentness：
 
 ```text
-last_touch_step[layer, slot]
-touch_count_window[layer, slot]
+last_touch_step_orig_block[layer, kv_block_id]
+touch_count_window_orig_block[layer, kv_block_id]
+last_touch_step_managed_slot[layer, slot]
+touch_count_window_managed_slot[layer, slot]
 req_resident_count[req]
-layer_free_watermark[layer]
+orig_hbm_block_budget[layer]
+managed_free_watermark[layer]
 ```
 
 每个 step 间：
 
 ```text
-1. 消费 touch_ring，更新 last_touch_step 和 touch_count_window。
-2. 计算每层 free slot 缺口。
-3. 优先选择 stale / paused / over-quota 的 clean cold slots。
-4. 避开 PROTECTED / LOADING / DIRTY。
-5. 生成 eviction_plan[layer]，按 slot id 数组下发给 NPU。
+1. 消费 touch_ring，更新 original block 和 managed slot 的 touch 信息。
+2. 计算每层 original full-KV HBM block 是否超预算。
+3. 计算每层 managed_free_slot 是否低于 watermark。
+4. 选择 cold ORIG_HBM_CLEAN blocks 做 demotion。
+5. 选择 cold managed slots 做 token 级 eviction。
+6. CPU 直接更新 block_mode / managed_bitmap / managed_slot_table。
+7. 将释放的 managed slots 写入 next-step free_slot_buffer[layer]。
 ```
 
 这里的 LRU 不要求每次 hit 都修改链表。hit 只写 touch ring；排序和选择在 CPU step 间完成。
 
-### 9.4 备选：CLOCK / Hotness
+### 9.4 Original block demotion
 
-如果 CPU LRU 维护成本过高，可以退化为 CLOCK / hotness：
+original block demotion 是释放 HBM 的主要动作。它只处理 `ORIG_HBM_CLEAN` block：
 
 ```text
-slot.hotness:
-  hit/new/predicted topK -> set max
-  CPU 每轮扫描候选时 hotness--
-  hotness==0 且 clean 且 unprotected -> victim
+for block in selected_cold_original_blocks:
+    if block_mode[layer, block] != ORIG_HBM_CLEAN:
+        continue
+
+    if orig_dirty_bitmap[layer, block] != 0:
+        continue
+
+    if block is protected by current/next-step policy:
+        continue
+
+    block_mode[layer, block] = ASU_ONLY
+    release original full-KV HBM block for kv_cache[0]/[1]
+```
+
+注意：
+
+```text
+block_table 不变。
+kv_cache[2] 不变。
+kv_block_id 仍然是逻辑 block id。
+只是 kv_cache[0]/[1] 的原始 HBM block 不再作为 full KV source。
+```
+
+demotion 后，如果 topK 再命中该 block：
+
+```text
+block_mode == ASU_ONLY
+  -> ASU miss-load 到 managed slot
+  -> block_mode = MIXED_MANAGED
+```
+
+### 9.5 Managed slot eviction
+
+managed slot eviction 只处理已经从 ASU miss-load 回来的 token 级 cache：
+
+```text
+for victim in cpu_selected_clean_victims:
+    block = managed_slot_owner_block[layer, victim]
+    offset = managed_slot_owner_offset[layer, victim]
+    epoch = managed_slot_owner_epoch[layer, victim]
+
+    if epoch != block_epoch[layer, block]:
+        mark slot FREE
+        append victim to next_step_free_slot_buffer
+        continue
+
+    if managed_slot_state[layer, victim] is PROTECTED or LOADING:
+        continue
+
+    managed_bitmap[layer, block].clear(offset)
+    managed_slot_table[layer, block, offset] = INVALID
+    managed_slot_state[layer, victim] = FREE
+    append victim to next_step_free_slot_buffer
+
+    if managed_bitmap[layer, block] is empty:
+        block_mode[layer, block] = ASU_ONLY
+```
+
+managed slot 不承载新生成 dirty token。新 token 的 dirty 状态只存在于 original block 的 `orig_dirty_bitmap`。因此 managed eviction 不需要 writeback。
+
+### 9.6 Dirty original block 处理
+
+dirty original block 不能 demote。
+
+```text
+if orig_dirty_bitmap[layer, block] != 0:
+    block_mode remains ORIG_HBM_DIRTY
+    not demotable
+```
+
+ASU 写完成回调或 step 间轮询更新：
+
+```text
+clear orig_dirty_bitmap[layer, block, offset]
+
+if all valid offsets clean:
+    block_mode[layer, block] = ORIG_HBM_CLEAN
+```
+
+只有 `ORIG_HBM_CLEAN` 才能进入 demotion candidate。
+
+### 9.7 备选：CLOCK / Hotness
+
+如果 CPU LRU 维护成本过高，可以退化为 CLOCK / hotness，但仍然按两类对象维护：
+
+```text
+original_block.hotness:
+  ORIG touch / new tail / predicted topK -> set max
+  CPU 每轮候选选择时 hotness--
+  hotness==0 且 ORIG_HBM_CLEAN -> demote
+
+managed_slot.hotness:
+  managed touch -> set max
+  CPU 每轮候选选择时 hotness--
+  hotness==0 且 unprotected -> evict
 ```
 
 这个方案更简单，但对 95% 命中率的可控性弱于 Windowed LRU。
-
-### 9.5 Dirty slot 处理
-
-dirty slot 不能直接释放。
-
-```text
-if victim is DIRTY:
-    enqueue writeback to ASU
-    state = EVICTING
-    writeback done:
-        clear resident_bitmap
-        clear hbm_slot_table
-        push free_slot_stack
-else:
-    clear resident_bitmap
-    clear hbm_slot_table
-    push free_slot_stack
-```
-
-推荐新 token write-through 到 ASU，尽量缩短 dirty 时间，使 eviction 大多是 clean eviction。
 
 淘汰应用流程：
 
 ```mermaid
 flowchart TB
-    A["CPU eviction_plan[layer]"] --> B["NPU apply victim slots"]
-    B --> C{"slot protected/loading?"}
-    C -- "yes" --> D["skip victim"]
-    C -- "no" --> E{"epoch valid?"}
-    E -- "no" --> F["free stale slot"]
-    E -- "yes" --> G{"DIRTY?"}
-    G -- "yes" --> H["writeback to ASU<br/>state=EVICTING"]
-    H --> I["writeback done"]
-    I --> J["clear bitmap/table<br/>push free stack"]
-    G -- "no" --> J
-    F --> J
+    A["CPU reads touch + metadata"] --> B["update LRU/hotness"]
+    B --> C["select cold ORIG_HBM_CLEAN blocks"]
+    B --> D["select cold managed slots"]
+
+    C --> E{"dirty/protected?"}
+    E -- "yes" --> F["skip block"]
+    E -- "no" --> G["block_mode=ASU_ONLY<br/>release original full-KV block"]
+
+    D --> H{"protected/loading/stale?"}
+    H -- "protected/loading" --> I["skip slot"]
+    H -- "stale or evictable" --> J["clear managed_bitmap/table<br/>slot FREE"]
+    J --> K["append to next-step<br/>free_slot_buffer"]
 ```
 
 ## 10. Req 变化时的数据维护
@@ -724,9 +988,10 @@ flowchart TB
 1. vLLM 建立 request metadata。
 2. vLLM block table 描述 prompt 的 logical blocks。
 3. full KV 的 ASU block base 已由 prefill 写入，或 decode 从 handoff metadata 获得。
-4. 初始化 resident_bitmap = 0。
-5. 如果有 prefill predicted topK，decode 预取这些 token 的 full KV 到 HBM。
-6. decode 节点准备完整候选范围的 kv_cache[2]。
+4. prompt block 默认初始化为 ASU_ONLY。
+5. managed_bitmap / managed_slot_table 初始化为空。
+6. 如果有 prefill predicted topK，decode 预取这些 token 的 full KV 到 managed slots，block_mode 变为 MIXED_MANAGED。
+7. decode 节点准备完整候选范围的 kv_cache[2]。
 ```
 
 ### 10.2 Batch reorder / reschedule
@@ -736,7 +1001,7 @@ vLLM 动态 batch 重排时：
 ```text
 只更新 batch metadata 和 block_table view。
 不移动 ASU full KV。
-不移动 HBM full KV slots。
+不移动 original full-KV blocks 或 managed slots。
 不改变 kv_cache[2] 的 block 语义。
 ```
 
@@ -748,8 +1013,10 @@ vLLM 动态 batch 重排时：
 1. vLLM block allocator 分配 kv_block_id。
 2. block_epoch[layer, kv_block_id]++。
 3. 为 full KV 分配或记录 asu_block_base[layer, kv_block_id]。
-4. resident_bitmap[layer, kv_block_id] 清零。
-5. 后续新 token insert 逐 offset 写入 HBM/ASU。
+4. 为该 block 准备原始 full-KV HBM block。
+5. block_mode[layer, kv_block_id] = ORIG_HBM_DIRTY。
+6. managed_bitmap[layer, kv_block_id] 清零。
+7. 后续新 token insert 逐 offset 写入原始 HBM block，并写入 ASU。
 ```
 
 ### 10.4 Finish / cancel / reset
@@ -761,14 +1028,20 @@ vLLM 动态 batch 重排时：
 ```text
 for kv_block_id in request block_table:
     epoch = block_epoch[layer, kv_block_id]
-    bitmap = resident_bitmap[layer, kv_block_id]
+
+    if block_mode[layer, kv_block_id] is ORIG_HBM_DIRTY or ORIG_HBM_CLEAN:
+        release original full-KV HBM block for kv_cache[0]/[1]
+
+    bitmap = managed_bitmap[layer, kv_block_id]
     for each set offset in bitmap:
-        slot = hbm_slot_table[layer, kv_block_id, offset]
-        if hbm_slot_owner_epoch[layer, slot] == epoch:
-            mark slot FREE
-            push free_slot_stack
-    resident_bitmap[layer, kv_block_id] = 0
-    invalidate hbm_slot_table entries
+        slot = managed_slot_table[layer, kv_block_id, offset]
+        if managed_slot_owner_epoch[layer, slot] == epoch:
+            managed_slot_state[layer, slot] = FREE
+            append slot to next-step free_slot_buffer
+
+    managed_bitmap[layer, kv_block_id] = 0
+    invalidate managed_slot_table entries
+    block_mode[layer, kv_block_id] = ASU_ONLY or INVALID
     block_epoch[layer, kv_block_id]++
 ```
 
@@ -779,16 +1052,20 @@ reset 流程：
 ```mermaid
 flowchart TB
     A["req finish/cancel"] --> B["iterate request block_table"]
-    B --> C["read resident_bitmap per block"]
-    C --> D["enumerate set offsets"]
-    D --> E["slot = hbm_slot_table[block, offset]"]
-    E --> F{"epoch match?"}
-    F -- "yes" --> G["slot FREE<br/>push free_stack"]
-    F -- "no" --> H["skip stale"]
-    G --> I["clear bitmap/table"]
-    H --> I
-    I --> J["block_epoch++"]
-    J --> K["vLLM releases logical blocks"]
+    B --> C{"block_mode ORIG_HBM_*?"}
+    C -- "yes" --> D["release original full-KV block"]
+    C -- "no" --> E["no original block"]
+    D --> F["read managed_bitmap"]
+    E --> F
+    F --> G["enumerate managed offsets"]
+    G --> H["slot = managed_slot_table[block, offset]"]
+    H --> I{"epoch match?"}
+    I -- "yes" --> J["managed slot FREE<br/>append free_slot_buffer"]
+    I -- "no" --> K["skip stale"]
+    J --> L["clear managed bitmap/table<br/>block_mode INVALID"]
+    K --> L
+    L --> M["block_epoch++"]
+    M --> N["vLLM releases logical blocks"]
 ```
 
 ## 11. ASU 存储内容
@@ -835,7 +1112,8 @@ HBM 中仍然需要保留：
 模型权重 shard
 workspace / graph / communication buffers
 kv_cache[2] indexer key cache
-full KV HBM cache slots
+original full-KV tail blocks
+managed full-KV token slots
 residency metadata
 ```
 
@@ -881,17 +1159,17 @@ residency metadata
 topK residency metadata lookup
 miss 去重
 ASU read job 生成
-HBM slot state 更新
+block_mode / managed slot state 更新
 ```
 
 NPU 压力控制原则：
 
-1. hit path 只读 bitmap/table，避免链表和复杂分支。
+1. hit path 只读 `block_mode`、`managed_bitmap/table`，避免链表和复杂分支。
 2. hit touch 不直接更新 LRU 链表，只写 touch ring。
 3. miss 按 block/offset 排序去重，尽量合并 ASU IO。
-4. free slot 分配只 pop 数组栈。
-5. 淘汰选择放 CPU step 间，NPU 只应用 victim 数组。
-6. 通过 watermark 保证 step 内大多数情况下不触发 emergency eviction。
+4. managed free slot 分配只 pop CPU 预先准备的连续数组。
+5. 淘汰选择和淘汰应用都放 CPU step 间，NPU 不参与 victim 处理。
+6. 通过 watermark 保证 step 内大多数情况下不触发 managed free slot shortage；不足时走 backpressure，不在 NPU 上 emergency eviction。
 
 ### 12.3 命中率目标
 
@@ -913,7 +1191,7 @@ miss_by_reason:
   cold_start
   evicted
   first_decode_not_prefetched
-  dirty_writeback_blocked
+  dirty_asu_write_pending
   free_slot_shortage
 ```
 
@@ -943,7 +1221,7 @@ IndexerBlock:
   对应 kv_cache[2] HBM page，必须常驻。
 
 FullKVResidency:
-  对应 kv_cache[0]/[1] 的 ASU-backed HBM token slots。
+  对应 kv_cache[0]/[1] 的 block_mode、original full-KV blocks、managed token slots 和 ASU 地址。
 ```
 
 ## 14. 第一版落地范围
@@ -952,10 +1230,10 @@ FullKVResidency:
 
 1. 保持 `kv_cache[2]` 和 Lightning Indexer 不变。
 2. 定义 full KV ASU 地址表和 residency metadata。
-3. 在 indexer 输出后增加 `materialize_topk_full_kv`。
-4. 改造 sparse attention 输入，使其消费 materialized HBM full KV slots。
-5. 新 token full KV write-through 到 ASU，并进入 HBM recent tail。
-6. CPU step 间生成 eviction plan，NPU 只应用。
+3. 在 indexer 输出后增加 `resolve_topk_full_kv / materialize_topk_full_kv`。
+4. 改造 sparse attention 输入，使其消费 materialized workspace 或统一 source refs。
+5. 新 token full KV 按原有逻辑写原始 HBM block，并 write-through 到 ASU。
+6. CPU step 间完成淘汰并准备下一步 free slot buffer，NPU 不参与淘汰。
 7. 调整 vLLM decode 节点的 KV memory accounting，把 full KV 冷数据算到 ASU，不算 HBM 常驻。
 
 第一版不做：
@@ -995,12 +1273,14 @@ vLLM block table 继续作为主逻辑索引。
 kv_cache[2] 继续作为 indexer key cache 常驻 HBM。
 Lightning Indexer 继续输出精确 logical topK。
 ASU 保存完整 full attention KV。
-HBM 只缓存 full attention KV 的 hot token slots。
-topK logical token 通过 block table 查询 full KV residency。
-hit 直接 attention。
-miss 由 NPU 从 ASU 读入 HBM 后 attention。
-CPU 在 decode step 间生成 eviction plan。
-新生成 token 同时更新 kv_cache[2]、HBM full KV 和 ASU full KV。
+HBM 中的新生成 / tail token 保持原始 vLLM full-KV block layout。
+HBM 中的旧 hot token 使用 managed token slots。
+topK logical token 通过 block table + block_mode 查询 full KV source。
+ORIG_HBM_* 命中原始 block。
+MIXED_MANAGED 命中 managed slot。
+ASU_ONLY 或 managed miss 由 NPU 从 ASU 读入 managed slot。
+CPU 在 decode step 间完成 original block demotion 和 managed slot eviction。
+新生成 token 更新 kv_cache[2]，full KV 写原始 HBM block，并写入 ASU。
 ```
 
 这版设计的核心价值是：在不破坏现有 indexer 语义和 vLLM block table 机制的前提下，降低 `kv_cache[0]/[1]` 的 HBM 常驻量，从而提升 64G HBM 约束下的 decode 并发能力。

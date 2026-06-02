@@ -9,7 +9,8 @@ token 粒度管理
 + 全局 HBM KVCache token slot pool
 + 每 req dense token_state 索引表
 + 数组栈管理 free slots
-+ 全局 CLOCK / hotness 连续扫描淘汰
++ CLOCK / hotness 作为 baseline 淘汰方案
++ Windowed LRU / Batched LRU 作为备选淘汰方案
 + per-req soft quota 防止单个请求长期占满 HBM
 + req generation 防止 reset 后异步 IO 写回污染新请求
 ```
@@ -74,7 +75,7 @@ flowchart LR
     M --> A["allocator<br/>free_stack pop"]
     A --> E{"free slots enough?"}
     E -- "yes" --> IO["backend -> HBM load"]
-    E -- "no" --> C["CLOCK eviction<br/>linear scan slot_state"]
+    E -- "no" --> C["eviction prepare<br/>CLOCK or Windowed LRU<br/>linear scan slot_state"]
     C --> A
     IO --> U["update token_state / slot_state"]
     U --> P
@@ -87,7 +88,7 @@ flowchart LR
 2. 每个 req 只维护逻辑 token 到物理 slot 的状态映射。
 3. free slot 分配走数组栈，不通过链表，也不遍历 free bitmap。
 4. free slot 不足或低水位时才触发 eviction，eviction 使用连续扫描生成 victim buffer。
-5. 精确 LRU 不适合 NPU，使用 CLOCK / hotness 近似淘汰。
+5. 精确链表 LRU 不适合 NPU，默认使用 CLOCK / hotness，备选评估 Windowed LRU / Batched LRU。
 6. req reset 使用 generation 隔离异步 IO，避免旧请求 load/writeback 完成后污染复用后的 req slot。
 
 ## 4. 辅助数据结构总览
@@ -155,6 +156,7 @@ pool_id + slot_id
 | `slot_backend` | physical token slot | NPU GM | backend id / offset | clean eviction 后写回 token_state 的 backend 引用 |
 | `free_stack` | physical token slot | NPU GM | `slot_id[]`, `free_top` | O(1) 批量 pop/push free slots |
 | `clock_state` | global pool | NPU GM | `clock_hand`, `scan_len` | CLOCK 淘汰连续扫描游标 |
+| `last_access_step` | physical token slot | NPU GM，可选 | recent access timestamp | Windowed LRU 备选方案使用 |
 | `victim_buffers` | eviction candidate | NPU GM/UB staging | `victim_over_quota[]`, `victim_normal[]` | eviction_prepare 输出候选 slot |
 | `load_job_table` | IO job | NPU GM | `(req, token, generation, target_slot, backend)` | backend -> HBM 换入任务 |
 | `writeback_job_table` | IO job | NPU GM | `(slot, req, token, generation, backend)` | dirty slot HBM -> backend 写回任务 |
@@ -683,19 +685,20 @@ flowchart TB
 
 ### 10.2 淘汰策略
 
-不做精确 LRU。推荐全局 CLOCK / hotness 近似淘汰。
-
-元数据：
+淘汰策略保留两套可评估方案：
 
 ```text
-clock_hand
-scan_len
-victim_over_quota[]
-victim_normal[]
-victim_dirty[]
+方案 A: CLOCK / hotness
+    当前推荐 baseline。逻辑简单，NPU 友好，牺牲一部分 LRU 精度。
+
+方案 B: Windowed LRU / Batched LRU
+    LRU 备选方案。用 last_access_step 表达最近访问时间，
+    淘汰时在连续扫描窗口内选择最老 token。
 ```
 
-淘汰只在 free slots 不足或低水位时触发：
+严格 global linked-list LRU 只作为对照方案，不建议作为 NPU 第一版实现。
+
+两套方案共享相同的触发条件：
 
 ```text
 if free_top < needed_slots:
@@ -703,6 +706,61 @@ if free_top < needed_slots:
 
 if free_top < low_watermark:
     background_eviction_prepare()
+```
+
+其中：
+
+```text
+needed_slots = unique_miss_tokens_to_load + decode_new_tokens_to_write
+shortage = max(0, needed_slots - free_top)
+target_victims = shortage + refill_margin
+```
+
+`refill_margin` 用于避免刚释放完马上再次触发淘汰。
+
+扫描方式不是随机选一段，而是确定性的环形顺序扫描：
+
+```text
+start = clock_hand
+end = clock_hand + scan_len
+
+if end <= total_slots:
+    scan slot_state[start:end]
+else:
+    scan slot_state[start:total_slots]
+    scan slot_state[0:end % total_slots]
+
+clock_hand = end % total_slots
+```
+
+这保证 `eviction_prepare` 的主访问是连续 GM 读，适合 Ascend NPU 做 tile、vector mask 和 compact。
+
+#### 10.2.1 方案 A: CLOCK / hotness
+
+CLOCK / hotness 方案用小整数近似访问热度。命中时把 `hotness` 设置到最大值；淘汰扫描时遇到热 token 只递减热度，不立即淘汰。
+
+额外元数据：
+
+```text
+clock_hand
+scan_len
+slot_state[slot].hotness     2-bit 或 3-bit counter
+victim_over_quota_clean[]
+victim_normal_clean[]
+victim_over_quota_dirty[]
+victim_normal_dirty[]
+```
+
+hit mark 流程：
+
+```text
+1. lookup 只输出 touched_slot_list，不直接写 slot_state。
+2. mark kernel 对 touched_slot_list 去重。
+3. 对 unique touched slot:
+      hotness = max_hotness
+      PROTECTED = 1
+4. attention 完成后:
+      PROTECTED = 0
 ```
 
 `eviction_prepare` 连续扫描：
@@ -736,7 +794,7 @@ for slot in scan range:
         append victim_dirty_normal
 ```
 
-淘汰优先级：
+CLOCK / hotness 的淘汰优先级：
 
 ```text
 1. cold + over_quota + clean
@@ -753,6 +811,225 @@ for slot in scan range:
 ```
 
 `hotness` 建议先使用 2-bit 或 3-bit counter，而不是单 bit refbit。命中后设置到 max，淘汰扫描每轮递减。这样比单次 second-chance 更接近 DSA token 重用模式，但仍然保持连续扫描和简单分支。
+
+流程图：
+
+```mermaid
+flowchart TB
+    A["free_top < needed_slots"] --> B["从 clock_hand 顺序扫描 slot_state window"]
+    B --> C{"slot safe?<br/>RESIDENT && !PROTECTED && !LOADING && !EVICTING"}
+    C -- "no" --> D["skip"]
+    C -- "yes" --> E{"hotness > 0?"}
+    E -- "yes" --> F["hotness -= 1<br/>skip"]
+    E -- "no" --> G["读取 owner_req<br/>判断 over_quota / dirty"]
+    G --> H["按优先级写入 victim buffers"]
+    H --> I{"victim_count >= target?"}
+    I -- "no" --> B
+    I -- "yes" --> J["eviction_apply<br/>释放 clean / writeback dirty"]
+    D --> I
+    F --> I
+```
+
+该方案的 NPU 压力主要在：
+
+```text
+1. eviction_prepare 对 slot_state/owner 数组做连续读。
+2. hotness > 0 时需要写回 hotness--，这是连续窗口内的批量写。
+3. eviction_apply 对 victim 对应的 token_state[req, token] 做随机写。
+```
+
+优点：
+
+```text
+1. 数据结构简单。
+2. 不需要 per-hit 维护 LRU 链表。
+3. 扫描和 hotness 衰减都发生在连续窗口内。
+4. 容易控制每 step 最大扫描预算。
+```
+
+缺点：
+
+```text
+1. 只能近似 recency，无法严格选择最久未访问 token。
+2. hotness counter 粒度有限，可能无法区分多个较老 token 的先后顺序。
+3. 如果 hotness 设置过高，会导致扫描效率下降。
+```
+
+#### 10.2.2 方案 B: Windowed LRU / Batched LRU
+
+Windowed LRU 不维护全局 LRU 链表，而是给每个 physical slot 记录最近访问 step。淘汰时仍然顺序扫描一个窗口，只是在窗口候选里选择 `last_access_step` 最老的 slot。
+
+额外元数据：
+
+```text
+global_cache_step          uint64
+last_access_step[N]        uint32 / uint64
+last_mark_step[N]          uint32，可选，用于同 step 重复 touch 过滤
+lru_candidate_slots[M]     int32
+lru_candidate_score[M]     int32
+lru_victim_buffer[K]       int32
+```
+
+hit mark 流程：
+
+```text
+1. lookup 输出 touched_slot_list。
+2. touched_slot_list 去重。
+3. 对 unique touched slot:
+      last_access_step[slot] = global_cache_step
+      PROTECTED = 1
+4. attention 完成后:
+      PROTECTED = 0
+5. step 完成:
+      global_cache_step += 1
+```
+
+Windowed LRU 的关键点是：hit hot path 仍然不做链表移动，只做批量 timestamp 写入。
+
+淘汰候选过滤：
+
+```text
+candidate =
+    RESIDENT
+  & !PROTECTED
+  & !LOADING
+  & !EVICTING
+```
+
+候选评分：
+
+```text
+age = global_cache_step - last_access_step[slot]
+
+score =
+    age
+  + over_quota_bonus
+  - dirty_penalty
+  - protected_penalty
+```
+
+其中 `protected_penalty` 在正常情况下不需要，因为 `PROTECTED` 已经过滤掉；保留该项主要用于 emergency 策略。
+
+victim 选择可以有两种实现：
+
+```text
+1. topK select:
+      在候选窗口内选 score 最大的 K 个。
+      精度更高，但需要 selection / partial sort。
+
+2. bucket select:
+      按 age 高位或 age range 分桶。
+      先取 oldest bucket，再按 quota/dirty 优先级取 victim。
+      精度略低，但更适合 NPU vector compact。
+```
+
+建议第一版 Windowed LRU 使用 bucket select，不做完整排序。
+
+流程图：
+
+```mermaid
+flowchart TB
+    A["free_top < needed_slots"] --> B["从 clock_hand 顺序扫描 slot_state window"]
+    B --> C["过滤 safe resident slots"]
+    C --> D["连续读取 last_access_step"]
+    D --> E["计算 age / score"]
+    E --> F{"选择策略"}
+    F -- "topK select" --> G["选 score 最大的 K 个"]
+    F -- "bucket select" --> H["按 age bucket compact<br/>优先 oldest buckets"]
+    G --> I["lru_victim_buffer"]
+    H --> I
+    I --> J["eviction_apply<br/>释放 clean / writeback dirty"]
+```
+
+该方案的 NPU 压力主要在：
+
+```text
+1. mark kernel 需要随机批量写 last_access_step[slot]。
+2. eviction_prepare 需要连续读取 last_access_step window。
+3. topK select 或 bucket compact 比 CLOCK 判断更重。
+4. eviction_apply 仍然有 token_state[req, token] 随机写。
+```
+
+优点：
+
+```text
+1. 比 CLOCK 更接近 LRU，能区分更细的 recency。
+2. 在 DSA working set 有明显时间局部性时，可能提升命中率。
+3. 仍然避免链表，淘汰扫描仍然是连续窗口。
+4. 可通过 age bucket 限制 NPU 上的 selection 复杂度。
+```
+
+缺点：
+
+```text
+1. hit mark 多一个 last_access_step 随机批量写。
+2. eviction_prepare 需要读 timestamp 并计算 score。
+3. 如果 touched_slot_list 很大，timestamp 写放大可能明显。
+4. topK select 实现复杂度高于 CLOCK。
+```
+
+#### 10.2.3 严格 Global LRU 对照方案
+
+严格 LRU 需要维护全局双向链表：
+
+```text
+lru_prev[N]
+lru_next[N]
+lru_head
+lru_tail
+```
+
+每次 hit 都要把 slot 移到链表头：
+
+```text
+prev = lru_prev[slot]
+next = lru_next[slot]
+
+lru_next[prev] = next
+lru_prev[next] = prev
+lru_prev[old_head] = slot
+lru_next[slot] = old_head
+lru_prev[slot] = INVALID
+lru_head = slot
+```
+
+这个方案语义最精确，但不适合作为 Ascend NPU 首版：
+
+```text
+1. 每次 hit 都有多次 data-dependent random read/write。
+2. topK hit 数量大时，LRU 更新会进入 hot path。
+3. 并发 mark 同一 slot 或相邻节点需要 atomic/CAS/lock。
+4. 链表节点跳转破坏连续访存。
+5. request reset/eviction 时链表删除也需要随机更新前后节点。
+```
+
+因此严格 LRU 只建议用于 CPU simulator 或离线评估，作为判断 CLOCK/Windowed LRU 命中率差距的 upper bound。
+
+#### 10.2.4 两种可实现方案对比
+
+| 维度 | CLOCK / hotness | Windowed LRU / Batched LRU |
+| --- | --- | --- |
+| 访问热度表达 | 2-bit/3-bit hotness counter | `last_access_step` timestamp |
+| hit 维护 | unique touch 后设置 hotness=max | unique touch 后写 last_access_step=current_step |
+| 淘汰扫描 | 连续扫描 slot_state | 连续扫描 slot_state + last_access_step |
+| victim 选择 | hotness==0 后按 quota/dirty 分 buffer | 在窗口内选 age 最大或 oldest bucket |
+| NPU 实现复杂度 | 低 | 中 |
+| 随机写压力 | touched slot 写 hotness | touched slot 写 timestamp |
+| 命中率潜力 | 中 | 中高 |
+| 适合作为第一版 | 是 | 可作为对比实验 |
+
+推荐策略：
+
+```text
+1. 第一版实现 CLOCK / hotness。
+2. 同时保留 last_access_step 的可选编译/运行开关。
+3. 通过真实 DSA trace 对比:
+      CLOCK hit rate
+      Windowed LRU hit rate
+      eviction scan efficiency
+      mark kernel 写放大
+4. 如果 Windowed LRU 命中率提升明显，且 mark/selection 成本可接受，再切为默认。
+```
 
 ### 10.3 Per-Req Soft Quota
 
@@ -959,7 +1236,8 @@ token 粒度 KVCache manager
     + req generation guard
     + SoA slot metadata arrays
     + array-based free_stack
-    + CLOCK / hotness linear-scan eviction
+    + CLOCK / hotness linear-scan eviction as baseline
+    + optional Windowed LRU / Batched LRU eviction for comparison
     + victim_buffer batch apply
     + per-req soft quota
     + chunk reset by token_state row scan

@@ -1,340 +1,235 @@
-# 基于历史 token 索引与 tail 原生路径的 ASU-backed Decode KVCache 管理设计草稿
+# ASU-backed DSA Decode KVCache 管理设计草稿
 
-本文重写 HBM KVCache 管理设计，修正一个关键边界：
+本文定义 Ascend NPU + ASU 存储后端下的 DSA decode KVCache 管理机制。
+
+核心目标是：承接 Lightning Indexer 输出的 topK original token ids，在 NPU 侧完成 token 粒度 HBM resident / ASU miss 解析与加载，并把 full KV 以不破坏 SFA attention 语义的形式交给 SFA。
+
+## 0. 当前结论
+
+当前 SFA 的 `sparse_indices` 不是纯地址 id。它表示 original logical token id，并参与 causal/window/seq length 语义判断。
+
+因此，本设计不再采用：
 
 ```text
-我们的 token 索引不覆盖新生成 token。
-
-managed historical token:
-  已经脱离原始 vLLM full-KV block layout。
-  由 ASU-backed token 索引管理。
-  查询 state 可直接得到 managed HBM pair slot 或 ASU full-KV record address。
-  pair slot 中 kv_cache[0] 与 kv_cache[1] 必须共享同一个 block + offset。
-
-decode tail / 新生成 token:
-  不进入我们的 token 索引。
-  继续按原 vLLM block table / slot_mapping 写入和查询 full KV。
-  在 tail 阶段天然 HBM resident，ASU write 完成前禁止释放。
+resolved_hbm_loc -> remapped sparse id -> SFA
 ```
 
-SFA 不改。无论 token 来自 managed 索引还是 tail 原始路径，SFA 前统一转换成它能读的形式：
+最终路径改为：
 
 ```text
-resolved_hbm_loc = (hbm_block_id, hbm_offset)
-  -> 同时定位 kv_cache[0][hbm_block_id, hbm_offset]
-  -> 同时定位 kv_cache[1][hbm_block_id, hbm_offset]
-  -> sfa_access_block_idx
-  -> sfa_block_table[layer, req, sfa_access_block_idx] = hbm_block_id
-  -> sfa_sparse_id = sfa_access_block_idx * block_size + hbm_offset
+sparse_indices[topk_i] = original token id      # 保留 SFA 语义
+resolved_kv_slots[topk_i] = real HBM token slot # 只用于 KV 地址
+```
+
+SFA 数学主体不变，只扩展 KV gather / MergeKv 的地址生成：
+
+```text
+old:
+  sparse_indices -> block_table -> PA KV address
+
+new:
+  sparse_indices -> attention semantic checks
+  resolved_kv_slots -> KV address
 ```
 
 ## 1. 目标与边界
 
 ### 1.1 目标
 
-1. 在 Ascend 910B 单卡约 64 GB HBM 限制下，降低 decode 节点 full KV 常驻 HBM 量。
-2. 在相同 HBM 限制下提高并发能力，当前目标约 50 req，可按模型、topK、seq len 和 SLA 调整。
-3. HBM hit rate 目标约 95%。
-4. HBM miss 时由 NPU 通过参数面直接从 ASU 读取 full KV，并在 SFA 调用前放入 SFA 可访问的 HBM cache slot。
+1. 在 Ascend 910B 单卡 HBM 受限条件下，降低 decode 节点 full KV 常驻 HBM 量。
+2. 面向后续 950DT 组网，构建可承接 ASU 存储后端的 KVCache 管理路径，对标 Nvidia G2.5 生态位。
+3. 在 DSA 注意力架构下，使用 indexer topK 直接检索 HBM 常驻 KV。
+4. HBM miss 时，由 NPU 直驱 ASU 读取 full KV，并安装到 HBM token slot。
+5. 支持 token 粒度动态加载和淘汰，提高 req 并发。
+6. 将解析后的 KV 地址交给 SFA，不影响 SFA attention 算法正确性。
 
-### 1.2 不改的部分
-
-```text
-Indexer:
-  不改 Lightning Indexer。
-  不改 kv_cache[2] 的 PA_BSND HBM block layout。
-  indexer 继续使用 vLLM 原始 block table。
-
-SFA:
-  不改 npu_sparse_flash_attention operator。
-  SFA 继续通过 sparse_indices + block_table 生成 KV 地址。
-  不新增独立的 key_rope block table。
-  key_rope 必须与 key/value 使用同一套 logical token id 到 physical block/offset 映射。
-```
-
-### 1.3 改的部分
+### 1.2 不负责的部分
 
 ```text
-Full KV historical cache:
-  对已经脱离 tail 的历史 token，使用 ASU-backed token 索引。
-  managed token 的 HBM 位置不要求等于原始 vLLM block + offset。
-  但同一个 managed token 的 kv_cache[0] 和 kv_cache[1] 必须位于同一个 managed HBM slot。
+ASU read 接口内部机制:
+  由其他团队实现。
+  本设计只假设 NPU 侧有可用的批量读接口和 completion 语义。
 
-SFA compatibility:
-  在 SFA 前，把 topK token 解析到真实 HBM 坐标。
-  再把真实 HBM 坐标 remap 成 SFA 可寻址的临时 sparse id。
+Lightning Indexer:
+  不改 indexer 算法。
+  不改 kv_cache[2] 的 PA_BSND layout。
+  indexer 继续使用原始 vLLM block table。
+
+SFA 数学主体:
+  不改 QK / softmax / PV / rope 语义。
+  不改 sparse_indices 的 original token id 语义。
 ```
 
-## 2. 三个坐标系
+### 1.3 需要改的部分
 
-| 坐标系 | 含义 | 使用者 |
+```text
+Token KV management:
+  新增 ASU-backed token state。
+  按 token 粒度管理 kv_cache[0] + kv_cache[1] full KV pair。
+  HBM hit 返回 resident slot。
+  HBM miss 通过 ASU load 到 free HBM token slot。
+
+SFA gather:
+  新增 resolved_kv_slots 输入或等价机制。
+  只修改 KV gather / MergeKv 的地址生成。
+  sparse_indices 继续作为 original token ids 使用。
+```
+
+## 2. 当前代码事实
+
+### 2.1 DSA KVCache 组成
+
+当前 DSA decode 路径下，`kv_cache` 至少包含三类数据：
+
+| cache tensor | 用途 | 本设计是否管理 |
 | --- | --- | --- |
-| `indexer_token_id` | indexer 输出的 req 内原始 logical token position | domain 判断、managed token uid 映射、tail block table 计算 |
-| `managed_token_uid` | managed historical token 的索引身份 | managed token state / ASU record addr / hotness |
-| `sfa_access_id` | SFA 兼容层生成的临时 logical id | SFA sparse_indices |
+| `kv_cache[0]` | `k_nope` / MLA latent cache；SFA 中同时作为 key 和 value | 是 |
+| `kv_cache[1]` | `k_pe` / `key_rope`；与 query_rope 参与 attention score | 是 |
+| `kv_cache[2]` | Lightning Indexer key cache | 否，保持原 PA layout |
 
-必须避免把这三者混成一个概念。
-
-```text
-indexer_token_id:
-  代表原始序列里的 token 位置。
-
-managed_token_uid:
-  只在 token 属于 managed domain 时存在。
-
-sfa_access_id:
-  只用于让 SFA 读到正确 HBM 地址。
-  不代表原始序列位置。
-```
-
-## 3. 当前代码事实
-
-### 3.1 DSA KVCache 实际组成
-
-根据 vllm-ascend 的 SFA/MLA 路径，DSA decode 下的 `kv_cache` 不是传统 attention 的 K/V 两个 tensor，而是至少包含三类数据：
-
-| cache tensor | 源码变量/用途 | 是否属于本设计 full-KV 管理对象 |
-| --- | --- | --- |
-| `kv_cache[0]` | `k_nope` / MLA latent cache；SFA 中同时作为 `key` 和 `value` | 是 |
-| `kv_cache[1]` | `k_pe` / `key_rope`；SFA 中与 `query_rope` 配合参与 attention score | 是 |
-| `kv_cache[2]` | Lightning Indexer key cache；由 indexer 的 `wk/k_norm/rope` 路径生成 | 否，第一版保持原 vLLM PA layout |
-
-因此，本设计里的 full KV token record 指：
+本设计中的 full KV record 指：
 
 ```text
 full_kv_record(token) =
-    kv_cache[0] token fragment   # k_nope / latent
-  + kv_cache[1] token fragment   # k_pe / key_rope
+    kv_cache[0] token fragment
+  + kv_cache[1] token fragment
 ```
 
-`kv_cache[2]` 是 indexer key cache，不是 SFA attention 读取的 full KV payload。第一版不把 `kv_cache[2]` 纳入 ASU-backed managed full-KV slot pool，否则 indexer 本身也需要 ASU/HBM 分层设计。
+`kv_cache[2]` 只服务 indexer，不进入 ASU-backed full KV token slot pool。
 
-### 3.2 indexer key cache 与 full attention KV 是两套数据
+### 2.2 `kv_cache[0]` 与 `kv_cache[1]` 必须同 slot
 
-当前 Ascend SFA 路径中，indexer key 写入：
-
-```python
-torch_npu.npu_scatter_nd_update_(
-    kv_cache[2].view(-1, k.shape[-1]),
-    attn_metadata.slot_mapping.view(-1, 1),
-    k.view(-1, k.shape[-1])
-)
-```
-
-Lightning Indexer 调用：
-
-```python
-topk_indices = torch.ops._C_ascend.npu_lightning_indexer(
-    query=q,
-    key=kv_cache[2],
-    weights=weights,
-    actual_seq_lengths_query=actual_seq_lengths_query,
-    actual_seq_lengths_key=actual_seq_lengths_key,
-    block_table=attn_metadata.block_tables,
-    layout_query="TND",
-    layout_key="PA_BSND",
-    sparse_count=2048,
-    sparse_mode=3,
-)
-```
-
-SFA 当前调用：
-
-```python
-attn_output = torch.ops._C_ascend.npu_sparse_flash_attention(
-    query=ql_nope,
-    key=kv_cache[0],
-    value=kv_cache[0],
-    sparse_indices=topk_indices,
-    block_table=attn_metadata.block_tables,
-    key_rope=kv_cache[1],
-    layout_kv="PA_BSND",
-)
-```
-
-这里的关键约束是：
+当前 SFA 使用同一份 sparse id / block table 寻址 key/value 和 key_rope。即使修改 gather 地址生成，也必须保持：
 
 ```text
-SFA 只有一套 sparse_indices + block_table。
-在 PA_BSND 布局下，这套地址同时用于:
-  kv_cache[0] 作为 key/value
-  kv_cache[1] 作为 key_rope
+resolved_kv_slot(token)
+  -> kv_cache[0][slot]
+  -> kv_cache[1][slot]
 ```
 
-也就是说，`key_rope` 可以按同样方式管理，但不能独立映射。若某个 token 被解析到：
+不能为同一个 token 的 `kv_cache[0]` 与 `kv_cache[1]` 维护两套独立地址。
+
+### 2.3 SFA sparse id 语义
+
+当前 SFA PA 寻址模型是：
 
 ```text
-resolved_hbm_loc = (hbm_block_id, hbm_offset)
+token_id = sparse_indices[topk_i]
+logical_block = token_id / block_size
+offset = token_id % block_size
+physical_block = block_table[req, logical_block]
+addr = physical_block * block_size + offset
 ```
 
-则 SFA 会同时读取：
+但 `token_id` 不只用于地址。`sparse_mode=3` 下，它还参与 causal/window 边界判断。
+
+因此：
 
 ```text
-kv_cache[0][hbm_block_id, hbm_offset]
-kv_cache[1][hbm_block_id, hbm_offset]
+sparse_indices 必须保持 original logical token id。
+actual_seq_lengths_kv 必须继续表示原始 KV 序列语义。
+不能把 access namespace 长度伪装成 seq length。
 ```
 
-如果 `kv_cache[0]` 和 `kv_cache[1]` 被放在不同 block/offset，当前 SFA 无法表达这种关系。要支持独立映射，必须改 SFA operator，使其接收单独的 `key_rope_block_table` 或 per-token `key_rope` 地址。
+### 2.4 block table 与 token 粒度重排冲突
 
-本设计中，SFA operator 不改，但输入换成 remap 后的临时视图：
-
-```python
-attn_output = torch.ops._C_ascend.npu_sparse_flash_attention(
-    query=ql_nope,
-    key=kv_cache[0],
-    value=kv_cache[0],
-    sparse_indices=attn_metadata.sfa_sparse_indices[layer],
-    block_table=attn_metadata.sfa_block_tables[layer],
-    key_rope=kv_cache[1],
-    layout_kv="PA_BSND",
-)
-```
-
-### 3.3 为什么要分 domain
-
-如果 full KV cache 已经按 token 粒度重排，managed historical token 的查询不应走：
+原始 SFA `block_table` 是 logical block -> physical block 的映射。它只能表达 block 粒度布局，不能表达：
 
 ```text
-indexer_token_id
-  -> logical block + offset
-  -> indexer_block_table
-  -> original kv_block + offset
-  -> managed cache state
+token_id -> arbitrary HBM token slot
 ```
 
-因为 managed cache 不保证仍在 original kv block 上。
+若 full KV 以 token 粒度动态加载到任意 HBM slot，仅靠 remap block table 无法表达正确地址。必须扩展 SFA gather，使其接受 token-level resolved slot。
 
-但新生成 token 又不能强行进入 managed 索引，因为它仍处于原 vLLM block layout：
+## 3. 三个坐标系
+
+| 坐标系 | 含义 | 使用者 |
+| --- | --- | --- |
+| `original_token_id` | req 内原始 logical token position，即 indexer topK 输出 | SFA 语义、domain 判断、tail 定位 |
+| `managed_token_uid` | managed historical token 的管理身份 | token state / ASU record / hotness |
+| `resolved_kv_slot` | token 当前真实 HBM full KV pair slot | SFA gather 地址生成 |
+
+必须避免把 `resolved_kv_slot` 编码回新的 sparse id。
 
 ```text
-new / tail token:
-  full KV 由原 vLLM 写入原始 block + offset。
-  ASU write 可能尚未完成。
-  它在 tail 阶段应直接通过原 vLLM block table 得到 HBM 位置。
-```
+original_token_id:
+  代表原始序列位置。
+  传给 SFA sparse_indices。
 
-所以查询必须先分 domain：
+managed_token_uid:
+  只在 token 属于 managed historical domain 时存在。
 
-```text
-if token belongs to managed historical domain:
-    查 managed token index
-else:
-    查原 vLLM block table / slot_mapping
+resolved_kv_slot:
+  表示 kv_cache[0] 与 kv_cache[1] 的同一个 HBM token pair slot。
+  只服务 KV 地址生成。
 ```
 
 ## 4. 总体架构
 
-### 4.1 数据流
-
 ```mermaid
 flowchart TB
-    subgraph I["Indexer 保持原样"]
+    subgraph I["Indexer 原生层"]
         K2["kv_cache[2]<br/>indexer key cache"]
-        IBT["indexer_block_table<br/>vLLM original block table"]
+        IBT["original block table"]
         IDX["npu_lightning_indexer"]
-        TOPK["indexer_topk_token_id"]
+        TOPK["original topK token ids"]
     end
 
-    subgraph R["Domain router"]
+    subgraph R["Token KV Resolver"]
         DOM{"managed historical<br/>or decode tail?"}
-    end
-
-    subgraph M["Managed historical path"]
-        UID["managed_token_uid"]
-        STATE["managed_token_state[layer, uid]<br/>pair_state + shared_hbm_loc + asu_record_addr"]
+        TAIL["tail path<br/>original block table / slot_mapping"]
+        STATE["managed token state"]
         ASU["ASU full KV store"]
-        LOAD["ASU miss load<br/>kv_cache[0] + kv_cache[1]<br/>to same managed slot"]
+        LOAD["ASU miss load<br/>install kv_cache[0/1] pair"]
+        SLOT["resolved_kv_slots"]
     end
 
-    subgraph TAIL["Decode tail path"]
-        TBT["tail/original vLLM block table"]
-        TLOC["tail_hbm_loc<br/>original block + offset"]
-    end
-
-    subgraph S["SFA compatibility"]
-        LOC["resolved_hbm_loc"]
-        SBT["sfa_block_table[layer]"]
-        SID["sfa_sparse_indices[layer]"]
-        SFA["npu_sparse_flash_attention"]
+    subgraph S["SFA Gather Extension"]
+        SEM["sparse_indices keeps<br/>original token ids"]
+        GATHER["MergeKv reads<br/>resolved_kv_slots"]
+        SFA["SFA math unchanged"]
     end
 
     K2 --> IDX
     IBT --> IDX
     IDX --> TOPK
     TOPK --> DOM
-    DOM -- "managed" --> UID
-    UID --> STATE
-    STATE -- "HBM hit" --> LOC
+    DOM -- "tail" --> TAIL
+    DOM -- "managed" --> STATE
+    STATE -- "HBM hit" --> SLOT
     STATE -- "ASU_ONLY" --> LOAD
     ASU --> LOAD
-    LOAD --> LOC
-    DOM -- "tail" --> TBT
-    TBT --> TLOC
-    TLOC --> LOC
-    LOC --> SBT
-    LOC --> SID
-    SBT --> SFA
-    SID --> SFA
+    LOAD --> SLOT
+    TAIL --> SLOT
+    TOPK --> SEM
+    SLOT --> GATHER
+    SEM --> SFA
+    GATHER --> SFA
 ```
 
-### 4.2 两条查询路径
-
-| domain | 覆盖 token | 查询方式 | 输出 |
-| --- | --- | --- | --- |
-| managed historical | 已脱离原始 vLLM full-KV block layout 的历史 token | `managed_token_uid -> managed_token_state` | managed HBM slot 或 ASU miss load 后的 HBM slot |
-| decode tail | 新生成 / recent tail token | `indexer_token_id -> logical_block + offset -> vLLM block table` | 原始 vLLM HBM block + offset |
-
-两条路径最终都输出：
+### 4.1 主要路径
 
 ```text
-resolved_hbm_loc = (hbm_block_id, hbm_offset)
-```
-
-SFA compatibility 层只处理 `resolved_hbm_loc`，不关心它来自 managed 还是 tail。
-
-### 4.3 SFA 寻址转换
-
-SFA 地址生成可抽象为：
-
-```text
-logical_block_idx = sparse_index / block_size
-block_offset = sparse_index % block_size
-physical_block = block_table[req, logical_block_idx]
-addr0 = kv_cache[0][physical_block, block_offset]
-addr1 = kv_cache[1][physical_block, block_offset]
-```
-
-因此对于任意 resolved HBM location：
-
-```text
-resolved_hbm_loc = (hbm_block_id = 700, hbm_offset = 13)
-```
-
-转换为：
-
-```text
-sfa_access_block_idx = get_or_create_access_block(req, 700)
-sfa_block_table[layer, req, sfa_access_block_idx] = 700
-sfa_sparse_id = sfa_access_block_idx * block_size + 13
-```
-
-SFA 内部就会读到：
-
-```text
-kv_cache[0][700, 13]  # key/value latent
-kv_cache[1][700, 13]  # key_rope
+1. indexer 输出 original_topk_indices。
+2. Token KV Resolver 对每个 topK token 判断 domain。
+3. tail token 走原始 vLLM block table / slot_mapping，得到原始 full KV slot。
+4. managed token 查 token state。
+5. HBM hit 直接返回 resident slot。
+6. HBM miss 通过 ASU load 到 free HBM token pair slot，再返回 slot。
+7. SFA 接收 original_topk_indices 和 resolved_kv_slots。
+8. SFA 保留 original_topk_indices 做语义判断，用 resolved_kv_slots 读取 kv_cache[0/1]。
 ```
 
 ## 5. 核心数据结构
 
 ### 5.1 domain 判断元数据
 
-第一版推荐用连续边界，NPU 判断最简单：
+第一版使用连续边界：
 
 ```text
 managed_prefix_len[req]
 
-if indexer_token_id < managed_prefix_len[req]:
+if original_token_id < managed_prefix_len[req]:
     managed historical domain
 else:
     decode tail domain
@@ -344,35 +239,23 @@ else:
 
 ```text
 [0, managed_prefix_len):
-  已纳入 managed token index。
+  已纳入 ASU-backed managed token state。
 
 [managed_prefix_len, seq_len):
-  decode tail，仍按原 vLLM block table 查询 full KV。
+  decode tail，仍按 vLLM 原始 block layout 定位 full KV。
 ```
 
-如果后续出现非连续迁移需求，可以升级为 bitmap：
+若后续需要非连续迁移，再升级为 membership bitmap。
+
+### 5.2 managed token state
+
+managed token uid 可用 base + token id：
 
 ```text
-managed_membership_bitmap[req, token_id]
+managed_token_uid = managed_token_base[req] + original_token_id
 ```
 
-但第一版不建议在 NPU hit path 引入 bitmap 随机查，除非 trace 证明 prefix 模型命中率不足。
-
-### 5.2 managed token index
-
-managed token 的身份映射：
-
-```text
-managed_token_uid = managed_token_base[req] + indexer_token_id
-```
-
-或使用 dense table：
-
-```text
-managed_token_uid = managed_uid_table[req, indexer_token_id]
-```
-
-主状态表：
+主状态：
 
 ```text
 managed_token_state[layer, managed_token_uid]
@@ -380,924 +263,336 @@ managed_token_state[layer, managed_token_uid]
 
 字段：
 
-| 字段 | 粒度 | 含义 |
-| --- | --- | --- |
-| `state` | token pair | `HBM_CLEAN` / `ASU_ONLY` / `LOADING` / `INVALID`，表示 `kv_cache[0]` + `kv_cache[1]` 这一对是否可用 |
-| `hbm_block_id` | token pair | managed token 当前所在 HBM cache block，`kv_cache[0]` 与 `kv_cache[1]` 共享 |
-| `hbm_offset` | token pair | managed token 当前所在 HBM cache block 内 offset，`kv_cache[0]` 与 `kv_cache[1]` 共享 |
-| `asu_record_addr` | token pair | ASU 中 full-KV record 地址，record 包含 `kv_cache[0]` fragment 与 `kv_cache[1]` fragment |
-| `token_epoch` | token | 防止 token uid 复用后的 stale IO |
-| `req_id` | token | 所属请求 |
-| `logical_token_id` | token | req 内原始 token id |
+| 字段 | 含义 |
+| --- | --- |
+| `state` | `HBM_CLEAN` / `ASU_ONLY` / `LOADING` / `INVALID` |
+| `hbm_slot` | 当前 HBM token pair slot，线性 slot 或 `(block, offset)` |
+| `asu_record_addr` | ASU full KV record 地址 |
+| `token_epoch` | 防止 req/token 复用后的 stale IO |
+| `req_id` | 所属请求 |
+| `logical_token_id` | req 内 original token id |
 
-禁止为同一个 managed token 记录两个互不相关的位置：
-
-```text
-invalid design:
-  kv_cache[0] -> (block_a, offset_a)
-  kv_cache[1] -> (block_b, offset_b)
-
-valid design:
-  full_kv_pair -> (block_x, offset_x)
-```
-
-这是由 SFA 的 PA 寻址方式决定的：当前 SFA 只有一套 `sparse_indices + block_table`，会用同一个 sparse id 同时访问 `key/value` 和 `key_rope`。
-
-managed token 的状态不需要 `HBM_DIRTY` 作为主状态，因为只有 ASU write 完成、可安全从原始 tail 域迁出的 token 才进入 managed index。若实现选择复用当前 HBM slot 作为 managed slot，也必须先保证 ASU 副本已完成。
+`HBM_CLEAN` 的前提是 ASU 中已有完整 full KV record，且 HBM slot 中 `kv_cache[0]` 与 `kv_cache[1]` pair 均有效。
 
 ### 5.3 decode tail 元数据
 
-tail token 不进入 managed token index。它依赖 vLLM 原始信息：
+tail token 不进入 managed token state。它使用原始 vLLM 信息：
 
-| 数据结构 | 粒度 | 作用 |
-| --- | --- | --- |
-| `indexer_block_table[req, logical_block]` | block | 继续给 indexer 使用，也可用于 tail token full-KV HBM 定位 |
-| `tail_slot_mapping[token]` | token | 若已有 slot_mapping 可用，可直接得到 original block + offset |
-| `tail_dirty_bitmap[layer, req, logical_block]` | block bitset | tail token ASU write 是否完成 |
-| `tail_protect_until_step[req]` | req / token range | tail token 保护窗口，防止过早迁入 managed 或释放 |
+| 数据结构 | 作用 |
+| --- | --- |
+| `original_block_table` | indexer 使用，也可定位 tail full KV |
+| `slot_mapping` | 若可按 token 查询，直接得到 tail HBM slot |
+| `tail_dirty_bitmap` | 标记 tail token ASU write 是否完成 |
+| `tail_protect_until_step` | 防止过早迁入 managed 或释放 |
 
 tail 查询：
 
 ```text
-logical_block = indexer_token_id / block_size
-offset = indexer_token_id % block_size
-hbm_block = indexer_block_table[req, logical_block]
-resolved_hbm_loc = (hbm_block, offset)
+slot = slot_mapping[req, original_token_id]
 ```
 
-如果 vLLM 暴露更直接的 `slot_mapping`，也可以：
+或：
 
 ```text
-resolved_hbm_loc = slot_mapping[req, indexer_token_id]
+logical_block = original_token_id / block_size
+offset = original_token_id % block_size
+block = original_block_table[req, logical_block]
+slot = block * block_size + offset
 ```
 
-### 5.4 HBM managed slot pool
+在 DCP/PCP 或 hybrid block 模式下，优先复用 vLLM 已计算的 `slot_mapping`，避免重新实现复杂 rank-local 映射。
 
-managed historical tokens 使用统一 token slot pool：
+### 5.4 HBM token pair slot pool
 
-```text
-managed_hbm_slot = (hbm_block_id, hbm_offset)
-```
-
-一个 managed slot 是 full-KV pair slot：
+managed full KV 使用 token pair slot：
 
 ```text
-managed_hbm_slot(block, offset):
-  kv_cache[0][block, offset] = k_nope / latent fragment
-  kv_cache[1][block, offset] = k_pe / key_rope fragment
-```
-
-slot 分配和释放必须以 pair 为粒度，不能只释放或覆盖 `kv_cache[0]`、`kv_cache[1]` 中的一个分量。
-
-NPU step 内不遍历 free list。CPU step 间准备：
-
-```text
-free_managed_slot_buffer[layer][i] = (hbm_block_id, hbm_offset)
+hbm_token_slot:
+  kv_cache[0][slot] = latent key/value fragment
+  kv_cache[1][slot] = key_rope fragment
 ```
 
 辅助结构：
 
-| 数据结构 | 粒度 | 作用 |
-| --- | --- | --- |
-| `free_managed_slot_buffer[layer]` | managed token slot | NPU ASU miss path 使用 |
-| `slot_owner_token[layer, hbm_block_id, offset]` | slot | managed HBM slot 当前属于哪个 token |
-| `slot_state[layer, hbm_block_id, offset]` | slot | FREE / RESIDENT / LOADING / PROTECTED |
-| `load_job_table[layer]` | IO job | ASU -> managed HBM slot |
-| `touch_ring[layer]` | event | NPU 上报 topK touch/hit/miss/domain |
-| `cache_stats[layer]` | stats | hit rate、miss、load latency |
+| 数据结构 | 作用 |
+| --- | --- |
+| `free_slot_buffer[layer]` | NPU miss load 消费的 free HBM token slots |
+| `slot_owner_token[layer, slot]` | 当前 slot 属于哪个 managed token |
+| `slot_state[layer, slot]` | `FREE` / `RESIDENT` / `LOADING` / `PROTECTED` |
+| `load_job_table[layer]` | ASU -> HBM load job |
+| `touch_ring[layer]` | NPU 上报 touch / hit / miss / source |
+| `cache_stats[layer]` | hit rate、miss、load latency |
 
-### 5.5 SFA compatibility scratch
+slot 分配、释放、覆盖必须以 pair 为粒度。
 
-每个 layer、每个 step 生成临时 SFA 视图：
+### 5.5 resolved slots
 
-| 数据结构 | 粒度 | 作用 |
-| --- | --- | --- |
-| `sfa_block_table[layer, req, access_block_idx]` | access block | access block -> real HBM block |
-| `sfa_sparse_indices[layer, req, topk_i]` | topK token | 传给 SFA 的临时 sparse index |
-| `sfa_access_block_map[layer, req, hbm_block_id]` | HBM block | 同一个 HBM block 复用同一个 access block idx |
-| `sfa_access_block_count[layer, req]` | req | 当前 req 使用了多少 access block |
-| `sfa_access_seq_len[layer, req]` | req | 若 SFA 检查 key length，传 access namespace 长度 |
-
-`sfa_block_table` 是临时访问表，不是原始序列 block table：
+Resolver 输出：
 
 ```text
-原始 block table:
-  indexer 使用，覆盖原始上下文。
-
-SFA access block table:
-  SFA 使用，覆盖本 step topK 实际落到的 HBM blocks。
+resolved_kv_slots[layer, query_token, kv_head, topk_i]
 ```
 
-如果 SFA 检查 key length：
+或与 SFA topK tensor 等价的压缩布局。
+
+每个 entry 表示一个 full KV pair slot：
 
 ```text
-sfa_access_seq_len = sfa_access_block_count * block_size
+resolved_kv_slot = hbm_block_id * block_size + hbm_offset
 ```
+
+SFA gather 使用：
+
+```text
+key row  = kv_cache[0][resolved_kv_slot]
+rope row = kv_cache[1][resolved_kv_slot]
+```
+
+如果底层实现需要 `(block, offset)`，可将 `resolved_kv_slot` 拆成两个 tensor；语义上仍是 per-token physical slot。
 
 ## 6. Decode 流程
 
-### 6.1 第一轮 decode
-
-第一轮 decode 时，prefill 节点给 decode 节点 predicted topK。decode 节点可以提前从 ASU load 这些历史 token 到 managed HBM slots。
-
-```mermaid
-sequenceDiagram
-    participant P as Prefill node
-    participant D as Decode CPU
-    participant N as Decode NPU
-    participant A as ASU
-    participant S as SFA
-
-    P->>D: prompt metadata + predicted topK
-    D->>N: init managed_prefix_len / managed index
-    D->>N: keep kv_cache[2] and original block table for indexer
-    N->>A: load predicted topK historical full KV
-    A->>N: full KV data
-    N->>N: write managed HBM slots
-    N->>N: build sfa_sparse_indices + sfa_block_table
-    N->>S: call SFA unchanged
-```
-
-初始化规则：
+### 6.1 req init
 
 ```text
-prompt / historical token:
-  属于 managed domain。
-  managed_token_state 默认 ASU_ONLY。
-  predicted topK 可提前 load 为 HBM_CLEAN。
-
-new decode token:
-  属于 decode tail domain。
-  不创建 managed_token_state。
-  继续按 vLLM 原始 block layout 写 full KV。
+1. vLLM 初始化 original block table，供 kv_cache[2] / indexer 使用。
+2. ASUFullKVCacheManager 初始化 managed_prefix_len。
+3. prompt historical token 默认进入 managed domain:
+     state = ASU_ONLY
+     asu_record_addr = ASU full KV record address
+4. predicted topK 可提前 load 到 HBM token slots。
+5. decode tail 初始为空。
 ```
 
-### 6.2 后续 decode step
+### 6.2 append new token
 
-```mermaid
-flowchart TB
-    A["step start"] --> B["write new token full KV<br/>original vLLM block layout"]
-    B --> C["write indexer key<br/>kv_cache[2] original layout"]
-    C --> D["npu_lightning_indexer"]
-    D --> E["indexer_topk_token_id"]
-    E --> F{"token domain?"}
-    F -- "managed historical" --> G["managed_token_state lookup"]
-    G --> H{"HBM resident?"}
-    H -- "yes" --> I["managed hbm loc"]
-    H -- "no" --> J["ASU load to managed slot"]
-    J --> I
-    F -- "decode tail" --> K["original block table / slot_mapping"]
-    K --> L["tail hbm loc"]
-    I --> M["resolved_hbm_loc"]
-    L --> M
-    M --> N["build sfa_access_id<br/>and sfa_block_table"]
-    N --> O["SFA unchanged"]
-    O --> P["touch_ring stats"]
-    P --> Q["CPU between steps<br/>eviction / tail migration / free slot refill"]
-```
-
-NPU step 内只做：
+新生成 token 属于 tail domain：
 
 ```text
-1. indexer 输出 indexer_topk_token_id。
-2. 根据 managed_prefix_len 判断 domain。
-3. managed token:
-     查 managed_token_state。
-     ASU_ONLY 时 load 到 free managed slot。
-4. tail token:
-     按原 vLLM block table / slot_mapping 得到 HBM block + offset。
-5. 两条路径统一输出 resolved_hbm_loc。
-6. resolved_hbm_loc -> sfa_sparse_indices + sfa_block_table。
-7. 调用未改造的 SFA。
+1. vLLM 为新 token 分配 original block + offset。
+2. 写 kv_cache[0] 和 kv_cache[1] full KV 到原始 slot。
+3. 写 kv_cache[2] indexer key 到原始 slot。
+4. 设置 tail dirty bit。
+5. 异步写 ASU。
+6. ASU write 完成后清 dirty bit。
 ```
 
-NPU step 内不做：
+### 6.3 每步 attention 前
 
 ```text
-managed victim 选择
+1. indexer 输出 original_topk_indices。
+2. Token KV Resolver 生成 resolved_kv_slots。
+3. SFA 调用:
+     sparse_indices = original_topk_indices
+     resolved_kv_slots = Resolver 输出
+     actual_seq_lengths_kv = 原始 KV seq length
+4. SFA gather 按 resolved_kv_slots 读取 kv_cache[0/1]。
+5. SFA 数学主体不变。
+```
+
+### 6.4 tail 迁入 managed domain
+
+CPU step 间可将 tail contiguous prefix 转入 managed domain，条件：
+
+```text
+1. ASU write 已完成。
+2. token 超出 tail protect window。
+3. CPU 决定释放或复用 original full-KV HBM backing。
+```
+
+第一版建议：
+
+```text
+tail -> managed 时默认 state = ASU_ONLY。
+释放 original full-KV HBM backing。
+后续 topK 命中再从 ASU load 到 managed token slot。
+```
+
+若复用当前 HBM 内容作为 managed slot，必须把 pair ownership 从 vLLM original allocator 转移给 managed slot pool，且不能再被原 allocator 复用。
+
+## 7. Token KV Resolver
+
+### 7.1 输入
+
+```text
+original_topk_indices
+managed_prefix_len
+managed_token_base or managed_uid_table
+managed_token_state
+original_block_table / slot_mapping
+free_slot_buffer
+kv_cache[0], kv_cache[1]
+ASU read interface
+```
+
+### 7.2 输出
+
+```text
+resolved_kv_slots
+touch_ring events
+miss/load stats
+load_job_table updates
+managed_token_state updates
+```
+
+### 7.3 单 token 逻辑
+
+```text
+token_id = original_topk_indices[...]
+
+if token_id >= managed_prefix_len[req]:
+    slot = tail_slot_mapping_or_original_block_table_lookup(req, token_id)
+    source = TAIL_ORIGINAL_HBM
+
+else:
+    uid = managed_token_base[req] + token_id
+    state = managed_token_state[layer, uid]
+
+    if state == HBM_CLEAN:
+        slot = state.hbm_slot
+        source = MANAGED_HBM
+
+    elif state == ASU_ONLY:
+        slot = pop(free_slot_buffer[layer])
+        issue_asu_read_pair(state.asu_record_addr, kv_cache[0][slot], kv_cache[1][slot])
+        wait_or_pipeline_load_completion()
+        managed_token_state[layer, uid] = HBM_CLEAN(slot, state.asu_record_addr)
+        source = MANAGED_ASU_LOAD
+
+    elif state == LOADING:
+        wait_or_reuse_load_job()
+        slot = loaded slot
+        source = MANAGED_LOADING
+
+    else:
+        invalid token state
+
+resolved_kv_slots[...] = slot
+write_touch_ring(req, token_id, source, slot)
+```
+
+### 7.4 NPU step 内不做的事
+
+```text
+victim 选择
 LRU 链表维护
 free list 链表遍历
 tail token 迁入 managed index
 dirty tail token 释放
 ```
 
-## 7. SFA 前查询与 remap
+## 8. SFA Gather Extension
 
-### 7.1 输入输出
+### 8.1 ABI 变化
 
-输入：
-
-```text
-indexer_topk_indices[req, k]
-managed_prefix_len[req]
-managed_token_state[layer, uid]
-indexer_block_table[req, logical_block] 或 slot_mapping
-free_managed_slot_buffer[layer]
-```
-
-输出：
+SFA 增加输入：
 
 ```text
-sfa_sparse_indices[layer, req, k]
-sfa_block_table[layer, req, access_block_idx]
-kv_cache[0][resolved_hbm_block, resolved_hbm_offset]
-kv_cache[1][resolved_hbm_block, resolved_hbm_offset]
+resolved_kv_slots
 ```
 
-### 7.2 单 token 查询
+现有输入保持：
 
 ```text
-indexer_token_id = indexer_topk_indices[req, i]
-
-if indexer_token_id < managed_prefix_len[req]:
-    domain = managed historical
-else:
-    domain = decode tail
+sparse_indices = original topK token ids
+actual_seq_lengths_query = 原语义
+actual_seq_lengths_kv = 原语义
+query_rope / key_rope = 原语义
 ```
 
-managed historical path：
+`block_table` 可保留为兼容参数或 fallback 参数，但在 token-level resolved slot 路径中，SFA full KV gather 不再依赖 `block_table` 生成 `kv_cache[0/1]` 地址。
+
+### 8.2 内部修改范围
+
+只改 KV gather / MergeKv 地址生成。
+
+旧路径：
 
 ```text
-uid = managed_token_base[req] + indexer_token_id
-state = managed_token_state[layer, uid]
-
-if state == HBM_CLEAN:
-    resolved_hbm_loc = (state.hbm_block_id, state.hbm_offset)
-
-elif state == ASU_ONLY:
-    slot = pop(free_managed_slot_buffer[layer])
-    ASU read state.asu_record_addr -> kv_cache[0][slot.block, slot.offset]
-                                      + kv_cache[1][slot.block, slot.offset]
-    managed_token_state[layer, uid] = HBM_CLEAN(slot.block, slot.offset, state.asu_record_addr)
-    resolved_hbm_loc = (slot.block, slot.offset)
-
-elif state == LOADING:
-    wait/reuse load job
-    resolved_hbm_loc = loaded slot
+realS2Idx = sparse_indices[topk_i]
+block = block_table[req, realS2Idx / block_size]
+offset = realS2Idx % block_size
+slot = block * block_size + offset
+copy kv_cache[0/1][slot] -> merge workspace
 ```
 
-decode tail path：
+新路径：
 
 ```text
-logical_block = indexer_token_id / block_size
-offset = indexer_token_id % block_size
-hbm_block = indexer_block_table[req, logical_block]
-resolved_hbm_loc = (hbm_block, offset)
+realS2Idx = sparse_indices[topk_i]
+semantic checks use realS2Idx
+
+slot = resolved_kv_slots[topk_i]
+copy kv_cache[0/1][slot] -> merge workspace
 ```
 
-如果 `slot_mapping` 能直接查询指定 token：
+不改：
 
 ```text
-resolved_hbm_loc = slot_mapping[req, indexer_token_id]
+topK ordering
+causal/window 判断
+actual seq length 语义
+QK matmul
+softmax
+PV matmul
+output layout
 ```
 
-### 7.3 统一 remap
+## 9. Eviction 与 CPU 管理
 
-两条路径得到 `resolved_hbm_loc` 后，统一执行：
-
-```text
-hbm_block, hbm_offset = resolved_hbm_loc
-access_block = get_or_create_sfa_access_block(req, hbm_block)
-sfa_block_table[layer, req, access_block] = hbm_block
-sfa_sparse_indices[layer, req, i] = access_block * block_size + hbm_offset
-```
-
-### 7.4 示例
-
-managed token 示例：
-
-```text
-indexer_token_id = 1234
-managed_prefix_len = 4096
-
-1234 < 4096 -> managed
-managed_token_state 查到:
-  hbm_block = 700
-  hbm_offset = 13
-
-access_block = 5
-sfa_block_table[5] = 700
-sfa_sparse_id = 5 * 16 + 13 = 93
-```
-
-tail token 示例：
-
-```text
-indexer_token_id = 4100
-managed_prefix_len = 4096
-
-4100 >= 4096 -> tail
-logical_block = 4100 / 16 = 256
-offset = 4100 % 16 = 4
-hbm_block = indexer_block_table[req, 256] = 812
-
-access_block = 6
-sfa_block_table[6] = 812
-sfa_sparse_id = 6 * 16 + 4 = 100
-```
-
-SFA 分别读：
-
-```text
-managed token:
-  kv_cache[0][700, 13]
-  kv_cache[1][700, 13]
-
-tail token:
-  kv_cache[0][812, 4]
-  kv_cache[1][812, 4]
-```
-
-### 7.5 批量伪代码
-
-```text
-clear_sfa_access_scratch(req)
-
-for i in 0..topk-1:
-    token_id = indexer_topk_indices[req, i]
-
-    if token_id < managed_prefix_len[req]:
-        uid = managed_token_base[req] + token_id
-        state = managed_token_state[layer, uid]
-
-        if state is HBM_CLEAN:
-            hbm_block = state.hbm_block_id
-            hbm_offset = state.hbm_offset
-            source = MANAGED_HBM
-
-        elif state is ASU_ONLY:
-            slot = pop(free_managed_slot_buffer[layer])
-            enqueue_asu_read_pair(
-                state.asu_record_addr,
-                kv_cache[0][slot.block, slot.offset],
-                kv_cache[1][slot.block, slot.offset],
-            )
-            wait_or_pipeline_load()
-            managed_token_state[layer, uid] = HBM_CLEAN(slot.block, slot.offset, state.asu_record_addr)
-            hbm_block = slot.block
-            hbm_offset = slot.offset
-            source = MANAGED_ASU_LOAD
-
-        elif state is LOADING:
-            wait_or_reuse(state.job)
-            hbm_block = managed_token_state[layer, uid].hbm_block_id
-            hbm_offset = managed_token_state[layer, uid].hbm_offset
-            source = MANAGED_LOADING
-
-        else:
-            raise invalid_managed_token
-
-    else:
-        logical_block = token_id / block_size
-        offset = token_id % block_size
-        hbm_block = indexer_block_table[req, logical_block]
-        hbm_offset = offset
-        source = TAIL_ORIGINAL_HBM
-
-    access_block = get_or_create_access_block(req, hbm_block)
-    sfa_block_table[layer, req, access_block] = hbm_block
-    sfa_sparse_indices[layer, req, i] = access_block * block_size + hbm_offset
-    write_touch_ring(req, token_id, source, hbm_block, hbm_offset)
-
-sfa_access_seq_len[layer, req] = sfa_access_block_count[layer, req] * block_size
-
-npu_sparse_flash_attention(
-    sparse_indices=sfa_sparse_indices[layer, req],
-    block_table=sfa_block_table[layer, req],
-    actual_seq_lengths_key=sfa_access_seq_len[layer, req],
-    key=kv_cache[0],
-    value=kv_cache[0],
-    key_rope=kv_cache[1],
-)
-```
-
-### 7.6 必须验证的 SFA 语义
-
-该方案成立的关键前提是：
-
-```text
-SFA 使用 sparse_indices 主要做 KV 地址生成；
-不会把 sparse_indices 当作原始绝对位置参与额外语义计算。
-```
-
-如果 SFA 内部使用 sparse index 做 causal mask、绝对位置判断、排序假设或 seq len 检查，则必须对拍验证 remap 后语义是否仍正确。
-
-## 8. 新生成 token 管理
-
-### 8.1 tail 写入路径
-
-新生成 token 不进入 managed token index。
-
-```text
-1. vLLM 为新 token 分配 original logical block + offset。
-2. full KV 按原逻辑写入 kv_cache[0][original_block, offset] 和 kv_cache[1][original_block, offset]。
-3. indexer key 写入 kv_cache[2][original_block, offset]。
-4. tail_dirty_bitmap[layer, req, original_block].set(offset)。
-5. 异步写 ASU。
-6. ASU write 完成后 clear dirty bit。
-```
-
-这部分仍由原 vLLM block table / slot_mapping 定位。
-
-这里的 `original_block + offset` 同样是 pair 坐标：
-
-```text
-kv_cache[0][original_block, offset] = new token k_nope / latent
-kv_cache[1][original_block, offset] = new token k_pe / key_rope
-kv_cache[2][original_block, offset] = new token indexer key
-```
-
-其中 `kv_cache[2]` 只服务 indexer，不进入本设计的 full-KV ASU record。
-
-### 8.2 topK 命中新生成 token
-
-如果 topK 中包含新生成 token：
-
-```text
-indexer_token_id >= managed_prefix_len[req]
-  -> tail domain
-  -> original block table / slot_mapping
-  -> resolved_hbm_loc = original block + offset
-  -> SFA remap
-```
-
-不查 managed token index。
-
-### 8.3 tail token 何时迁入 managed index
-
-CPU 在 step 间可以把 tail token 转入 managed domain，但必须满足：
-
-```text
-1. ASU write 已完成。
-2. token 超出 tail protect window。
-3. CPU 决定释放或复用原始 full-KV HBM backing。
-```
-
-迁移动作：
-
-```text
-for token in contiguous tail prefix ready_to_manage:
-    create managed_token_state[layer, uid]
-    managed_token_state.state = ASU_ONLY
-    managed_token_state.asu_record_addr = token ASU full-KV record addr
-
-advance managed_prefix_len[req]
-```
-
-如果实现希望保留当前 HBM 内容作为 managed cache，也可以：
-
-```text
-managed_token_state.state = HBM_CLEAN
-managed_token_state.hbm_block_id = current_original_block
-managed_token_state.hbm_offset = current_offset
-```
-
-但这要求该 slot 的 ownership 从 tail/original domain 转给 managed slot pool，并且不能再被 vLLM 原始 block allocator 复用。转移的是 pair ownership：`kv_cache[0]` 与 `kv_cache[1]` 的同一 `(block, offset)` 一起转移。
-
-第一版建议更简单：
-
-```text
-tail -> managed 时默认设为 ASU_ONLY。
-释放 original HBM backing。
-后续 topK 命中再从 ASU load 到 managed slot。
-```
-
-这样元数据边界最清晰。
-
-## 9. 淘汰机制
-
-### 9.1 职责划分
-
-淘汰只作用于 managed historical domain。
+eviction 只作用于 managed historical domain。
 
 ```text
 CPU:
-  消费 touch_ring。
-  更新 hotness / LRU / req quota。
-  选择 managed HBM_CLEAN victim。
-  修改 managed_token_state 和 slot_state。
-  准备下一 step 的 free_managed_slot_buffer。
+  consume_touch_ring()
+  update_hotness_or_lru()
+  choose HBM_CLEAN victims()
+  evict_clean_managed_tokens()
+  advance_tail_to_managed_boundary()
+  refill_free_slot_buffer()
+  publish_next_step_metadata()
 
 NPU:
-  只消费当前 step metadata snapshot。
-  HBM miss 时只从 free_managed_slot_buffer 取 slot。
-  不做 victim 选择。
+  consume current metadata snapshot
+  resolve topK token slots
+  issue ASU read on miss
+  install loaded KV pair
+  write touch/miss events
 ```
 
-tail token 不由 managed eviction 淘汰：
+managed eviction：
 
 ```text
-tail token:
-  由 vLLM 原始 block 生命周期和 tail migration 机制管理。
-  dirty tail token 禁止释放。
+require state == HBM_CLEAN
+require asu_record_addr valid
+
+old_slot = state.hbm_slot
+state = ASU_ONLY
+state.hbm_slot = INVALID
+slot_owner_token[old_slot] = INVALID
+slot_state[old_slot] = FREE
+append old_slot to next free_slot_buffer
 ```
 
-### 9.2 managed token eviction
+tail token 不由 managed eviction 淘汰。dirty tail token 在 ASU write 完成前禁止释放。
+
+## 10. free slot 不足
+
+NPU step 内不做 emergency victim 选择。
+
+| 方式 | 行为 |
+| --- | --- |
+| watermark | CPU 提前准备足够 free slots |
+| host slow path | NPU 上报不足，host refill 后重放 |
+| admission control | 降低并发或限制 managed miss 预算 |
+
+第一版：
 
 ```text
-victim = managed_token_uid
-require managed_token_state[layer, victim].state == HBM_CLEAN
-require managed_token_state[layer, victim].asu_record_addr is valid
-require ASU full-KV record contains both kv_cache[0] and kv_cache[1] fragments
-
-old_slot = (hbm_block_id, hbm_offset)
-managed_token_state[layer, victim].state = ASU_ONLY
-managed_token_state[layer, victim].hbm_block_id = INVALID
-managed_token_state[layer, victim].hbm_offset = INVALID
-slot_owner_token[layer, old_slot] = INVALID
-slot_state[layer, old_slot] = FREE
-append old_slot to next free_managed_slot_buffer
+free_slot_buffer >= expected_managed_miss_tokens + reserve_margin
 ```
 
-该释放动作不写回 HBM 内容。它只修改索引和 slot ownership，因为 managed token 进入 `HBM_CLEAN` 的前提是 ASU 中已经有完整 full-KV record：
-
-```text
-ASU record valid:
-  kv_cache[0] fragment persisted
-  kv_cache[1] fragment persisted
-
-evict:
-  remove HBM residency
-  keep ASU residency
-```
-
-如果某个 token 只有 `kv_cache[0]` 或只有 `kv_cache[1]` 的 ASU 副本完成，则不能进入 `HBM_CLEAN` 可淘汰集合。
-
-### 9.3 CPU-only LRU baseline
-
-CPU 维护：
-
-```text
-last_touch_step[layer, managed_token_uid]
-resident_lru[layer]
-protected_until_step[layer, managed_token_uid]
-```
-
-流程：
-
-```text
-1. NPU 写 touch_ring(req, token_id, source, hbm_loc)。
-2. CPU 只把 managed source 的 touched token 更新到 managed LRU。
-3. free_managed_slot_buffer 低于 watermark 时，从 LRU cold end 选 victim。
-4. 跳过当前 step topK、protected、LOADING token。
-5. 对 HBM_CLEAN victim 执行 managed eviction。
-```
-
-### 9.4 Score/Watermark 方案
-
-```text
-score(token) =
-    w_touch * recent_touch_count
-  - w_age   * age_since_last_touch
-  - w_quota * req_over_quota
-```
-
-优先级：
-
-| 优先级 | 对象 | 操作 |
-| --- | --- | --- |
-| P0 | 当前 step topK managed token | 保护 |
-| P1 | `LOADING` managed token | 保护 |
-| P2 | 高频 topK managed token | 保留 |
-| P3 | paused req / over-quota req 的 clean managed token | 优先淘汰 |
-| P4 | cold `HBM_CLEAN` managed token | 淘汰为 `ASU_ONLY` |
-
-tail token 的保护由 `tail_protect_window` 和 dirty bitmap 管理，不混入 managed eviction score。
-
-### 9.5 free managed slot 不够时
-
-NPU step 内不做 emergency eviction。
-
-| 方式 | 行为 | 适用 |
-| --- | --- | --- |
-| watermark | CPU 提前准备足够 free managed slots | 默认 |
-| host slow path | NPU 上报不足，host 同步 refill 后重放 | 功能兜底 |
-| admission control | 降低并发或 topK managed miss 预算 | SLA 保护 |
-
-第一版推荐：
-
-```text
-free_managed_slot_buffer >= expected_managed_miss_tokens + reserve_margin
-```
-
-## 10. 请求变化时的维护
-
-### 10.1 req init
-
-```text
-1. vLLM 初始化 indexer_block_table，供 kv_cache[2] / indexer 使用。
-2. cache manager 初始化 managed_prefix_len。
-3. prompt historical token 默认进入 managed domain:
-     managed_token_state.state = ASU_ONLY
-     managed_token_state.asu_record_addr = ASU full-KV record address
-4. predicted topK historical token 可提前 load 到 managed HBM slots。
-5. decode tail 初始为空。
-```
-
-### 10.2 req append token
-
-```text
-1. vLLM append token，更新 seq_len 和 indexer block table。
-2. 写 kv_cache[2] indexer key，保持原始布局。
-3. 写 kv_cache[0] 和 kv_cache[1] full KV 到 original full-KV block 的同一 offset。
-4. token 属于 tail domain，不创建 managed_token_state。
-5. 设置 tail dirty bit。
-6. 发起 ASU write。
-7. ASU write 完成后清 tail dirty bit。
-```
-
-### 10.3 req finish / abort / reset
-
-```text
-managed domain:
-  for each managed_token_uid owned by req:
-      token_epoch += 1
-      if HBM slot valid:
-          slot_state = FREE
-          append slot to next free_managed_slot_buffer
-      managed_token_state = INVALID
-
-tail domain:
-  wait or invalidate tail ASU writes by epoch
-  release original vLLM full-KV blocks according to vLLM lifecycle
-  clear tail_dirty_bitmap
-```
-
-所有 inflight ASU IO 完成时必须校验 epoch，避免 stale write。
-
-### 10.4 req pause / resume
-
-pause：
-
-```text
-managed HBM_CLEAN token 可被 CPU 优先淘汰。
-tail dirty token 等待 ASU write 完成。
-clean tail token 可优先迁入 managed domain，然后释放 original HBM backing。
-kv_cache[2] 的处理继续遵循 vLLM 现有策略。
-```
-
-resume：
-
-```text
-managed token 可从 ASU_ONLY 恢复。
-tail token 继续按 vLLM block table 查询，直到迁入 managed domain。
-```
-
-## 11. 查询、转换、维护流程图
-
-### 11.1 查询与 remap
-
-```mermaid
-flowchart TB
-    A["indexer_topk_token_id"] --> B{"token_id < managed_prefix_len?"}
-    B -- "yes" --> C["managed_token_state lookup"]
-    C --> D{"HBM resident?"}
-    D -- "yes" --> E["managed hbm loc"]
-    D -- "no" --> F["ASU load to managed slot"]
-    F --> E
-    B -- "no" --> G["tail lookup<br/>original block table / slot_mapping"]
-    G --> H["tail hbm loc"]
-    E --> I["resolved_hbm_loc"]
-    H --> I
-    I --> J["access_block = map hbm_block"]
-    J --> K["sfa_block_table[access_block] = hbm_block"]
-    K --> L["sfa_sparse_id = access_block * block_size + offset"]
-    L --> M["SFA unchanged"]
-```
-
-### 11.2 CPU 维护
-
-```mermaid
-flowchart TB
-    A["SFA step done"] --> B["NPU writes touch_ring"]
-    B --> C["CPU updates managed LRU / hotness"]
-    C --> D["CPU handles tail migration"]
-    D --> E{"free managed slots below watermark?"}
-    E -- "yes" --> F["select clean managed victims"]
-    E -- "no" --> G["skip managed eviction"]
-    F --> H["managed_token_state -> ASU_ONLY"]
-    H --> I["slot_state -> FREE"]
-    I --> J["refill next free_managed_slot_buffer"]
-    G --> J
-    J --> K["publish next-step metadata"]
-```
-
-### 11.3 reset
-
-```mermaid
-flowchart TB
-    A["req reset"] --> B["invalidate managed tokens"]
-    B --> C["release managed HBM slots"]
-    C --> D["clear tail dirty metadata"]
-    D --> E["release original vLLM full-KV blocks"]
-    E --> F["stale IO discarded by epoch"]
-```
-
-## 12. HBM 命中率目标
-
-### 12.1 命中率定义
-
-整体 HBM hit：
-
-```text
-HBM hit token:
-  managed token state is HBM_CLEAN
-  or token is tail domain and original HBM full KV is resident
-
-HBM miss token:
-  managed token state is ASU_ONLY and this step requires ASU read
-```
-
-```text
-hit_rate = hit_tokens / total_topK_tokens
-```
-
-tail token 在 tail window 内通常应视为 HBM hit，因为它本来就常驻原始 HBM block。
-
-### 12.2 95% hit rate 的策略来源
-
-1. 第一轮 decode 使用 prefill predicted topK 预取 managed historical token。
-2. recent tail token 默认保留在原始 vLLM block 中。
-3. managed miss 后恢复的 token 至少保护若干 step。
-4. 高频 topK historical token 提高 hotness。
-5. paused req / over-quota req 的 clean managed token 优先淘汰。
-
-需要用 trace 校准：
-
-```text
-tail_protect_window
-tail_to_managed_migration_policy
-miss_protect_window
-free_managed_slot_watermark
-per_req_hbm_quota
-LRU window
-score weights
-predicted topK prefetch count
-```
-
-## 13. Ascend NPU 压力评估
-
-### 13.1 NPU step 内新增压力
-
-| 项 | 压力来源 | 说明 |
-| --- | --- | --- |
-| domain check | `token_id < managed_prefix_len` | 标量比较，对 NPU 友好 |
-| managed state lookup | managed token 的 `uid -> state` dense gather | 不经过 block table |
-| tail lookup | tail token 的 original block table / slot_mapping | 只对 tail domain 执行 |
-| ASU read | managed ASU_ONLY token full KV 读取 | 由 managed hit rate 决定 |
-| SFA id remap | `(hbm_block, offset) -> sfa_access_id` | 需要 access block map |
-| touch_ring write | token_id/domain/hit/miss/hbm_loc event | 连续 ring buffer |
-
-### 13.2 对 NPU 友好的约束
-
-```text
-不用链表。
-不用 NPU 维护 LRU。
-不用 NPU 扫描 victim。
-managed lookup 不经过 indexer block table。
-tail lookup 只做原始 block table / slot_mapping 地址计算。
-free_managed_slot_buffer 是 CPU 准备好的连续数组。
-sfa_access_block_map 使用 dense marker 或 topK 局部 group-by。
-```
-
-### 13.3 随机访问不可完全消除
-
-不可避免的随机性来自：
-
-```text
-indexer topK token id 本身离散。
-managed_token_state gather 离散。
-tail block table lookup 离散。
-ASU miss token 地址离散。
-HBM token slot 地址离散。
-```
-
-本设计降低的是额外 metadata 复杂度：
-
-```text
-managed token 不再 logical token -> original block table -> state。
-tail token 不进入 managed index。
-NPU 不扫 free list 或 victim。
-SFA 不理解多套 source type。
-```
-
-### 13.4 当前 `hbm_lookup_update` 350 us 问题
-
-50 req、query length 2K 下单算子 350 us，说明 metadata path 已经很重。新的查询路径应按以下原则实现：
-
-```text
-1. domain check 使用 managed_prefix_len，避免 bitmap 随机查。
-2. managed uid 尽量用 base + token_id，避免二次 gather。
-3. managed hit path 一次读出 state + hbm block + offset。
-4. tail path 只做原始 block table 地址计算。
-5. ASU miss path 与 hit path 分离。
-6. eviction 和 tail migration 完全 CPU-only。
-```
-
-## 14. 与 vLLM 集成点
-
-### 14.1 Python/调度层
-
-新增：
-
-```text
-ASUFullKVCacheManager
-  managed_prefix_len 管理
-  managed token uid 分配
-  managed_token_state 管理
-  ASU full-KV record address 管理
-  managed HBM slot pool
-  CPU eviction
-  tail -> managed migration
-```
-
-`attn_metadata` 扩展：
-
-```text
-indexer_block_table              # 继续给 indexer，也供 tail path 地址计算
-managed_prefix_len               # domain check
-managed_token_state pointers
-free_managed_slot_buffer pointers
-sfa_block_tables[layer]          # 给 SFA
-sfa_sparse_indices[layer]        # 给 SFA
-sfa_access_seq_lens[layer]       # 若 SFA 需要 key length 检查
-touch_ring pointers
-```
-
-Indexer 使用：
-
-```python
-block_table=attn_metadata.block_tables
-```
-
-SFA 使用：
-
-```python
-sparse_indices=attn_metadata.sfa_sparse_indices[layer]
-block_table=attn_metadata.sfa_block_tables[layer]
-actual_seq_lengths_key=attn_metadata.sfa_access_seq_lens[layer]
-```
-
-### 14.2 NPU custom op
-
-需要新增 SFA 前置 op：
-
-```text
-asu_lookup_load_and_remap_for_sfa(
-    indexer_topk_indices,
-    managed_prefix_len,
-    managed_token_base_or_uid_table,
-    managed_token_state,
-    indexer_block_table_or_slot_mapping,
-    free_managed_slot_buffer,
-    kv_cache_0,
-    kv_cache_1,
-    sfa_block_table,
-    sfa_sparse_indices,
-    sfa_access_block_map,
-    sfa_access_seq_lens,
-    load_job_table,
-    touch_ring,
-)
-```
-
-职责：
-
-```text
-1. 判断 topK token domain。
-2. managed token: 查 managed_token_state，必要时 ASU load。
-3. ASU load 必须把 `kv_cache_0` 与 `kv_cache_1` 写到同一 `(block, offset)`。
-4. tail token: 通过 original block table / slot_mapping 得到 HBM loc。
-5. resolved_hbm_loc -> sfa_access_id。
-6. 生成 sfa_sparse_indices 和 sfa_block_table。
-7. 写 touch_ring。
-```
-
-不负责：
-
-```text
-victim 选择
-LRU 更新
-tail -> managed migration
-free slot victim refill
-indexer key cache 管理
-SFA 算子内部修改
-```
-
-### 14.3 CPU manager
-
-CPU manager 在 step 间执行：
-
-```text
-consume_touch_ring()
-update_managed_hotness_or_lru()
-evict_clean_managed_tokens()
-advance_tail_to_managed_boundary()
-refill_free_managed_slot_buffer()
-publish_metadata_snapshot()
-```
-
-## 15. 内存预算模型
+## 11. 内存预算
 
 HBM 常驻内容：
 
@@ -1309,16 +604,17 @@ HBM 常驻内容：
   metadata
 
 可控:
-  managed historical full-KV HBM token slots
-  decode tail original full-KV blocks
+  managed full-KV HBM token slots
+  decode tail original full-KV slots
+  resolved_kv_slots / load metadata
 ```
 
-Full KV HBM 预算：
+Full KV HBM：
 
 ```text
 full_kv_hbm =
     managed_slot_count * per_token_full_kv_bytes
-  + tail_original_block_count * block_size * per_token_full_kv_bytes
+  + tail_resident_token_count * per_token_full_kv_bytes
 ```
 
 其中：
@@ -1329,53 +625,173 @@ per_token_full_kv_bytes =
   + bytes(kv_cache[1] token fragment)
 ```
 
-`kv_cache[2]` 是 indexer key cache，按 indexer 预算单独计算，不计入 managed full-KV slot pool。
+如果启用 PA-compatible staging 过渡方案，还必须额外计算 staging scratch HBM。
 
-降低 HBM 的核心是：
+## 12. 过渡方案：PA-compatible staging
+
+若短期完全不改 SFA，可在 SFA 前构造临时 PA staging：
 
 ```text
-控制 tail window。
-及时把 clean tail token 迁入 managed domain。
-让 managed domain 只保留高价值 hot token 的 HBM slot。
+1. Resolver 解析 topK token。
+2. 将 topK token 的 kv_cache[0/1] pair copy 到 temporary PA staging blocks。
+3. sparse_indices 仍保持 original token ids。
+4. temporary block_table 指向 staging blocks。
+5. actual_seq_lengths_kv 仍保持原始 seq length 语义。
+6. 调用未改 SFA。
 ```
 
-## 16. 风险与待验证项
+该方案只适合作为 correctness / ASU offload / cache policy 验证路径，不是最终目标：
+
+```text
+问题:
+  额外 KV 搬运成本高。
+  block table 是 block 粒度，会浪费 scratch HBM。
+  无法自然表达 token 粒度任意重排。
+```
+
+## 13. 与 vLLM 集成点
+
+### 13.1 Python / 调度层
+
+新增：
+
+```text
+ASUFullKVCacheManager
+  managed_prefix_len 管理
+  managed token uid 分配
+  managed_token_state 管理
+  ASU full-KV record addr 管理
+  HBM token pair slot pool
+  CPU eviction
+  tail -> managed migration
+```
+
+`attn_metadata` 扩展：
+
+```text
+managed_prefix_len
+managed_token_state pointers
+free_slot_buffer pointers
+resolved_kv_slots
+load_job_table pointers
+touch_ring pointers
+```
+
+Indexer 继续使用：
+
+```text
+block_table = original vLLM block table
+```
+
+SFA 使用：
+
+```text
+sparse_indices = original_topk_indices
+resolved_kv_slots = Token KV Resolver output
+actual_seq_lengths_kv = original seq length metadata
+```
+
+### 13.2 NPU custom op
+
+新增：
+
+```text
+asu_resolve_kv_slots_for_sfa(
+    original_topk_indices,
+    managed_prefix_len,
+    managed_token_base_or_uid_table,
+    managed_token_state,
+    original_block_table_or_slot_mapping,
+    free_slot_buffer,
+    kv_cache_0,
+    kv_cache_1,
+    resolved_kv_slots,
+    load_job_table,
+    touch_ring,
+)
+```
+
+职责：
+
+```text
+1. 判断 topK token domain。
+2. tail token: 得到 original HBM slot。
+3. managed token: 查 state。
+4. HBM hit: 输出 resident slot。
+5. HBM miss: 通过 ASU load kv_cache[0/1] pair 到 free slot。
+6. 输出 resolved_kv_slots。
+7. 写 touch/miss/load stats。
+```
+
+不负责：
+
+```text
+victim 选择
+LRU 更新
+tail -> managed migration
+free slot victim refill
+indexer key cache 管理
+SFA 数学计算
+```
+
+### 13.3 SFA kernel
+
+修改：
+
+```text
+MergeKv / gather:
+  用 resolved_kv_slots 生成 kv_cache[0/1] GM 地址。
+```
+
+保持：
+
+```text
+sparse_indices original token id 语义
+sparse_mode=3 边界判断
+actual_seq_lengths 语义
+matmul / softmax / output
+```
+
+## 14. 风险与待验证项
 
 | 风险 | 说明 | 验证方式 |
 | --- | --- | --- |
-| SFA sparse index 是否只用于寻址 | 如果 SFA 把 sparse index 当原始绝对位置做 mask，remap 会影响语义 | NPU 对拍，检查 SFA kernel 语义 |
-| `sfa_sparse_indices` 顺序要求 | SFA 可能要求 sparse indices 有序或 block 分组 | 构造乱序/排序对拍 |
-| access seq length | remap 后 access id 与原始 seq len 不同 | 验证 SFA 是否检查 key length |
-| domain 边界 | `managed_prefix_len` 必须与 tail migration 一致 | 单测 + trace replay |
-| tail dirty 释放 | ASU write 未完成前释放 tail HBM 会丢数据 | dirty bitmap + epoch 对拍 |
-| stale ASU IO | token uid 或 req 复用后旧 IO 写回 | epoch 校验 |
-| hit rate 不达 95% | DSA topK 分布可能更散 | trace replay 调参 |
-| NPU lookup 时延 | 50 req、topK 2K 下 lookup/remap 仍重 | profiler 分解 domain/lookup/load/remap |
-| key_rope 同 slot 约束 | 若 `kv_cache[0]` 与 `kv_cache[1]` 分别搬运，SFA 会按同一 sparse id 读错 | pair load/evict 单测 + SFA 对拍 |
+| SFA gather 扩展正确性 | `sparse_indices` 语义保留，KV 地址改为 resolved slot | SFA 对拍 |
+| `resolved_kv_slots` shape | topK 实际 shape 包含 query token 和 kv head 维度 | shape 单测 + trace |
+| ASU miss latency | miss 会阻塞或重放 attention | profiler + miss budget |
+| free slot 不足 | NPU 不做 victim 选择 | watermark / admission test |
+| tail dirty 释放 | ASU write 未完成前释放会丢 KV | dirty bitmap + epoch |
+| stale IO | req/token 复用后旧 IO 写回 | epoch 校验 |
+| pair slot 约束 | kv_cache[0] 与 kv_cache[1] 必须同 slot | pair load/evict 单测 |
+| hit rate 不达标 | topK 分布可能更散 | trace replay |
 
-## 17. 当前结论
+## 15. 当前路线
 
-本版设计采用：
-
-```text
-1. kv_cache[2] 和原始 block table 保持现状，只服务 indexer 和 tail token 原生路径。
-2. DSA full KV record 由 kv_cache[0] 和 kv_cache[1] 组成；kv_cache[2] 不是 full KV payload。
-3. kv_cache[0] 与 kv_cache[1] 必须按同一个 token slot 管理，共享同一个 `(block, offset)`。
-4. 我们的 managed token index 只覆盖 historical managed domain，不覆盖新生成 tail token。
-5. topK token 先做 domain 判断。
-6. managed token 查 managed_token_state，可 ASU miss load 到 managed HBM pair slot。
-7. tail token 走原 vLLM block table / slot_mapping，直接得到原始 HBM block + offset。
-8. 两条路径统一输出 resolved_hbm_loc。
-9. SFA 不改；SFA 前把 resolved_hbm_loc 转换成 sfa_sparse_indices + sfa_block_table。
-10. managed eviction、tail migration、free slot refill 全部由 CPU step 间完成。
-```
-
-关键变化：
+主线：
 
 ```text
-删除“所有 token 都进入 token_state”的假设。
-明确新生成 token 不进入 managed token index。
-保留 tail token 的原 vLLM block table 查询路径。
-managed 索引只控制已经脱离原始 block layout 的 historical token。
-新增 key_rope 同 slot 约束：不为 kv_cache[1] 设计独立映射，除非未来修改 SFA。
+original topK token ids
+  -> Token KV Resolver
+  -> resolved_kv_slots
+  -> SFA Gather Extension
+  -> SFA math unchanged
 ```
+
+保留：
+
+```text
+kv_cache[2] + original block table -> indexer
+decode tail original write path
+managed historical token state
+CPU eviction and migration
+```
+
+不再作为主线：
+
+```text
+resolved_hbm_loc -> remapped sparse id
+access namespace seq length
+仅靠 remap block table 表达 token 粒度任意重排
+```
+
+这条路线才能同时满足 token 粒度动态加载、降低 HBM 常驻 KV、提高 req 并发，以及不破坏 SFA 算法正确性。

@@ -1,0 +1,1223 @@
+diff --git csrc/sparse_flash_attention/op_host/sparse_flash_attention_def.cpp csrc/sparse_flash_attention/op_host/sparse_flash_attention_def.cpp
+index dbf6879e..585118a9 100644
+--- csrc/sparse_flash_attention/op_host/sparse_flash_attention_def.cpp
++++ csrc/sparse_flash_attention/op_host/sparse_flash_attention_def.cpp
+@@ -87,4 +87,76 @@ public:
+     }
+ };
+ OP_ADD(SparseFlashAttention);
++
++class SparseFlashAttentionAsu : public OpDef {
++public:
++    explicit SparseFlashAttentionAsu(const char *name) : OpDef(name)
++    {
++        this->Input("query")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_FLOAT16, ge::DT_BF16})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
++            .AutoContiguous();
++        this->Input("key")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_FLOAT16, ge::DT_BF16})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
++            .AutoContiguous();
++        this->Input("value")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_FLOAT16, ge::DT_BF16})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
++            .AutoContiguous();
++        this->Input("sparse_indices")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_INT32, ge::DT_INT32})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
++            .AutoContiguous();
++        this->Input("resolved_kv_slots")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_INT32, ge::DT_INT32})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
++            .AutoContiguous();
++        this->Input("actual_seq_lengths_query")
++            .ParamType(OPTIONAL)
++            .DataType({ge::DT_INT32, ge::DT_INT32})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
++            .AutoContiguous();
++        this->Input("actual_seq_lengths_kv")
++            .ParamType(OPTIONAL)
++            .DataType({ge::DT_INT32, ge::DT_INT32})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
++            .AutoContiguous();
++        this->Input("query_rope")
++            .ParamType(OPTIONAL)
++            .DataType({ge::DT_FLOAT16, ge::DT_BF16})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
++            .AutoContiguous();
++        this->Input("managed_key_rope")
++            .ParamType(OPTIONAL)
++            .DataType({ge::DT_FLOAT16, ge::DT_BF16})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
++            .AutoContiguous();
++        this->Output("attention_out")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_FLOAT16, ge::DT_BF16})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND});
++        this->Attr("scale_value").AttrType(REQUIRED).Float(1.0);
++        this->Attr("sparse_block_size").AttrType(REQUIRED).Int(1);
++        this->Attr("layout_query").AttrType(OPTIONAL).String("TND");
++        this->Attr("layout_kv").AttrType(OPTIONAL).String("TND");
++        this->Attr("sparse_mode").AttrType(OPTIONAL).Int(3);
++        OpAICoreConfig aicore_config;
++        aicore_config.DynamicCompileStaticFlag(true)
++            .DynamicFormatFlag(true)
++            .DynamicRankSupportFlag(true)
++            .DynamicShapeSupportFlag(true)
++            .NeedCheckSupportFlag(false)
++            .PrecisionReduceFlag(true)
++            .ExtendCfgInfo("aclnnSupport.value", "support_aclnn");
++        this->AICore().AddConfig("ascend910b", aicore_config);
++        this->AICore().AddConfig("ascend910_93", aicore_config);
++    }
++};
++OP_ADD(SparseFlashAttentionAsu);
+ } // namespace ops
+diff --git csrc/sparse_flash_attention/op_host/sparse_flash_attention_proto.cpp csrc/sparse_flash_attention/op_host/sparse_flash_attention_proto.cpp
+index 07d2091b..20a0cd6b 100644
+--- csrc/sparse_flash_attention/op_host/sparse_flash_attention_proto.cpp
++++ csrc/sparse_flash_attention/op_host/sparse_flash_attention_proto.cpp
+@@ -44,5 +44,6 @@ ge::graphStatus InferDataTypeSparseFlashAttention(gert::InferDataTypeContext *co
+ }
+ 
+ IMPL_OP(SparseFlashAttention).InferShape(InferShapeSparseFlashAttention).InferDataType(InferDataTypeSparseFlashAttention);
++IMPL_OP(SparseFlashAttentionAsu).InferShape(InferShapeSparseFlashAttention).InferDataType(InferDataTypeSparseFlashAttention);
+ } // namespace ops
+   
+diff --git csrc/sparse_flash_attention/op_host/sparse_flash_attention_tiling.cpp csrc/sparse_flash_attention/op_host/sparse_flash_attention_tiling.cpp
+index 65040919..c918bc8c 100644
+--- csrc/sparse_flash_attention/op_host/sparse_flash_attention_tiling.cpp
++++ csrc/sparse_flash_attention/op_host/sparse_flash_attention_tiling.cpp
+@@ -40,6 +40,7 @@ static const std::string KEY_NAME = "key";
+ static const std::string VALUE_NAME = "value";
+ static const std::string BLOCK_TABLE_NAME = "block_table";
+ static const std::string SPARSE_INDICES_NAME = "sparse_indices";
++static const std::string RESOLVED_KV_SLOTS_NAME = "resolved_kv_slots";
+ static const std::string QUERY_ROPE_NAME = "query_rope";
+ static const std::string KEY_ROPE_NAME = "key_rope";
+ static const std::string ATTEN_OUT_NAME = "attention_out";
+@@ -51,7 +52,8 @@ const std::map<std::string, std::vector<ge::DataType>> DTYPE_SUPPORT_MAP = {
+     {QUERY_ROPE_NAME,             {ge::DT_FLOAT16, ge::DT_BF16}},
+     {KEY_ROPE_NAME,               {ge::DT_FLOAT16, ge::DT_BF16}},
+     {ATTEN_OUT_NAME,              {ge::DT_FLOAT16, ge::DT_BF16}},
+-    {SPARSE_INDICES_NAME,         {ge::DT_INT32}}
++    {SPARSE_INDICES_NAME,         {ge::DT_INT32}},
++    {RESOLVED_KV_SLOTS_NAME,      {ge::DT_INT32}}
+ };
+ 
+ const std::map<std::string, std::vector<SFALayout>> LAYOUT_SUPPORT_MAP = {
+@@ -476,6 +478,23 @@ ge::graphStatus TilingSparseFlashAttention(gert::TilingContext *context)
+     return tiling.DoOpTiling(&sfaInfo);
+ }
+ 
++ge::graphStatus TilingSparseFlashAttentionAsu(gert::TilingContext *context)
++{
++    SFATilingInfo sfaInfo;
++    SFAInfoParser sfaInfoParser(context, true);
++    if (sfaInfoParser.Parse(sfaInfo) != ge::GRAPH_SUCCESS) {
++        return ge::GRAPH_FAILED;
++    }
++
++    SFATilingCheck tilingChecker(sfaInfo);
++    if (tilingChecker.Process() != ge::GRAPH_SUCCESS) {
++        return ge::GRAPH_FAILED;
++    }
++
++    SFAMlaTiling tiling(context);
++    return tiling.DoOpTiling(&sfaInfo);
++}
++
+ ge::graphStatus TilingPrepareForSparseFlashAttention(gert::TilingParseContext *context)
+ {
+     (void)context;
+@@ -699,11 +718,23 @@ ge::graphStatus SFATilingCheck::CheckSingleParaSparseIndices() const
+     return ge::GRAPH_SUCCESS;
+ }
+ 
++ge::graphStatus SFATilingCheck::CheckSingleParaResolvedKvSlots() const
++{
++    if (!sfaInfo_.asuResolvedSlots) {
++        return ge::GRAPH_SUCCESS;
++    }
++    if (ge::GRAPH_SUCCESS != CheckDtypeSupport(opParamInfo_.resolvedKvSlots.desc, RESOLVED_KV_SLOTS_NAME)) {
++        return ge::GRAPH_FAILED;
++    }
++    return ge::GRAPH_SUCCESS;
++}
++
+ ge::graphStatus SFATilingCheck::CheckSinglePara() const
+ {
+     if (ge::GRAPH_SUCCESS != CheckSingleParaQuery() ||
+         ge::GRAPH_SUCCESS != CheckSingleParaKey() ||
+-        ge::GRAPH_SUCCESS != CheckSingleParaSparseIndices() || 
++        ge::GRAPH_SUCCESS != CheckSingleParaSparseIndices() ||
++        ge::GRAPH_SUCCESS != CheckSingleParaResolvedKvSlots() ||
+         ge::GRAPH_SUCCESS != CheckSingleParaNumHeads() ||
+         ge::GRAPH_SUCCESS != CheckSingleParaKvHeadNums() ||
+         ge::GRAPH_SUCCESS != CheckSingleParaSparseMode() ||
+@@ -810,8 +841,10 @@ ge::graphStatus SFATilingCheck::CheckParaExistenceMlaNoquant() const
+     }
+     std::map<std::string, const void *> mlaNoquantParamExistMap = {
+         {"actualSeqLengths", opParamInfo_.actualSeqLengths.tensor},
+-        {"blockTable", opParamInfo_.blockTable.tensor},
+     };
++    if (!sfaInfo_.asuResolvedSlots) {
++        mlaNoquantParamExistMap["blockTable"] = opParamInfo_.blockTable.tensor;
++    }
+     std::map<std::string, const void *> mlaNoquantParamNotExistMap = {};
+     if (CheckExistenceByMap(mlaNoquantParamExistMap, mlaNoquantParamNotExistMap) != ge::GRAPH_SUCCESS) {
+         return ge::GRAPH_FAILED;
+@@ -858,12 +891,18 @@ void SFATilingCheck::SetSFAShapeCompare()
+     keyShapeCmp_ = opParamInfo_.key.shape->GetStorageShape();
+     valueShapeCmp_ = opParamInfo_.value.shape->GetStorageShape();
+     attenOutShapeCmp_ = opParamInfo_.attenOut.shape->GetStorageShape();
++    if (sfaInfo_.asuResolvedSlots) {
++        resolvedSlotsShapeCmp_ = opParamInfo_.resolvedKvSlots.shape->GetStorageShape();
++    }
+     queryRopeShapeCmp_ = opParamInfo_.queryRope.tensor->GetStorageShape();
+     keyRopeShapeCmp_ = opParamInfo_.keyRope.tensor->GetStorageShape();
+ }
+ 
+ ge::graphStatus SFATilingCheck::CheckBlockTable() const
+ {
++    if (sfaInfo_.asuResolvedSlots) {
++        return ge::GRAPH_SUCCESS;
++    }
+     if (kvStorageMode_ != KvStorageMode::PAGE_ATTENTION) {
+         OPS_ERR_IF(opParamInfo_.blockTable.tensor != nullptr,
+             OPS_LOG_E(opName_, "when the layout_kv is %s, %s should be null",
+@@ -915,6 +954,20 @@ ge::graphStatus SFATilingCheck::CheckTopkShape()
+     return CompareShape(shapeParams, topkShapeCmp_, topkLayout_, SPARSE_INDICES_NAME);
+ }
+ 
++ge::graphStatus SFATilingCheck::CheckResolvedKvSlotsShape()
++{
++    if (!sfaInfo_.asuResolvedSlots) {
++        return ge::GRAPH_SUCCESS;
++    }
++    SFATilingShapeCompareParam shapeParams;
++    shapeParams.B = bSize_;
++    shapeParams.N = n2Size_;
++    shapeParams.S = s1Size_;
++    shapeParams.D = sparseBlockCount_;
++    shapeParams.T = qTSize_;
++    return CompareShape(shapeParams, resolvedSlotsShapeCmp_, topkLayout_, RESOLVED_KV_SLOTS_NAME);
++}
++
+ ge::graphStatus SFATilingCheck::CheckAttenOutShape()
+ {
+     SFATilingShapeCompareParam shapeParams;
+@@ -951,7 +1004,8 @@ ge::graphStatus SFATilingCheck::CheckQRope()
+ 
+ ge::graphStatus SFATilingCheck::CheckTopK()
+ {
+-    if (ge::GRAPH_SUCCESS != CheckTopkShape()) {
++    if (ge::GRAPH_SUCCESS != CheckTopkShape() ||
++        ge::GRAPH_SUCCESS != CheckResolvedKvSlotsShape()) {
+         return ge::GRAPH_FAILED;
+     }
+     return ge::GRAPH_SUCCESS;
+@@ -1361,6 +1415,14 @@ ge::graphStatus SFAInfoParser::CheckRequiredInOutExistence() const
+                return ge::GRAPH_FAILED);
+     OPS_ERR_IF(opParamInfo_.sparseIndices.desc == nullptr, OPS_LOG_E(opName_, "Desc of tensor sparseIndices is nullptr"),
+                return ge::GRAPH_FAILED);
++    if (asuResolvedSlots_) {
++        OPS_ERR_IF(opParamInfo_.resolvedKvSlots.shape == nullptr,
++                   OPS_LOG_E(opName_, "Shape of tensor resolvedKvSlots is nullptr"),
++                   return ge::GRAPH_FAILED);
++        OPS_ERR_IF(opParamInfo_.resolvedKvSlots.desc == nullptr,
++                   OPS_LOG_E(opName_, "Desc of tensor resolvedKvSlots is nullptr"),
++                   return ge::GRAPH_FAILED);
++    }
+     OPS_ERR_IF(opParamInfo_.attenOut.shape == nullptr, OPS_LOG_E(opName_, "Shape of tensor output is nullptr"),
+                return ge::GRAPH_FAILED);
+     OPS_ERR_IF(opParamInfo_.attenOut.desc == nullptr, OPS_LOG_E(opName_, "Desc of tensor output is nullptr"),
+@@ -1456,15 +1518,26 @@ ge::graphStatus SFAInfoParser::GetNpuInfo()
+ 
+ void SFAInfoParser::GetOptionalInputParaInfo()
+ {
+-    opParamInfo_.blockTable.tensor = context_->GetOptionalInputTensor(BLOCK_TABLE_INPUT_INDEX);
+-    opParamInfo_.actualSeqLengthsQ.tensor = context_->GetOptionalInputTensor(ACT_SEQ_LEN_Q_INPUT_INDEX);
+-    opParamInfo_.actualSeqLengthsQ.desc = context_->GetOptionalInputDesc(ACT_SEQ_LEN_Q_INPUT_INDEX);
+-    opParamInfo_.actualSeqLengths.tensor = context_->GetOptionalInputTensor(ACT_SEQ_LEN_KV_INPUT_INDEX);
+-    opParamInfo_.actualSeqLengths.desc = context_->GetOptionalInputDesc(ACT_SEQ_LEN_KV_INPUT_INDEX);
+-    opParamInfo_.queryRope.tensor = context_->GetOptionalInputTensor(QUERY_ROPE_INPUT_INDEX);
+-    opParamInfo_.queryRope.desc = context_->GetOptionalInputDesc(QUERY_ROPE_INPUT_INDEX);
+-    opParamInfo_.keyRope.tensor = context_->GetOptionalInputTensor(KEY_ROPE_INPUT_INDEX);
+-    opParamInfo_.keyRope.desc = context_->GetOptionalInputDesc(KEY_ROPE_INPUT_INDEX);
++    if (asuResolvedSlots_) {
++        opParamInfo_.actualSeqLengthsQ.tensor = context_->GetOptionalInputTensor(ASU_ACT_SEQ_LEN_Q_INPUT_INDEX);
++        opParamInfo_.actualSeqLengthsQ.desc = context_->GetOptionalInputDesc(ASU_ACT_SEQ_LEN_Q_INPUT_INDEX);
++        opParamInfo_.actualSeqLengths.tensor = context_->GetOptionalInputTensor(ASU_ACT_SEQ_LEN_KV_INPUT_INDEX);
++        opParamInfo_.actualSeqLengths.desc = context_->GetOptionalInputDesc(ASU_ACT_SEQ_LEN_KV_INPUT_INDEX);
++        opParamInfo_.queryRope.tensor = context_->GetOptionalInputTensor(ASU_QUERY_ROPE_INPUT_INDEX);
++        opParamInfo_.queryRope.desc = context_->GetOptionalInputDesc(ASU_QUERY_ROPE_INPUT_INDEX);
++        opParamInfo_.keyRope.tensor = context_->GetOptionalInputTensor(MANAGED_KEY_ROPE_INPUT_INDEX);
++        opParamInfo_.keyRope.desc = context_->GetOptionalInputDesc(MANAGED_KEY_ROPE_INPUT_INDEX);
++    } else {
++        opParamInfo_.blockTable.tensor = context_->GetOptionalInputTensor(BLOCK_TABLE_INPUT_INDEX);
++        opParamInfo_.actualSeqLengthsQ.tensor = context_->GetOptionalInputTensor(ACT_SEQ_LEN_Q_INPUT_INDEX);
++        opParamInfo_.actualSeqLengthsQ.desc = context_->GetOptionalInputDesc(ACT_SEQ_LEN_Q_INPUT_INDEX);
++        opParamInfo_.actualSeqLengths.tensor = context_->GetOptionalInputTensor(ACT_SEQ_LEN_KV_INPUT_INDEX);
++        opParamInfo_.actualSeqLengths.desc = context_->GetOptionalInputDesc(ACT_SEQ_LEN_KV_INPUT_INDEX);
++        opParamInfo_.queryRope.tensor = context_->GetOptionalInputTensor(QUERY_ROPE_INPUT_INDEX);
++        opParamInfo_.queryRope.desc = context_->GetOptionalInputDesc(QUERY_ROPE_INPUT_INDEX);
++        opParamInfo_.keyRope.tensor = context_->GetOptionalInputTensor(KEY_ROPE_INPUT_INDEX);
++        opParamInfo_.keyRope.desc = context_->GetOptionalInputDesc(KEY_ROPE_INPUT_INDEX);
++    }
+ }
+ 
+ void SFAInfoParser::GetInputParaInfo()
+@@ -1477,6 +1550,10 @@ void SFAInfoParser::GetInputParaInfo()
+     opParamInfo_.value.shape = context_->GetInputShape(VALUE_INPUT_INDEX);
+     opParamInfo_.sparseIndices.desc = context_->GetInputDesc(SPARSE_INDICES_INPUT_INDEX);
+     opParamInfo_.sparseIndices.shape = context_->GetInputShape(SPARSE_INDICES_INPUT_INDEX);
++    if (asuResolvedSlots_) {
++        opParamInfo_.resolvedKvSlots.desc = context_->GetInputDesc(RESOLVED_KV_SLOTS_INPUT_INDEX);
++        opParamInfo_.resolvedKvSlots.shape = context_->GetInputShape(RESOLVED_KV_SLOTS_INPUT_INDEX);
++    }
+     GetOptionalInputParaInfo();
+ }
+ 
+@@ -1717,6 +1794,9 @@ void SFAInfoParser::SetSFAShape()
+     keyShape_ = opParamInfo_.key.shape->GetStorageShape();
+     valueShape_ = opParamInfo_.value.shape->GetStorageShape();
+     sparseIndicesShape_ = opParamInfo_.sparseIndices.shape->GetStorageShape();
++    if (asuResolvedSlots_) {
++        resolvedSlotsShape_ = opParamInfo_.resolvedKvSlots.shape->GetStorageShape();
++    }
+     queryRopeShape_ = opParamInfo_.queryRope.tensor->GetStorageShape();
+ }
+ 
+@@ -1746,6 +1826,7 @@ void SFAInfoParser::GenerateInfo(SFATilingInfo &sfaInfo)
+     sfaInfo.platformInfo = platformInfo_;
+     sfaInfo.opParamInfo = opParamInfo_;
+     sfaInfo.socVersion = socVersion_;
++    sfaInfo.asuResolvedSlots = asuResolvedSlots_;
+ 
+     sfaInfo.bSize = bSize_;
+     sfaInfo.n1Size = n1Size_;
+@@ -1842,4 +1923,7 @@ ge::graphStatus SFAInfoParser::Parse(SFATilingInfo &sfaInfo)
+ IMPL_OP_OPTILING(SparseFlashAttention)
+     .Tiling(TilingSparseFlashAttention)
+     .TilingParse<SparseFlashAttentionCompileInfo>(TilingPrepareForSparseFlashAttention);
++IMPL_OP_OPTILING(SparseFlashAttentionAsu)
++    .Tiling(TilingSparseFlashAttentionAsu)
++    .TilingParse<SparseFlashAttentionCompileInfo>(TilingPrepareForSparseFlashAttention);
+ } // namespace optiling
+diff --git csrc/sparse_flash_attention/op_host/sparse_flash_attention_tiling.h csrc/sparse_flash_attention/op_host/sparse_flash_attention_tiling.h
+index 34e7b9c0..27986b2c 100644
+--- csrc/sparse_flash_attention/op_host/sparse_flash_attention_tiling.h
++++ csrc/sparse_flash_attention/op_host/sparse_flash_attention_tiling.h
+@@ -33,6 +33,11 @@ constexpr uint32_t ACT_SEQ_LEN_Q_INPUT_INDEX = 5;
+ constexpr uint32_t ACT_SEQ_LEN_KV_INPUT_INDEX = 6;
+ constexpr uint32_t QUERY_ROPE_INPUT_INDEX = 7;
+ constexpr uint32_t KEY_ROPE_INPUT_INDEX = 8;
++constexpr uint32_t RESOLVED_KV_SLOTS_INPUT_INDEX = 4;
++constexpr uint32_t ASU_ACT_SEQ_LEN_Q_INPUT_INDEX = 5;
++constexpr uint32_t ASU_ACT_SEQ_LEN_KV_INPUT_INDEX = 6;
++constexpr uint32_t ASU_QUERY_ROPE_INPUT_INDEX = 7;
++constexpr uint32_t MANAGED_KEY_ROPE_INPUT_INDEX = 8;
+ // Outputs Index
+ constexpr uint32_t OUTPUT_INDEX = 0;
+ // Attributes Index
+@@ -107,6 +112,7 @@ struct SFAParaInfo {
+     SFARequiredParaInfo key = {nullptr, nullptr};
+     SFARequiredParaInfo value = {nullptr, nullptr};
+     SFARequiredParaInfo sparseIndices = {nullptr, nullptr};
++    SFARequiredParaInfo resolvedKvSlots = {nullptr, nullptr};
+     SFAOptionalParaInfo blockTable = {nullptr, nullptr};
+     SFAOptionalParaInfo actualSeqLengthsQ = {nullptr, nullptr};
+     SFAOptionalParaInfo actualSeqLengths = {nullptr, nullptr};
+@@ -175,6 +181,7 @@ TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionSingleCoreTensorSizeMla, single
+ TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionInnerSplitParams, innerSplitParams);
+ END_TILING_DATA_DEF
+ REGISTER_TILING_DATA_CLASS(SparseFlashAttention, SparseFlashAttentionTilingDataMla)
++REGISTER_TILING_DATA_CLASS(SparseFlashAttentionAsu, SparseFlashAttentionTilingDataMla)
+ 
+ template <typename T> inline T Align(T num, T rnd)
+ {
+@@ -227,6 +234,7 @@ struct SFATilingInfo {
+     int64_t sparseBlockCount = 0;
+ 
+     bool pageAttentionFlag = false;
++    bool asuResolvedSlots = false;
+     int64_t blockSize = 0;
+     uint32_t blockTypeSize = 0;
+     uint32_t maxBlockNumPerBatch = 0;
+@@ -376,6 +384,7 @@ private:
+     ge::graphStatus CheckSingleParaSparseMode() const;
+     ge::graphStatus CheckSingleParaSparseBlockSize() const;
+     ge::graphStatus CheckSingleParaSparseIndices() const;
++    ge::graphStatus CheckSingleParaResolvedKvSlots() const;
+     ge::graphStatus CheckSinglePara() const;
+     ge::graphStatus CheckMultiParaConsistency() const;
+     ge::graphStatus CheckRopeExistence();
+@@ -403,6 +412,7 @@ private:
+     ge::graphStatus CheckVAndKRope();
+     ge::graphStatus CheckTopK();
+     ge::graphStatus CheckTopkShape();
++    ge::graphStatus CheckResolvedKvSlotsShape();
+     ge::graphStatus CheckBlockTable() const;
+     ge::graphStatus CheckDTypeConsistency(const ge::DataType &actualDtype,
+     const ge::DataType &expectDtype, const std::string &name) const;
+@@ -469,6 +479,7 @@ private:
+     gert::Shape keyShapeCmp_{};
+     gert::Shape valueShapeCmp_{};
+     gert::Shape topkShapeCmp_{};
++    gert::Shape resolvedSlotsShapeCmp_{};
+     gert::Shape queryRopeShapeCmp_{};
+     gert::Shape keyRopeShapeCmp_{};
+     gert::Shape attenOutShapeCmp_{};
+@@ -476,7 +487,9 @@ private:
+ 
+ class SFAInfoParser {
+ public:
+-    explicit SFAInfoParser(const gert::TilingContext *context) : context_(context) {}
++    explicit SFAInfoParser(const gert::TilingContext *context,
++                           bool asuResolvedSlots = false)
++        : context_(context), asuResolvedSlots_(asuResolvedSlots) {}
+     ~SFAInfoParser() = default;
+ 
+     ge::graphStatus CheckRequiredInOutExistence() const;
+@@ -527,6 +540,7 @@ public:
+     uint32_t GetAxisNum(const gert::Shape &shape, const SFAAxis &axis,const SFALayout &layout) const;
+ 
+     const gert::TilingContext *context_ = nullptr;
++    bool asuResolvedSlots_ = false;
+ 
+     const char *opName_;
+     fe::PlatFormInfos *platformInfo_;
+@@ -576,6 +590,7 @@ public:
+     gert::Shape keyShape_{};
+     gert::Shape valueShape_{};
+     gert::Shape sparseIndicesShape_{};
++    gert::Shape resolvedSlotsShape_{};
+     gert::Shape queryRopeShape_{};
+     gert::Shape keyRopeShape_{};
+ };
+diff --git csrc/sparse_flash_attention/op_kernel/sparse_flash_attention.cpp csrc/sparse_flash_attention/op_kernel/sparse_flash_attention.cpp
+index a71306b5..383d999e 100644
+--- csrc/sparse_flash_attention/op_kernel/sparse_flash_attention.cpp
++++ csrc/sparse_flash_attention/op_kernel/sparse_flash_attention.cpp
+@@ -19,12 +19,13 @@
+ 
+ using namespace AscendC;
+ 
+-#define SFA_OP_IMPL(templateClass, tilingdataClass, ...)                                          \
++#define SFA_OP_IMPL(templateClass, tilingdataClass, resolvedKvSlotsPtr, ...)                      \
+     do {                                                                                          \
+         templateClass<SFAType<__VA_ARGS__>> op;                                                   \
+         GET_TILING_DATA_WITH_STRUCT(tilingdataClass, tiling_data_in, tiling);                     \
+         const tilingdataClass *__restrict tiling_data = &tiling_data_in;                          \
+-        op.Init(query, key, value, sparseIndices, actualSeqLengthsQuery, actualSeqLengthsKV,      \
++        op.Init(query, key, value, sparseIndices, resolvedKvSlotsPtr, actualSeqLengthsQuery,      \
++            actualSeqLengthsKV,                                                                  \
+ 	    blocktable, queryRope, keyRope, attentionOut, user, tiling_data, tiling, &tPipe);         \
+         op.Process();                                                                             \
+     } while (0)
+@@ -44,10 +45,39 @@ sparse_flash_attention(__gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_
+ 
+     if constexpr (ORIG_DTYPE_QUERY == DT_FLOAT16 && ORIG_DTYPE_KEY == DT_FLOAT16 &&
+                   ORIG_DTYPE_ATTENTION_OUT == DT_FLOAT16) {
+-        SFA_OP_IMPL(SparseFlashAttentionMla, SparseFlashAttentionTilingDataMla, half, half, half,
+-            FLASH_DECODE, static_cast<SFA_LAYOUT>(LAYOUT_T), static_cast<SFA_LAYOUT>(KV_LAYOUT_T), TEMPLATE_MODE);
++        SFA_OP_IMPL(SparseFlashAttentionMla, SparseFlashAttentionTilingDataMla, nullptr, half, half, half,
++            FLASH_DECODE, static_cast<SFA_LAYOUT>(LAYOUT_T), static_cast<SFA_LAYOUT>(KV_LAYOUT_T),
++            TEMPLATE_MODE);
+     } else { // bf16
+-        SFA_OP_IMPL(SparseFlashAttentionMla, SparseFlashAttentionTilingDataMla, bfloat16_t, bfloat16_t, bfloat16_t,
+-            FLASH_DECODE, static_cast<SFA_LAYOUT>(LAYOUT_T), static_cast<SFA_LAYOUT>(KV_LAYOUT_T), TEMPLATE_MODE);
++        SFA_OP_IMPL(SparseFlashAttentionMla, SparseFlashAttentionTilingDataMla, nullptr, bfloat16_t, bfloat16_t,
++            bfloat16_t, FLASH_DECODE, static_cast<SFA_LAYOUT>(LAYOUT_T), static_cast<SFA_LAYOUT>(KV_LAYOUT_T),
++            TEMPLATE_MODE);
+     }
+-}
+\ No newline at end of file
++}
++
++template<int FLASH_DECODE, int LAYOUT_T, int KV_LAYOUT_T, int TEMPLATE_MODE>
++ __global__ __aicore__ void
++sparse_flash_attention_asu(__gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t *value,
++                           __gm__ uint8_t *sparseIndices, __gm__ uint8_t *resolvedKvSlots,
++                           __gm__ uint8_t *actualSeqLengthsQuery, __gm__ uint8_t *actualSeqLengthsKV,
++                           __gm__ uint8_t* queryRope, __gm__ uint8_t* managedKeyRope,
++                           __gm__ uint8_t *attentionOut, __gm__ uint8_t *workspace, __gm__ uint8_t *tiling)
++{
++    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
++
++    TPipe tPipe;
++    __gm__ uint8_t *user = GetUserWorkspace(workspace);
++    __gm__ uint8_t *blocktable = nullptr;
++    __gm__ uint8_t *keyRope = managedKeyRope;
++
++    if constexpr (ORIG_DTYPE_QUERY == DT_FLOAT16 && ORIG_DTYPE_KEY == DT_FLOAT16 &&
++                  ORIG_DTYPE_ATTENTION_OUT == DT_FLOAT16) {
++        SFA_OP_IMPL(SparseFlashAttentionMla, SparseFlashAttentionTilingDataMla, resolvedKvSlots, half, half, half,
++            FLASH_DECODE, static_cast<SFA_LAYOUT>(LAYOUT_T), static_cast<SFA_LAYOUT>(KV_LAYOUT_T), TEMPLATE_MODE,
++            true);
++    } else { // bf16
++        SFA_OP_IMPL(SparseFlashAttentionMla, SparseFlashAttentionTilingDataMla, resolvedKvSlots, bfloat16_t,
++            bfloat16_t, bfloat16_t, FLASH_DECODE, static_cast<SFA_LAYOUT>(LAYOUT_T),
++            static_cast<SFA_LAYOUT>(KV_LAYOUT_T), TEMPLATE_MODE, true);
++    }
++}
+diff --git csrc/sparse_flash_attention/op_kernel/sparse_flash_attention_common.h csrc/sparse_flash_attention/op_kernel/sparse_flash_attention_common.h
+index 58530c60..8d1f2133 100644
+--- csrc/sparse_flash_attention/op_kernel/sparse_flash_attention_common.h
++++ csrc/sparse_flash_attention/op_kernel/sparse_flash_attention_common.h
+@@ -30,19 +30,20 @@ enum class SFA_LAYOUT
+     PA_BSND = 2,
+ };
+ 
+-template <typename Q_T, typename KV_T, typename OUT_T, const bool FLASH_DECODE = false,
+-	  SFA_LAYOUT LAYOUT_T = SFA_LAYOUT::BSND, SFA_LAYOUT KV_LAYOUT_T = SFA_LAYOUT::BSND,
+-          const int TEMPLATE_MODE = C_TEMPLATE, typename... Args>
+-struct SFAType {
+-    using queryType = Q_T;
+-    using kvType = KV_T;
+-    using outputType = OUT_T;
+-    static constexpr bool flashDecode = FLASH_DECODE;
+-    static constexpr SFA_LAYOUT layout = LAYOUT_T;
+-    static constexpr SFA_LAYOUT kvLayout = KV_LAYOUT_T;
+-    static constexpr int templateMode = TEMPLATE_MODE;
+-    static constexpr bool pageAttention = (KV_LAYOUT_T == SFA_LAYOUT::PA_BSND);
+-};
++template <typename Q_T, typename KV_T, typename OUT_T, const bool FLASH_DECODE = false,
++	  SFA_LAYOUT LAYOUT_T = SFA_LAYOUT::BSND, SFA_LAYOUT KV_LAYOUT_T = SFA_LAYOUT::BSND,
++          const int TEMPLATE_MODE = C_TEMPLATE, const bool ASU_RESOLVED_SLOT = false, typename... Args>
++struct SFAType {
++    using queryType = Q_T;
++    using kvType = KV_T;
++    using outputType = OUT_T;
++    static constexpr bool flashDecode = FLASH_DECODE;
++    static constexpr SFA_LAYOUT layout = LAYOUT_T;
++    static constexpr SFA_LAYOUT kvLayout = KV_LAYOUT_T;
++    static constexpr int templateMode = TEMPLATE_MODE;
++    static constexpr bool asuResolvedSlot = ASU_RESOLVED_SLOT;
++    static constexpr bool pageAttention = (KV_LAYOUT_T == SFA_LAYOUT::PA_BSND);
++};
+ 
+ // ================================Util functions==================================
+ template <typename T> __aicore__ inline T SFAAlign(T num, T rnd)
+@@ -189,4 +190,4 @@ struct MSplitInfo {
+     uint32_t vecDealM = 0U;
+ };
+ 
+-#endif // SPARSE_FLASH_ATTENTION_COMMON_H
+\ No newline at end of file
++#endif // SPARSE_FLASH_ATTENTION_COMMON_H
+diff --git csrc/sparse_flash_attention/op_kernel/sparse_flash_attention_kernel_mla.h csrc/sparse_flash_attention/op_kernel/sparse_flash_attention_kernel_mla.h
+index 1aec5de6..7f5f5965 100644
+--- csrc/sparse_flash_attention/op_kernel/sparse_flash_attention_kernel_mla.h
++++ csrc/sparse_flash_attention/op_kernel/sparse_flash_attention_kernel_mla.h
+@@ -63,8 +63,9 @@ public:
+ 
+     __aicore__ inline SparseFlashAttentionMla(){};
+     __aicore__ inline void Init(__gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t *value,
+-                                __gm__ uint8_t *sparseIndices, __gm__ uint8_t *actualSeqLengthsQ,
+-                                __gm__ uint8_t *actualSeqLengths, __gm__ uint8_t *blockTable,
++                                __gm__ uint8_t *sparseIndices, __gm__ uint8_t *resolvedKvSlots,
++                                __gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengths,
++                                __gm__ uint8_t *blockTable,
+                                 __gm__ uint8_t *queryRope, __gm__ uint8_t *keyRope,
+                                 __gm__ uint8_t *attentionOut, __gm__ uint8_t *workspace,
+                                 const SparseFlashAttentionTilingDataMla *__restrict tiling,
+@@ -78,6 +79,7 @@ private:
+     static constexpr bool FLASH_DECODE = SFAT::flashDecode;
+     static constexpr SFA_LAYOUT LAYOUT_T = SFAT::layout;
+     static constexpr SFA_LAYOUT KV_LAYOUT_T = SFAT::kvLayout;
++    static constexpr bool ASU_RESOLVED_SLOT = SFAT::asuResolvedSlot;
+ 
+     static constexpr uint32_t PRELOAD_NUM = 2;
+     static constexpr uint32_t N_BUFFER_M_BASIC_SIZE = 256;
+@@ -141,6 +143,7 @@ private:
+     GlobalTensor<OUT_T> attentionOutGm;
+     GlobalTensor<int32_t> blockTableGm;
+     GlobalTensor<int32_t> topKGm;
++    GlobalTensor<int32_t> resolvedSlotsGm;
+ 
+     GlobalTensor<int32_t> actualSeqLengthsQGm;
+     GlobalTensor<int32_t> actualSeqLengthsKVGm;
+@@ -375,8 +378,9 @@ __aicore__ inline void SparseFlashAttentionMla<SFAT>::UpdateInner(uint32_t &s2En
+ template <typename SFAT>
+ __aicore__ inline void SparseFlashAttentionMla<SFAT>::Init(__gm__ uint8_t *query,
+                        __gm__ uint8_t *key, __gm__ uint8_t *value,
+-                       __gm__ uint8_t *sparseIndices, __gm__ uint8_t *actualSeqLengthsQ,
+-                       __gm__ uint8_t *actualSeqLengths, __gm__ uint8_t *blockTable,
++                       __gm__ uint8_t *sparseIndices, __gm__ uint8_t *resolvedKvSlots,
++                       __gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengths,
++                       __gm__ uint8_t *blockTable,
+                        __gm__ uint8_t *queryRope, __gm__ uint8_t *keyRope,
+                        __gm__ uint8_t *attentionOut, __gm__ uint8_t *workspace,
+                        const SparseFlashAttentionTilingDataMla *__restrict tiling,
+@@ -420,6 +424,9 @@ __aicore__ inline void SparseFlashAttentionMla<SFAT>::Init(__gm__ uint8_t *query
+         blockTableGm.SetGlobalBuffer((__gm__ int32_t *)blockTable);
+     }
+     topKGm.SetGlobalBuffer((__gm__ int32_t *)sparseIndices);
++    if constexpr (ASU_RESOLVED_SLOT) {
++        resolvedSlotsGm.SetGlobalBuffer((__gm__ int32_t *)resolvedKvSlots);
++    }
+ 
+     uint64_t offset = 0;
+     mm1ResGm.SetGlobalBuffer(
+@@ -458,7 +465,8 @@ __aicore__ inline void SparseFlashAttentionMla<SFAT>::Init(__gm__ uint8_t *query
+         vectorService.InitParams(constInfo, tilingData);
+         vectorService.InitMm2ResInt32GmGlobalTensor(mm2ResInt32Gm);
+         if constexpr (TEMPLATE_MODE == V_TEMPLATE) {
+-            vectorService.InitVec0GlobalTensor(kvValidSizeGm_, kvMergeGm_, kRopeGm, keyGm, blockTableGm);
++            vectorService.InitVec0GlobalTensor(kvValidSizeGm_, kvMergeGm_, kRopeGm, keyGm, blockTableGm,
++                                               resolvedSlotsGm);
+         }
+         vectorService.InitVec1GlobalTensor(mm1ResGm, vec1ResGm, actualSeqLengthsQGm,
+                                            actualSeqLengthsKVGm, lseMaxFdGm, lseSumFdGm, topKGm);
+@@ -470,7 +478,8 @@ __aicore__ inline void SparseFlashAttentionMla<SFAT>::Init(__gm__ uint8_t *query
+         matmulService.InitMm1GlobalTensor(queryGm, qRopeGm, keyGm, kRopeGm, mm1ResGm);
+         matmulService.InitMm2GlobalTensor(vec1ResGm, valueGm, mm2ResGm, attentionOutGm);
+         matmulService.InitPageAttentionInfo(kvMergeGm_, blockTableGm, topKGm,
+-                                            constInfo.kvCacheBlockSize, constInfo.maxBlockNumPerBatch);
++                                            resolvedSlotsGm, constInfo.kvCacheBlockSize,
++                                            constInfo.maxBlockNumPerBatch);
+     }
+     if (pipe != nullptr) {
+         InitBuffers();
+@@ -966,4 +975,4 @@ __aicore__ inline void SparseFlashAttentionMla<SFAT>::CalcSinnerTopKBegin(RunInf
+         DealActSeqLenIsZero(info.bIdx, info.gS1Idx / constInfo.gSize, tempLoopInfo.n2Idx);
+     }
+ }
+-#endif // SPARSE_FLASH_ATTENTION_KERNEL_MLA_H
+\ No newline at end of file
++#endif // SPARSE_FLASH_ATTENTION_KERNEL_MLA_H
+diff --git csrc/sparse_flash_attention/op_kernel/sparse_flash_attention_service_cube_mla.h csrc/sparse_flash_attention/op_kernel/sparse_flash_attention_service_cube_mla.h
+index 60bb606c..ec0d013c 100644
+--- csrc/sparse_flash_attention/op_kernel/sparse_flash_attention_service_cube_mla.h
++++ csrc/sparse_flash_attention/op_kernel/sparse_flash_attention_service_cube_mla.h
+@@ -117,7 +117,8 @@ public:
+                                                GlobalTensor<MM_OUT_T> mm2ResGm, GlobalTensor<OUT_T> attentionOutGm);
+     __aicore__ inline void InitPageAttentionInfo(const GlobalTensor<KV_T>& kvMergeGm,
+                                                  GlobalTensor<int32_t> blockTableGm, GlobalTensor<int32_t> topKGm,
+-                                                 uint32_t blockSize, uint32_t maxBlockNumPerBatch);
++                                                 GlobalTensor<int32_t> resolvedSlotsGm, uint32_t blockSize,
++                                                 uint32_t maxBlockNumPerBatch);
+     __aicore__ inline void InitBuffers(TPipe *pipe);
+     __aicore__ inline void UpdateKey(GlobalTensor<KV_T> keyGm);
+     __aicore__ inline void UpdateValue(GlobalTensor<KV_T> valueGm);
+@@ -126,7 +127,7 @@ public:
+     __aicore__ inline void FreeEventID();
+     __aicore__ inline void CalcTopKBlockInfo(const RunInfo &info, uint32_t &curTopKIdx,
+                                              uint64_t &curOffsetInSparseBlock, uint32_t curSeqIdx,
+-                                             uint32_t &copyRowCnt, int64_t &idInTopK);
++                                             uint32_t &copyRowCnt, int64_t &idInTopK, int64_t &slotInTopK);
+     __aicore__ inline void ComputeMm1(const RunInfo &info, const MSplitInfo mSplitInfo);
+     __aicore__ inline void ComputeMm2(const RunInfo &info, const MSplitInfo mSplitInfo);
+ 
+@@ -136,6 +137,7 @@ private:
+     static constexpr bool FLASH_DECODE = SFAT::flashDecode;
+     static constexpr SFA_LAYOUT LAYOUT_T = SFAT::layout;
+     static constexpr SFA_LAYOUT KV_LAYOUT_T = SFAT::kvLayout;
++    static constexpr bool ASU_RESOLVED_SLOT = SFAT::asuResolvedSlot;
+ 
+     static constexpr uint32_t M_SPLIT_SIZE = 128;
+     static constexpr uint32_t N_SPLIT_SIZE = 128;
+@@ -190,6 +192,7 @@ private:
+     // block_table
+     GlobalTensor<int32_t> blockTableGm;
+     GlobalTensor<int32_t> topKGm;
++    GlobalTensor<int32_t> resolvedSlotsGm;
+ 
+     TBuf<TPosition::A1> bufQPL1;
+     TBuf<TPosition::A1> bufKVL1;
+@@ -237,6 +240,7 @@ private:
+                                         uint32_t kSplitSize, uint32_t mSize, uint32_t kSize);
+     __aicore__ inline void LoadDataMm1B(LocalTensor<KV_T> &bL0Tensor, LocalTensor<KV_T> &bL1Tensor, uint32_t idx,
+                                         uint32_t kSplitSize, uint32_t kSize, uint32_t nSize);
++    __aicore__ inline int64_t GetResolvedSlot(const RunInfo &info, uint32_t topKIdx, uint64_t curOffsetInSparseBlock);
+ };
+ 
+ template <typename SFAT> __aicore__ inline void SFAMatmulService<SFAT>::InitParams(const ConstInfo &constInfo)
+@@ -273,10 +277,12 @@ SFAMatmulService<SFAT>::InitMm2GlobalTensor(GlobalTensor<KV_T> vec1ResGm, Global
+ template <typename SFAT>
+ __aicore__ inline void
+ SFAMatmulService<SFAT>::InitPageAttentionInfo(const GlobalTensor<KV_T>& kvMergeGm, GlobalTensor<int32_t> blockTableGm,
+-		                              GlobalTensor<int32_t> topKGm, uint32_t blockSize, uint32_t maxBlockNumPerBatch)
++                                              GlobalTensor<int32_t> topKGm, GlobalTensor<int32_t> resolvedSlotsGm,
++                                              uint32_t blockSize, uint32_t maxBlockNumPerBatch)
+ {
+     this->blockTableGm = blockTableGm;
+     this->topKGm = topKGm;
++    this->resolvedSlotsGm = resolvedSlotsGm;
+     this->kvCacheBlockSize = blockSize;
+     this->maxBlockNumPerBatch = maxBlockNumPerBatch;
+     this->kvMergeGm_ = kvMergeGm;
+@@ -506,9 +512,18 @@ __aicore__ inline void SFAMatmulService<SFAT>::CopyInMm2BToL1(
+              mm1Nd2NzParamsForB);
+ }
+ 
++template <typename SFAT>
++__aicore__ inline int64_t SFAMatmulService<SFAT>::GetResolvedSlot(
++    const RunInfo &info, uint32_t topKIdx, uint64_t curOffsetInSparseBlock)
++{
++    (void)curOffsetInSparseBlock;
++    return resolvedSlotsGm.GetValue(info.topKBaseOffset + topKIdx);
++}
++
+ template <typename SFAT>
+ __aicore__ inline void SFAMatmulService<SFAT>::CalcTopKBlockInfo(
+-    const RunInfo &info, uint32_t &curTopKIdx, uint64_t &curOffsetInSparseBlock, uint32_t curSeqIdx, uint32_t &copyRowCnt, int64_t &idInTopK)
++    const RunInfo &info, uint32_t &curTopKIdx, uint64_t &curOffsetInSparseBlock, uint32_t curSeqIdx,
++    uint32_t &copyRowCnt, int64_t &idInTopK, int64_t &slotInTopK)
+ {
+     uint64_t blockBegin = idInTopK * constInfo.sparseBlockSize;
+     uint64_t blockEnd = (blockBegin + constInfo.sparseBlockSize > info.threshold) ?
+@@ -533,6 +548,11 @@ __aicore__ inline void SFAMatmulService<SFAT>::CalcTopKBlockInfo(
+             uint64_t blockLen = blockEnd - blockBegin;
+             curTopKIdx = topkidx;
+             idInTopK = sparseIndices;
++            if constexpr (ASU_RESOLVED_SLOT) {
++                slotInTopK = GetResolvedSlot(info, curTopKIdx, 0);
++            } else {
++                slotInTopK = idInTopK;
++            }
+             curOffsetInSparseBlock = 0;
+             copyRowCnt = blockLen;
+             break;
+@@ -569,11 +589,16 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm1(const RunInfo &info, c
+     uint64_t curOffsetInSparseBlock = info.curOffsetInSparseBlock;
+     uint32_t copyRowCnt = 0;
+     int64_t idInTopK = topKGm.GetValue(info.topKBaseOffset + curTopKIdx);
++    int64_t slotInTopK = idInTopK;
++    if constexpr (ASU_RESOLVED_SLOT) {
++        slotInTopK = GetResolvedSlot(info, curTopKIdx, curOffsetInSparseBlock);
++    }
+ 
+     uint32_t curTopKIdxTmp = 0;
+     uint64_t curOffsetInSparseBlockTmp = 0;
+     uint32_t copyRowCntTmp = 0;
+     int64_t idInTopKTmp = 0;
++    int64_t slotInTopKTmp = 0;
+ 
+     for (uint32_t nL1 = 0; nL1 < nL1Loops; nL1++) {
+         if (nL1 == (nL1Loops - 1)) {
+@@ -584,6 +609,7 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm1(const RunInfo &info, c
+         curOffsetInSparseBlockTmp = curOffsetInSparseBlock;
+         copyRowCntTmp = copyRowCnt;
+         idInTopKTmp = idInTopK;
++        slotInTopKTmp = slotInTopK;
+ 
+         for (uint32_t kL1 = 0; kL1 < kL1Loops; kL1++) {
+             kvL1BufIter++;
+@@ -596,6 +622,7 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm1(const RunInfo &info, c
+                 curOffsetInSparseBlock = curOffsetInSparseBlockTmp;
+                 copyRowCnt = copyRowCntTmp;
+                 idInTopK = idInTopKTmp;
++                slotInTopK = slotInTopKTmp;
+                 if constexpr (TEMPLATE_MODE == V_TEMPLATE) {
+                     if (kL1 == 0) {
+                         Nd2NzParams nd2nzPara;
+@@ -643,7 +670,8 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm1(const RunInfo &info, c
+                     }
+                 } else {
+                     while (copyFinishRowCnt < nL1Size) {
+-                        CalcTopKBlockInfo(info, curTopKIdx, curOffsetInSparseBlock, curSeqIdx, copyRowCnt, idInTopK);
++                        CalcTopKBlockInfo(info, curTopKIdx, curOffsetInSparseBlock, curSeqIdx, copyRowCnt, idInTopK,
++                                          slotInTopK);
+                         if (copyFinishRowCnt + copyRowCnt > nL1Size) {
+                             copyRowCnt = nL1Size - copyFinishRowCnt;
+                         }
+@@ -652,7 +680,9 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm1(const RunInfo &info, c
+                             Position startPos;
+                             startPos.bIdx = info.bIdx;
+                             startPos.n2Idx = info.n2Idx;
+-                            startPos.s2Idx = idInTopK * constInfo.sparseBlockSize + curOffsetInSparseBlock;
++                            startPos.s2Idx = (ASU_RESOLVED_SLOT ? slotInTopK : idInTopK) *
++                                                 constInfo.sparseBlockSize +
++                                             curOffsetInSparseBlock;
+                             startPos.dIdx = kL1 * 256;
+                             Position ropeStartPos = startPos;
+                             ropeStartPos.dIdx = kL1 * 32;
+@@ -684,15 +714,16 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm1(const RunInfo &info, c
+                         } else {
+                             uint64_t keyOffset = info.tensorBOffset;
+                             uint64_t kRopeOffset = info.tensorBRopeOffset;
++                            int64_t kvSlot = ASU_RESOLVED_SLOT ? slotInTopK : idInTopK;
+                             if constexpr (KV_LAYOUT_T == SFA_LAYOUT::BSND || KV_LAYOUT_T == SFA_LAYOUT::TND) {
+-                                keyOffset += (idInTopK * constInfo.sparseBlockSize + curOffsetInSparseBlock) *
++                                keyOffset += (kvSlot * constInfo.sparseBlockSize + curOffsetInSparseBlock) *
+                                              constInfo.kvHeadNum * constInfo.headDim;
+-                                kRopeOffset += (idInTopK * constInfo.sparseBlockSize + curOffsetInSparseBlock) *
++                                kRopeOffset += (kvSlot * constInfo.sparseBlockSize + curOffsetInSparseBlock) *
+                                                constInfo.kvHeadNum * constInfo.headDimRope;
+                             } else {
+-                                keyOffset += (idInTopK * constInfo.sparseBlockSize + curOffsetInSparseBlock) *
++                                keyOffset += (kvSlot * constInfo.sparseBlockSize + curOffsetInSparseBlock) *
+                                              constInfo.headDim;
+-                                kRopeOffset += (idInTopK * constInfo.sparseBlockSize + curOffsetInSparseBlock) *
++                                kRopeOffset += (kvSlot * constInfo.sparseBlockSize + curOffsetInSparseBlock) *
+                                                constInfo.headDimRope;
+                             }
+ 
+@@ -849,6 +880,10 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm2(const RunInfo &info, c
+         uint64_t curOffsetInSparseBlock = info.curOffsetInSparseBlock;
+         uint32_t copyRowCnt = 0;
+         int64_t idInTopK = topKGm.GetValue(info.topKBaseOffset + curTopKIdx);
++        int64_t slotInTopK = idInTopK;
++        if constexpr (ASU_RESOLVED_SLOT) {
++            slotInTopK = GetResolvedSlot(info, curTopKIdx, curOffsetInSparseBlock);
++        }
+ 
+         for (uint32_t k1 = 0; k1 < kL1Loops; k1++) {
+             if (k1 == (kL1Loops - 1)) {
+@@ -887,7 +922,8 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm2(const RunInfo &info, c
+                              nd2nzPara);
+                 } else {
+                     while (copyFinishRowCnt < kL0Size) {
+-                        CalcTopKBlockInfo(info, curTopKIdx, curOffsetInSparseBlock, curSeqIdx, copyRowCnt, idInTopK);
++                        CalcTopKBlockInfo(info, curTopKIdx, curOffsetInSparseBlock, curSeqIdx, copyRowCnt, idInTopK,
++                                          slotInTopK);
+ 
+                         if (copyFinishRowCnt + copyRowCnt > kL0Size) {
+                             copyRowCnt = kL0Size - copyFinishRowCnt;
+@@ -897,7 +933,9 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm2(const RunInfo &info, c
+                             Position startPos;
+                             startPos.bIdx = info.bIdx;
+                             startPos.n2Idx = info.n2Idx;
+-                            startPos.s2Idx = idInTopK * constInfo.sparseBlockSize + curOffsetInSparseBlock;
++                            startPos.s2Idx = (ASU_RESOLVED_SLOT ? slotInTopK : idInTopK) *
++                                                 constInfo.sparseBlockSize +
++                                             curOffsetInSparseBlock;
+                             startPos.dIdx =
+                                 nL1 * N_SPLIT_SIZE;
+                             PAShape shape;
+@@ -912,11 +950,12 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm2(const RunInfo &info, c
+                             DataCopyPA<KV_T, KV_LAYOUT_T>(subvTensor, valueGm, blockTableGm, shape, startPos);
+                         } else {
+                             uint64_t valueOffset = info.tensorBOffset;
++                            int64_t kvSlot = ASU_RESOLVED_SLOT ? slotInTopK : idInTopK;
+                             if constexpr (KV_LAYOUT_T == SFA_LAYOUT::BSND || KV_LAYOUT_T == SFA_LAYOUT::TND) {
+-                                valueOffset += (idInTopK * constInfo.sparseBlockSize + curOffsetInSparseBlock) *
++                                valueOffset += (kvSlot * constInfo.sparseBlockSize + curOffsetInSparseBlock) *
+                                                constInfo.kvHeadNum * constInfo.headDim;
+                             } else {
+-                                valueOffset += (idInTopK * constInfo.sparseBlockSize + curOffsetInSparseBlock) *
++                                valueOffset += (kvSlot * constInfo.sparseBlockSize + curOffsetInSparseBlock) *
+                                                constInfo.headDim;
+                             }
+ 
+@@ -1076,4 +1115,4 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm2(const RunInfo &info, c
+     qpL1BufIter += mL1Loops;
+ }
+ 
+-#endif // SPARSE_FLASH_ATTENTION_SERVICE_CUBE_MLA_H
+\ No newline at end of file
++#endif // SPARSE_FLASH_ATTENTION_SERVICE_CUBE_MLA_H
+diff --git csrc/sparse_flash_attention/op_kernel/sparse_flash_attention_service_vector_mla.h csrc/sparse_flash_attention/op_kernel/sparse_flash_attention_service_vector_mla.h
+index d0204d97..9370654f 100644
+--- csrc/sparse_flash_attention/op_kernel/sparse_flash_attention_service_vector_mla.h
++++ csrc/sparse_flash_attention/op_kernel/sparse_flash_attention_service_vector_mla.h
+@@ -44,7 +44,8 @@ public:
+     __aicore__ inline void InitVec0GlobalTensor(const GlobalTensor<int32_t> &kvValidSizeGm,
+                                                 const GlobalTensor<KV_T> &kvMergeGm,
+                                                 const GlobalTensor<KV_T> &keyRopeGm, const GlobalTensor<KV_T> &keyGm,
+-                                                const GlobalTensor<int32_t> &blkTableGm);
++                                                const GlobalTensor<int32_t> &blkTableGm,
++                                                const GlobalTensor<int32_t> &resolvedSlotsGm);
+     __aicore__ inline void InitVec1GlobalTensor(GlobalTensor<MM1_OUT_T> mm1ResGm, GlobalTensor<KV_T> vec1ResGm,
+                                                 GlobalTensor<int32_t> actualSeqLengthsQGm,
+                                                 GlobalTensor<int32_t> actualSeqLengthsKVGm, GlobalTensor<T> lseMaxFdGm,
+@@ -63,10 +64,14 @@ public:
+     __aicore__ inline void MergeKv(const RunInfo &runInfo);
+     __aicore__ inline int64_t GetKeyGmOffset(int64_t realS2Idx, const RunInfo &runInfo, int64_t s2IdLimit);
+     __aicore__ inline int64_t GetKeyRopeGmOffset(int64_t realS2Idx, const RunInfo &runInfo, int64_t s2IdLimit);
++    __aicore__ inline int64_t GetManagedKeyGmOffset(int64_t managedS2Idx, const RunInfo &runInfo);
++    __aicore__ inline int64_t GetResolvedSlot(int64_t s2GmOffset, int64_t topkGmBaseOffset,
++                                              const RunInfo &runInfo);
+     __aicore__ inline void GetRealS2Idx(int64_t s2GmOffset, int64_t &realS2Idx, int64_t topkGmBaseOffset,
+                                         const RunInfo &runInfo);
+     __aicore__ inline void CopyInKv(int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx, int64_t realS2Idx1,
+-                                    int64_t realS2Idx2, const RunInfo &runInfo);
++                                    int64_t realS2Idx2, int64_t resolvedS2Idx1, int64_t resolvedS2Idx2,
++                                    const RunInfo &runInfo);
+     __aicore__ inline void CopyOutMrgeResult(int64_t mte2Size, int64_t mte3Size, int64_t s2StartGmOffset,
+                                              int64_t mergeMte3Idx, const RunInfo &runInfo);
+     __aicore__ inline void SetInfInBlk(const LocalTensor<T> &mmResUb, uint32_t dealRowCount, uint32_t columnCount,
+@@ -74,7 +79,8 @@ public:
+     __aicore__ inline void SetMidInf(const LocalTensor<T> &mmResUb, uint32_t dealRowCount, uint32_t columnCount,
+                                      uint64_t startId, uint64_t endId);
+     __aicore__ inline void CopyInSingleKv(int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx, int64_t realS2Idx,
+-                                          int64_t keyBNBOffset,int64_t s2IdLimit, const RunInfo &runInfo);
++                                          int64_t resolvedS2Idx, int64_t keyBNBOffset, int64_t s2IdLimit,
++                                          const RunInfo &runInfo);
+     // ================================Vector1==========================================
+     __aicore__ inline void ProcessVec1SingleBuf(const RunInfo &info, const MSplitInfo &mSplitInfo);
+     __aicore__ inline void DealBmm1ResBaseBlock(const RunInfo &info, const MSplitInfo &mSplitInfo, uint32_t startRow,
+@@ -123,6 +129,7 @@ private:
+     static constexpr bool FLASH_DECODE = SFAT::flashDecode;
+     static constexpr SFA_LAYOUT LAYOUT_T = SFAT::layout;
+     static constexpr SFA_LAYOUT KV_LAYOUT_T = SFAT::kvLayout;
++    static constexpr bool ASU_RESOLVED_SLOT = SFAT::asuResolvedSlot;
+ 
+     static constexpr uint64_t MERGE_CACHE_GM_BUF_NUM = 4;
+     static constexpr uint64_t SYNC_INPUT_BUF1_FLAG = 2;
+@@ -163,6 +170,7 @@ private:
+     GlobalTensor<KV_T> keyRopeGm_;
+     GlobalTensor<KV_T> keyGm_;
+     GlobalTensor<int32_t> topkGm_;
++    GlobalTensor<int32_t> resolvedSlotsGm_;
+     GlobalTensor<int32_t> kvValidSizeGm_;
+ 
+     // ================================Local Buffer====================================
+@@ -255,12 +263,14 @@ SFAVectorService<SFAT>::InitMm2ResInt32GmGlobalTensor(GlobalTensor<int32_t> mm2R
+ template <typename SFAT>
+ __aicore__ inline void SFAVectorService<SFAT>::InitVec0GlobalTensor(
+     const GlobalTensor<int32_t> &kvValidSizeGm, const GlobalTensor<KV_T> &kvMergeGm,
+-    const GlobalTensor<KV_T> &keyRopeGm, const GlobalTensor<KV_T> &keyGm, const GlobalTensor<int32_t> &blkTableGm)
++    const GlobalTensor<KV_T> &keyRopeGm, const GlobalTensor<KV_T> &keyGm,
++    const GlobalTensor<int32_t> &blkTableGm, const GlobalTensor<int32_t> &resolvedSlotsGm)
+ {
+     this->kvMergeGm_ = kvMergeGm;
+     this->keyRopeGm_ = keyRopeGm;
+     this->keyGm_ = keyGm;
+     this->blkTableGm_ = blkTableGm;
++    this->resolvedSlotsGm_ = resolvedSlotsGm;
+     this->kvValidSizeGm_ = kvValidSizeGm;
+ }
+ 
+@@ -721,6 +731,21 @@ __aicore__ inline void SFAVectorService<SFAT>::GetRealS2Idx(int64_t s2GmOffset,
+                 static_cast<int64_t>((s2GmOffset + runInfo.s2Idx * constInfo.s2BaseSize) % constInfo.sparseBlockSize);
+ }
+ 
++template <typename SFAT>
++__aicore__ inline int64_t SFAVectorService<SFAT>::GetResolvedSlot(int64_t s2GmOffset, int64_t topkGmBaseOffset,
++                                                                  const RunInfo &runInfo)
++{
++    int64_t topkGmIdx = (s2GmOffset + runInfo.s2Idx * constInfo.s2BaseSize) / constInfo.sparseBlockSize;
++    if (unlikely(topkGmIdx >= constInfo.sparseBlockCount)) {
++        return -1;
++    }
++    int64_t offsetInSparseBlock =
++        static_cast<int64_t>((s2GmOffset + runInfo.s2Idx * constInfo.s2BaseSize) % constInfo.sparseBlockSize);
++    return resolvedSlotsGm_.GetValue(topkGmBaseOffset + topkGmIdx) *
++               static_cast<int64_t>(constInfo.sparseBlockSize) +
++           offsetInSparseBlock;
++}
++
+ template <typename SFAT>
+ __aicore__ inline int64_t SFAVectorService<SFAT>::GetKeyGmOffset(int64_t realS2Idx,
+                                                                  const RunInfo &runInfo, int64_t s2IdLimit)
+@@ -744,6 +769,16 @@ __aicore__ inline int64_t SFAVectorService<SFAT>::GetKeyGmOffset(int64_t realS2I
+     return realKeyGmOffset;
+ }
+ 
++template <typename SFAT>
++__aicore__ inline int64_t SFAVectorService<SFAT>::GetManagedKeyGmOffset(int64_t managedS2Idx,
++                                                                        const RunInfo &runInfo)
++{
++    if (managedS2Idx < 0) {
++        return -1;
++    }
++    return (runInfo.tensorBOffset + managedS2Idx * constInfo.kvHeadNum * constInfo.headDim) / constInfo.headDim;
++}
++
+ template <typename SFAT>
+ __aicore__ inline int64_t SFAVectorService<SFAT>::GetKeyRopeGmOffset(int64_t realS2Idx,
+                                                                  const RunInfo &runInfo, int64_t s2IdLimit)
+@@ -761,8 +796,10 @@ __aicore__ inline int64_t SFAVectorService<SFAT>::GetKeyRopeGmOffset(int64_t rea
+ template <typename SFAT>
+ __aicore__ inline void
+ SFAVectorService<SFAT>::CopyInSingleKv(int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx, int64_t realS2Idx,
+-                                       int64_t keyBNBOffset,int64_t s2IdLimit, const RunInfo &runInfo)
++                                       int64_t resolvedS2Idx, int64_t keyBNBOffset, int64_t s2IdLimit,
++                                       const RunInfo &runInfo)
+ {
++    (void)resolvedS2Idx;
+     if (keyBNBOffset < 0) {
+         return;
+     }
+@@ -785,22 +822,37 @@ SFAVectorService<SFAT>::CopyInSingleKv(int64_t &mte2Size, int64_t mte3Size, int6
+ 
+ template <typename SFAT>
+ __aicore__ inline void SFAVectorService<SFAT>::CopyInKv(int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx,
+-                                                        int64_t realS2Idx1, int64_t realS2Idx2, const RunInfo &runInfo)
++                                                        int64_t realS2Idx1, int64_t realS2Idx2,
++                                                        int64_t resolvedS2Idx1, int64_t resolvedS2Idx2,
++                                                        const RunInfo &runInfo)
+ {
+     int64_t s2IdLimit = runInfo.curActualSeqLenOri;
+     if (constInfo.sparseMode == 3) {
+         s2IdLimit = runInfo.curActualSeqLenOri - runInfo.actS1Size + runInfo.gS1Idx / constInfo.gSize + 1;
+     }
+ 
+-    int64_t keyOffset1 = GetKeyGmOffset(realS2Idx1, runInfo, s2IdLimit);
+-    int64_t keyOffset2 = GetKeyGmOffset(realS2Idx2, runInfo, s2IdLimit);
++    int64_t keyOffset1 = 0;
++    int64_t keyOffset2 = 0;
++    if constexpr (ASU_RESOLVED_SLOT) {
++        keyOffset1 = (realS2Idx1 < 0 || realS2Idx1 >= s2IdLimit) ? -1 : GetManagedKeyGmOffset(resolvedS2Idx1, runInfo);
++        keyOffset2 = (realS2Idx2 < 0 || realS2Idx2 >= s2IdLimit) ? -1 : GetManagedKeyGmOffset(resolvedS2Idx2, runInfo);
++    } else {
++        keyOffset1 = GetKeyGmOffset(realS2Idx1, runInfo, s2IdLimit);
++        keyOffset2 = GetKeyGmOffset(realS2Idx2, runInfo, s2IdLimit);
++    }
+     if (unlikely(keyOffset1 < 0 && keyOffset2 < 0)) {
+         return;
+     }
+ 
+     int64_t keySrcStride = 0;
+     int64_t keyRopeSrcStride = 0;
+-    if constexpr (PAGE_ATTENTION) {
++    if constexpr (ASU_RESOLVED_SLOT) {
++        keySrcStride = ((keyOffset1 > keyOffset2 ? (keyOffset1 - keyOffset2) :
++                        (keyOffset2 - keyOffset1)) - constInfo.sparseBlockSize) * constInfo.headDim * sizeof(KV_T);
++        keyRopeSrcStride = ((keyOffset1 > keyOffset2 ? (keyOffset1 - keyOffset2) :
++                            (keyOffset2 - keyOffset1)) - constInfo.sparseBlockSize) *
++                             constInfo.headDimRope * sizeof(KV_T);
++    } else if constexpr (PAGE_ATTENTION) {
+         int64_t blkTableSrcStride =
+         ((keyOffset1 > keyOffset2 ? (keyOffset1 - keyOffset2) :
+         (keyOffset2 - keyOffset1)) - constInfo.sparseBlockSize);
+@@ -820,8 +872,8 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyInKv(int64_t &mte2Size, int64
+         (!PAGE_ATTENTION && (keyRopeSrcStride >= INT32_MAX || keyRopeSrcStride < 0)) ||
+         realS2Idx1 + constInfo.sparseBlockSize >= s2IdLimit ||
+         realS2Idx2 + constInfo.sparseBlockSize >= s2IdLimit)) {
+-        CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx1, keyOffset1, s2IdLimit, runInfo);
+-        CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx2, keyOffset2, s2IdLimit, runInfo);
++        CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx1, resolvedS2Idx1, keyOffset1, s2IdLimit, runInfo);
++        CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx2, resolvedS2Idx2, keyOffset2, s2IdLimit, runInfo);
+     } else {
+         DataCopyExtParams intriParams;
+         intriParams.blockLen = constInfo.sparseBlockSize * constInfo.headDim * sizeof(KV_T);
+@@ -892,6 +944,8 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKv(const RunInfo &runInfo)
+     int64_t mte3Size = 0;
+     int64_t s2IdxArray0 = -1;
+     int64_t s2IdxArray1 = -1;
++    int64_t resolvedS2IdxArray0 = -1;
++    int64_t resolvedS2IdxArray1 = -1;
+     bool needWaitMte3ToMte2 = true;
+     SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
+     SetFlag<AscendC::HardEvent::MTE3_MTE2>(1);
+@@ -906,6 +960,11 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKv(const RunInfo &runInfo)
+             needWaitMte3ToMte2 = false;
+         }
+         GetRealS2Idx(s2GmOffsetArray, s2IdxArray0, topkGmBaseOffset, runInfo);
++        if constexpr (ASU_RESOLVED_SLOT) {
++            resolvedS2IdxArray0 = GetResolvedSlot(s2GmOffsetArray, topkGmBaseOffset, runInfo);
++        } else {
++            resolvedS2IdxArray0 = s2IdxArray0;
++        }
+         if (unlikely(s2IdxArray0 < 0)) {
+             CopyOutMrgeResult(mte2Size, mte3Size, s2GmStartOffset, mergeMte3Idx, runInfo);
+             SetFlag<AscendC::HardEvent::MTE3_MTE2>(mergeMte3Idx % 2);
+@@ -913,7 +972,14 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKv(const RunInfo &runInfo)
+             break;
+         }
+         GetRealS2Idx(s2GmOffsetArray + constInfo.sparseBlockSize, s2IdxArray1, topkGmBaseOffset, runInfo);
+-        CopyInKv(mte2Size, mte3Size, mergeMte3Idx, s2IdxArray0, s2IdxArray1, runInfo);
++        if constexpr (ASU_RESOLVED_SLOT) {
++            resolvedS2IdxArray1 =
++                GetResolvedSlot(s2GmOffsetArray + constInfo.sparseBlockSize, topkGmBaseOffset, runInfo);
++        } else {
++            resolvedS2IdxArray1 = s2IdxArray1;
++        }
++        CopyInKv(mte2Size, mte3Size, mergeMte3Idx, s2IdxArray0, s2IdxArray1,
++                 resolvedS2IdxArray0, resolvedS2IdxArray1, runInfo);
+         if ((mte2Size - mte3Size + 2 * constInfo.sparseBlockSize > 32) ||
+             s2GmOffsetArray + 2 * constInfo.sparseBlockSize >= s2GmLimit) {
+             CopyOutMrgeResult(mte2Size, mte3Size, s2GmStartOffset, mergeMte3Idx, runInfo);
+diff --git csrc/sparse_flash_attention/sparse_flash_attention_torch_adpt.h csrc/sparse_flash_attention/sparse_flash_attention_torch_adpt.h
+index 425c29ee..a11716f9 100644
+--- csrc/sparse_flash_attention/sparse_flash_attention_torch_adpt.h
++++ csrc/sparse_flash_attention/sparse_flash_attention_torch_adpt.h
+@@ -59,6 +59,49 @@ at::Tensor npu_sparse_flash_attention(
+         sparse_mode,
+         output);
+     return output;
+-}    
+ }
+-#endif
+\ No newline at end of file
++
++at::Tensor npu_sparse_flash_attention_asu(
++    const at::Tensor &query, const at::Tensor &managed_key,
++    const at::Tensor &managed_value, const at::Tensor &sparse_indices,
++    const at::Tensor &resolved_kv_slots, double scale_value,
++    int64_t sparse_block_size,
++    const c10::optional<at::Tensor> &actual_seq_lengths_query,
++    const c10::optional<at::Tensor> &actual_seq_lengths_kv,
++    const c10::optional<at::Tensor> &query_rope,
++    const c10::optional<at::Tensor> &managed_key_rope,
++    c10::string_view layout_query, c10::string_view layout_kv,
++    int64_t sparse_mode)
++{
++    std::string layout_query_str = std::string(layout_query);
++    std::string layout_kv_str = std::string(layout_kv);
++
++    for (size_t i = 0; i < query.sizes().size(); i++) {
++        TORCH_CHECK(query.size(i) > 0, "All values within query's shape should be greater "
++                                       "than 0, but shape[", i, "] is ", query.size(i));
++    }
++    at::Tensor output = at::empty(query.sizes(), query.options().dtype(query.dtype()));
++    char *layout_query_ptr = const_cast<char *>(layout_query_str.c_str());
++    char *layout_kv_ptr = const_cast<char *>(layout_kv_str.c_str());
++
++    EXEC_NPU_CMD(
++        aclnnSparseFlashAttentionAsu,
++        query,
++        managed_key,
++        managed_value,
++        sparse_indices,
++        resolved_kv_slots,
++        actual_seq_lengths_query,
++        actual_seq_lengths_kv,
++        query_rope,
++        managed_key_rope,
++        scale_value,
++        sparse_block_size,
++        layout_query_ptr,
++        layout_kv_ptr,
++        sparse_mode,
++        output);
++    return output;
++}
++}
++#endif
+diff --git csrc/torch_binding.cpp csrc/torch_binding.cpp
+index be744ceb..a81973fb 100644
+--- csrc/torch_binding.cpp
++++ csrc/torch_binding.cpp
+@@ -807,6 +807,18 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
+     );
+     ops.impl("npu_sparse_flash_attention", torch::kPrivateUse1, &vllm_ascend::npu_sparse_flash_attention);
+ 
++    ops.def(
++        "npu_sparse_flash_attention_asu(Tensor query, Tensor managed_key, Tensor managed_value,"
++        "                               Tensor sparse_indices, Tensor resolved_kv_slots,"
++        "                               float scale_value, int sparse_block_size, *,"
++        "                               Tensor? actual_seq_lengths_query=None,"
++        "                               Tensor? actual_seq_lengths_kv=None, Tensor? query_rope=None,"
++        "                               Tensor? managed_key_rope=None, str layout_query='TND',"
++        "                               str layout_kv='TND', int sparse_mode=3) -> Tensor"
++    );
++    ops.impl("npu_sparse_flash_attention_asu", torch::kPrivateUse1,
++             &vllm_ascend::npu_sparse_flash_attention_asu);
++
+     ops.def(
+         "npu_asu_resolve_kv_slots_single_req(Tensor original_topk_indices,"
+         "                                    int actual_seq_len,"
+diff --git csrc/torch_binding_meta.cpp csrc/torch_binding_meta.cpp
+index f4428720..0a82b3bb 100644
+--- csrc/torch_binding_meta.cpp
++++ csrc/torch_binding_meta.cpp
+@@ -250,6 +250,38 @@ at::Tensor npu_sparse_flash_attention_meta(
+     return output;
+ }
+ 
++at::Tensor npu_sparse_flash_attention_asu_meta(
++    const at::Tensor &query, const at::Tensor &managed_key,
++    const at::Tensor &managed_value, const at::Tensor &sparse_indices,
++    const at::Tensor &resolved_kv_slots, double scale_value,
++    int64_t sparse_block_size,
++    const c10::optional<at::Tensor> &actual_seq_lengths_query,
++    const c10::optional<at::Tensor> &actual_seq_lengths_kv,
++    const c10::optional<at::Tensor> &query_rope,
++    const c10::optional<at::Tensor> &managed_key_rope,
++    c10::string_view layout_query, c10::string_view layout_kv,
++    int64_t sparse_mode)
++{
++    (void)managed_key;
++    (void)managed_value;
++    (void)sparse_indices;
++    (void)resolved_kv_slots;
++    (void)scale_value;
++    (void)sparse_block_size;
++    (void)actual_seq_lengths_query;
++    (void)actual_seq_lengths_kv;
++    (void)query_rope;
++    (void)managed_key_rope;
++    (void)layout_query;
++    (void)layout_kv;
++    (void)sparse_mode;
++    for (size_t i = 0; i < query.sizes().size(); i++) {
++        TORCH_CHECK(query.size(i) > 0, "All values within query's shape should be greater "
++                                       "than 0, but shape[", i, "] is ", query.size(i));
++    }
++    return at::empty(query.sizes(), query.options().dtype(query.dtype()));
++}
++
+ at::Tensor npu_asu_resolve_kv_slots_single_req_meta(
+     const at::Tensor &original_topk_indices,
+     int64_t actual_seq_len,
+@@ -634,6 +666,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
+     ops.impl("npu_lightning_indexer", &vllm_ascend::meta::npu_lightning_indexer_meta);
+     // Sparse flash attention
+     ops.impl("npu_sparse_flash_attention", &vllm_ascend::meta::npu_sparse_flash_attention_meta);
++    ops.impl("npu_sparse_flash_attention_asu",
++             &vllm_ascend::meta::npu_sparse_flash_attention_asu_meta);
+     // ASU KV resolver
+     ops.impl("npu_asu_resolve_kv_slots_single_req",
+              &vllm_ascend::meta::npu_asu_resolve_kv_slots_single_req_meta);
+diff --git tests/ut/ops/test_asu_sparse_flash_attention_structure.py tests/ut/ops/test_asu_sparse_flash_attention_structure.py
+new file mode 100644
+index 00000000..b5732021
+--- /dev/null
++++ tests/ut/ops/test_asu_sparse_flash_attention_structure.py
+@@ -0,0 +1,54 @@
++from pathlib import Path
++
++
++def _repo_root() -> Path:
++    return Path(__file__).resolve().parents[3]
++
++
++def test_sparse_flash_attention_asu_variant_is_registered():
++    repo_root = _repo_root()
++    torch_binding = (repo_root / "csrc" / "torch_binding.cpp").read_text()
++    torch_binding_meta = (
++        repo_root / "csrc" / "torch_binding_meta.cpp"
++    ).read_text()
++    adapter = (
++        repo_root / "csrc" / "sparse_flash_attention" /
++        "sparse_flash_attention_torch_adpt.h"
++    ).read_text()
++
++    assert "npu_sparse_flash_attention_asu" in torch_binding
++    assert "resolved_kv_slots" in torch_binding
++    assert "managed_key_rope" in torch_binding
++    assert "npu_sparse_flash_attention_asu_meta" in torch_binding_meta
++    assert "npu_sparse_flash_attention_asu" in adapter
++    assert "aclnnSparseFlashAttentionAsu" in adapter
++
++
++def test_sparse_flash_attention_asu_variant_has_cann_host_and_kernel_inputs():
++    repo_root = _repo_root()
++    op_root = repo_root / "csrc" / "sparse_flash_attention"
++    op_def = (op_root / "op_host" / "sparse_flash_attention_def.cpp").read_text()
++    op_proto = (
++        op_root / "op_host" / "sparse_flash_attention_proto.cpp"
++    ).read_text()
++    tiling_header = (
++        op_root / "op_host" / "sparse_flash_attention_tiling.h"
++    ).read_text()
++    kernel = (op_root / "op_kernel" / "sparse_flash_attention.cpp").read_text()
++    vector_service = (
++        op_root / "op_kernel" / "sparse_flash_attention_service_vector_mla.h"
++    ).read_text()
++    cube_service = (
++        op_root / "op_kernel" / "sparse_flash_attention_service_cube_mla.h"
++    ).read_text()
++
++    assert "class SparseFlashAttentionAsu" in op_def
++    assert 'this->Input("resolved_kv_slots")' in op_def
++    assert 'this->Input("managed_key_rope")' in op_def
++    assert "IMPL_OP(SparseFlashAttentionAsu)" in op_proto
++    assert "RESOLVED_KV_SLOTS_INPUT_INDEX" in tiling_header
++    assert "MANAGED_KEY_ROPE_INPUT_INDEX" in tiling_header
++    assert "sparse_flash_attention_asu" in kernel
++    assert "resolvedKvSlots" in kernel
++    assert "GetResolvedSlot" in vector_service
++    assert "resolvedSlotsGm" in cube_service

@@ -1,0 +1,1039 @@
+diff --git csrc/asu_kv_resolver/asu_kv_resolver_torch_adpt.h csrc/asu_kv_resolver/asu_kv_resolver_torch_adpt.h
+new file mode 100644
+index 00000000..d511e5a4
+--- /dev/null
++++ csrc/asu_kv_resolver/asu_kv_resolver_torch_adpt.h
+@@ -0,0 +1,63 @@
++/*
++ * Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#ifndef ASU_KV_RESOLVER_TORCH_ADPT_H
++#define ASU_KV_RESOLVER_TORCH_ADPT_H
++
++namespace vllm_ascend {
++
++at::Tensor npu_asu_resolve_kv_slots_single_req(
++    const at::Tensor& original_topk_indices,
++    int64_t actual_seq_len,
++    int64_t managed_prefix_len,
++    at::Tensor& token_state,
++    const at::Tensor& asu_record_addr,
++    at::Tensor& hbm_slot_of_token,
++    at::Tensor& slot_owner_token,
++    const at::Tensor& free_slot_stack,
++    at::Tensor& free_slot_count,
++    const at::Tensor& original_block_table,
++    const at::Tensor& original_kv_cache_0,
++    const at::Tensor& original_kv_cache_1,
++    at::Tensor& managed_kv_cache_0,
++    at::Tensor& managed_kv_cache_1,
++    int64_t block_size)
++{
++    at::Tensor resolved_kv_slots = at::empty(
++        original_topk_indices.sizes(),
++        original_topk_indices.options().dtype(at::kInt));
++    EXEC_NPU_CMD(
++        aclnnAsuKvResolver,
++        original_topk_indices,
++        token_state,
++        asu_record_addr,
++        hbm_slot_of_token,
++        slot_owner_token,
++        free_slot_stack,
++        free_slot_count,
++        original_block_table,
++        original_kv_cache_0,
++        original_kv_cache_1,
++        managed_kv_cache_0,
++        managed_kv_cache_1,
++        actual_seq_len,
++        managed_prefix_len,
++        block_size,
++        resolved_kv_slots);
++    return resolved_kv_slots;
++}
++
++} // namespace vllm_ascend
++#endif
+diff --git csrc/asu_kv_resolver/op_host/CMakeLists.txt csrc/asu_kv_resolver/op_host/CMakeLists.txt
+new file mode 100644
+index 00000000..268b89c3
+--- /dev/null
++++ csrc/asu_kv_resolver/op_host/CMakeLists.txt
+@@ -0,0 +1,28 @@
++add_ops_compile_options(
++        OP_NAME AsuKvResolver
++        OPTIONS --cce-auto-sync=off
++                -Wno-deprecated-declarations
++                -Werror
++)
++
++target_sources(op_host_aclnn PRIVATE
++        asu_kv_resolver_def.cpp
++)
++
++target_sources(optiling PRIVATE
++        asu_kv_resolver_tiling.cpp
++)
++
++if (NOT BUILD_OPEN_PROJECT)
++    target_sources(opmaster_ct PRIVATE
++        asu_kv_resolver_tiling.cpp
++    )
++endif ()
++
++target_include_directories(optiling PRIVATE
++        ${CMAKE_CURRENT_SOURCE_DIR}
++)
++
++target_sources(opsproto PRIVATE
++        asu_kv_resolver_infershape.cpp
++)
+diff --git csrc/asu_kv_resolver/op_host/asu_kv_resolver_def.cpp csrc/asu_kv_resolver/op_host/asu_kv_resolver_def.cpp
+new file mode 100644
+index 00000000..e379bd8f
+--- /dev/null
++++ csrc/asu_kv_resolver/op_host/asu_kv_resolver_def.cpp
+@@ -0,0 +1,92 @@
++#include "register/op_def_registry.h"
++
++namespace ops {
++class AsuKvResolver : public OpDef {
++public:
++    explicit AsuKvResolver(const char* name) : OpDef(name)
++    {
++        this->Input("original_topk_indices")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_INT32, ge::DT_INT32, ge::DT_INT32})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
++            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
++        this->Input("token_state")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_INT32, ge::DT_INT32, ge::DT_INT32})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
++            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
++        this->Input("asu_record_addr")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_INT32, ge::DT_INT32, ge::DT_INT32})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
++            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
++        this->Input("hbm_slot_of_token")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_INT32, ge::DT_INT32, ge::DT_INT32})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
++            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
++        this->Input("slot_owner_token")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_INT32, ge::DT_INT32, ge::DT_INT32})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
++            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
++        this->Input("free_slot_stack")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_INT32, ge::DT_INT32, ge::DT_INT32})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
++            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
++        this->Input("free_slot_count")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_INT32, ge::DT_INT32, ge::DT_INT32})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
++            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
++        this->Input("original_block_table")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_INT32, ge::DT_INT32, ge::DT_INT32})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
++            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
++        this->Input("original_kv_cache_0")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_FLOAT16, ge::DT_BF16, ge::DT_FLOAT})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
++            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
++        this->Input("original_kv_cache_1")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_FLOAT16, ge::DT_BF16, ge::DT_FLOAT})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
++            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
++        this->Input("managed_kv_cache_0")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_FLOAT16, ge::DT_BF16, ge::DT_FLOAT})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
++            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
++        this->Input("managed_kv_cache_1")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_FLOAT16, ge::DT_BF16, ge::DT_FLOAT})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
++            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
++        this->Output("resolved_kv_slots")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_INT32, ge::DT_INT32, ge::DT_INT32})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
++            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
++
++        this->Attr("actual_seq_len").AttrType(REQUIRED).Int();
++        this->Attr("managed_prefix_len").AttrType(REQUIRED).Int();
++        this->Attr("block_size").AttrType(REQUIRED).Int();
++
++        OpAICoreConfig aicore_config;
++        aicore_config.DynamicCompileStaticFlag(true)
++            .DynamicFormatFlag(true)
++            .DynamicRankSupportFlag(true)
++            .DynamicShapeSupportFlag(true)
++            .NeedCheckSupportFlag(false)
++            .PrecisionReduceFlag(true)
++            .ExtendCfgInfo("aclnnSupport.value", "support_aclnn");
++        this->AICore().AddConfig("ascend910b", aicore_config);
++        this->AICore().AddConfig("ascend910_93", aicore_config);
++    }
++};
++
++OP_ADD(AsuKvResolver);
++} // namespace ops
+diff --git csrc/asu_kv_resolver/op_host/asu_kv_resolver_infershape.cpp csrc/asu_kv_resolver/op_host/asu_kv_resolver_infershape.cpp
+new file mode 100644
+index 00000000..04bfdccf
+--- /dev/null
++++ csrc/asu_kv_resolver/op_host/asu_kv_resolver_infershape.cpp
+@@ -0,0 +1,26 @@
++#include <register/op_impl_registry.h>
++
++namespace ops {
++constexpr size_t ORIGINAL_TOPK_INDICES_INDEX = 0;
++constexpr size_t RESOLVED_KV_SLOTS_INDEX = 0;
++
++static ge::graphStatus InferShapeAsuKvResolver(gert::InferShapeContext* context)
++{
++    const gert::Shape* topkShape =
++        context->GetInputShape(ORIGINAL_TOPK_INDICES_INDEX);
++    gert::Shape* outputShape = context->GetOutputShape(RESOLVED_KV_SLOTS_INDEX);
++    *outputShape = *topkShape;
++    return ge::GRAPH_SUCCESS;
++}
++
++static ge::graphStatus InferDataTypeAsuKvResolver(
++    gert::InferDataTypeContext* context)
++{
++    context->SetOutputDataType(RESOLVED_KV_SLOTS_INDEX, ge::DT_INT32);
++    return ge::GRAPH_SUCCESS;
++}
++
++IMPL_OP_INFERSHAPE(AsuKvResolver)
++    .InferShape(InferShapeAsuKvResolver)
++    .InferDataType(InferDataTypeAsuKvResolver);
++} // namespace ops
+diff --git csrc/asu_kv_resolver/op_host/asu_kv_resolver_tiling.cpp csrc/asu_kv_resolver/op_host/asu_kv_resolver_tiling.cpp
+new file mode 100644
+index 00000000..596d2d7d
+--- /dev/null
++++ csrc/asu_kv_resolver/op_host/asu_kv_resolver_tiling.cpp
+@@ -0,0 +1,70 @@
++#include "asu_kv_resolver_tiling.h"
++
++namespace optiling {
++constexpr size_t ORIGINAL_TOPK_INDICES_INDEX = 0;
++constexpr size_t ORIGINAL_KV_CACHE_0_INDEX = 8;
++constexpr size_t ORIGINAL_KV_CACHE_1_INDEX = 9;
++constexpr size_t ACTUAL_SEQ_LEN_ATTR_INDEX = 0;
++constexpr size_t BLOCK_SIZE_ATTR_INDEX = 2;
++
++static int64_t ShapeNumel(const gert::StorageShape* shape)
++{
++    int64_t numel = 1;
++    const gert::Shape& storageShape = shape->GetStorageShape();
++    for (size_t i = 0; i < storageShape.GetDimNum(); ++i) {
++        numel *= storageShape.GetDim(i);
++    }
++    return numel;
++}
++
++static int64_t SlotElements(const gert::StorageShape* shape)
++{
++    const gert::Shape& storageShape = shape->GetStorageShape();
++    if (storageShape.GetDimNum() <= 1) {
++        return 1;
++    }
++    int64_t slotNum = storageShape.GetDim(0);
++    return ShapeNumel(shape) / slotNum;
++}
++
++static ge::graphStatus TilingFunc(gert::TilingContext* context)
++{
++    const gert::StorageShape* topkShape =
++        context->GetInputShape(ORIGINAL_TOPK_INDICES_INDEX);
++    const gert::StorageShape* kv0Shape =
++        context->GetInputShape(ORIGINAL_KV_CACHE_0_INDEX);
++    const gert::StorageShape* kv1Shape =
++        context->GetInputShape(ORIGINAL_KV_CACHE_1_INDEX);
++    const gert::RuntimeAttrs* attrs = context->GetAttrs();
++
++    AsuKvResolverTilingData tiling;
++    tiling.set_topkNumel(ShapeNumel(topkShape));
++    tiling.set_actualSeqLen(
++        *attrs->GetAttrPointer<int64_t>(ACTUAL_SEQ_LEN_ATTR_INDEX));
++    tiling.set_blockSize(
++        *attrs->GetAttrPointer<int64_t>(BLOCK_SIZE_ATTR_INDEX));
++    tiling.set_kv0SlotElements(SlotElements(kv0Shape));
++    tiling.set_kv1SlotElements(SlotElements(kv1Shape));
++
++    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
++                        context->GetRawTilingData()->GetCapacity());
++    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
++    context->SetTilingKey(1);
++    context->SetBlockDim(1);
++    return ge::GRAPH_SUCCESS;
++}
++
++struct AsuKvResolverCompileInfo {};
++
++static ge::graphStatus TilingParseForAsuKvResolver(
++    gert::TilingParseContext* context)
++{
++    (void)context;
++    return ge::GRAPH_SUCCESS;
++}
++
++IMPL_OP_OPTILING(AsuKvResolver)
++    .Tiling(TilingFunc)
++    .TilingParse<AsuKvResolverCompileInfo>(TilingParseForAsuKvResolver);
++
++} // namespace optiling
+diff --git csrc/asu_kv_resolver/op_host/asu_kv_resolver_tiling.h csrc/asu_kv_resolver/op_host/asu_kv_resolver_tiling.h
+new file mode 100644
+index 00000000..bef0a448
+--- /dev/null
++++ csrc/asu_kv_resolver/op_host/asu_kv_resolver_tiling.h
+@@ -0,0 +1,21 @@
++#ifndef ASU_KV_RESOLVER_TILING_H
++#define ASU_KV_RESOLVER_TILING_H
++
++#include "register/op_impl_registry.h"
++#include "register/tilingdata_base.h"
++
++namespace optiling {
++
++BEGIN_TILING_DATA_DEF(AsuKvResolverTilingData)
++TILING_DATA_FIELD_DEF(int64_t, topkNumel)
++TILING_DATA_FIELD_DEF(int64_t, actualSeqLen)
++TILING_DATA_FIELD_DEF(int64_t, blockSize)
++TILING_DATA_FIELD_DEF(int64_t, kv0SlotElements)
++TILING_DATA_FIELD_DEF(int64_t, kv1SlotElements)
++END_TILING_DATA_DEF
++
++REGISTER_TILING_DATA_CLASS(AsuKvResolver, AsuKvResolverTilingData)
++
++} // namespace optiling
++
++#endif // ASU_KV_RESOLVER_TILING_H
+diff --git csrc/asu_kv_resolver/op_kernel/asu_kv_resolver.cpp csrc/asu_kv_resolver/op_kernel/asu_kv_resolver.cpp
+new file mode 100644
+index 00000000..4be4d8c7
+--- /dev/null
++++ csrc/asu_kv_resolver/op_kernel/asu_kv_resolver.cpp
+@@ -0,0 +1,180 @@
++#include "kernel_operator.h"
++
++using namespace AscendC;
++
++namespace {
++constexpr int32_t ASU_ONLY = 0;
++constexpr int32_t HBM_RESIDENT = 1;
++
++template <typename T>
++class AsuKvResolverKernel {
++public:
++    __aicore__ inline AsuKvResolverKernel() {}
++
++    __aicore__ inline void Init(GM_ADDR originalTopkIndices,
++                                GM_ADDR tokenState,
++                                GM_ADDR asuRecordAddr,
++                                GM_ADDR hbmSlotOfToken,
++                                GM_ADDR slotOwnerToken,
++                                GM_ADDR freeSlotStack,
++                                GM_ADDR freeSlotCount,
++                                GM_ADDR originalBlockTable,
++                                GM_ADDR originalKvCache0,
++                                GM_ADDR originalKvCache1,
++                                GM_ADDR managedKvCache0,
++                                GM_ADDR managedKvCache1,
++                                GM_ADDR resolvedKvSlots,
++                                const AsuKvResolverTilingData* tilingData)
++    {
++        topkNumel_ = tilingData->topkNumel;
++        blockSize_ = tilingData->blockSize;
++        kv0SlotElements_ = tilingData->kv0SlotElements;
++        kv1SlotElements_ = tilingData->kv1SlotElements;
++
++        originalTopkIndicesGm_.SetGlobalBuffer(
++            (__gm__ int32_t*)originalTopkIndices, topkNumel_);
++        tokenStateGm_.SetGlobalBuffer((__gm__ int32_t*)tokenState);
++        asuRecordAddrGm_.SetGlobalBuffer((__gm__ int32_t*)asuRecordAddr);
++        hbmSlotOfTokenGm_.SetGlobalBuffer((__gm__ int32_t*)hbmSlotOfToken);
++        slotOwnerTokenGm_.SetGlobalBuffer((__gm__ int32_t*)slotOwnerToken);
++        freeSlotStackGm_.SetGlobalBuffer((__gm__ int32_t*)freeSlotStack);
++        freeSlotCountGm_.SetGlobalBuffer((__gm__ int32_t*)freeSlotCount);
++        originalBlockTableGm_.SetGlobalBuffer(
++            (__gm__ int32_t*)originalBlockTable);
++        originalKvCache0Gm_.SetGlobalBuffer((__gm__ T*)originalKvCache0);
++        originalKvCache1Gm_.SetGlobalBuffer((__gm__ T*)originalKvCache1);
++        managedKvCache0Gm_.SetGlobalBuffer((__gm__ T*)managedKvCache0);
++        managedKvCache1Gm_.SetGlobalBuffer((__gm__ T*)managedKvCache1);
++        resolvedKvSlotsGm_.SetGlobalBuffer(
++            (__gm__ int32_t*)resolvedKvSlots, topkNumel_);
++    }
++
++    __aicore__ inline void Process()
++    {
++        for (int64_t i = 0; i < topkNumel_; ++i) {
++            int32_t tokenId = originalTopkIndicesGm_.GetValue(i);
++            int32_t state = tokenStateGm_.GetValue(tokenId);
++            int32_t slot = hbmSlotOfTokenGm_.GetValue(tokenId);
++
++            if (state != HBM_RESIDENT) {
++                int32_t sourceSlot =
++                    state == ASU_ONLY ? asuRecordAddrGm_.GetValue(tokenId)
++                                      : ResolveTailSourceSlot(tokenId);
++                slot = PopFreeSlot();
++                CopyFullKvPair(sourceSlot, slot);
++                tokenStateGm_.SetValue(tokenId, HBM_RESIDENT);
++                hbmSlotOfTokenGm_.SetValue(tokenId, slot);
++                slotOwnerTokenGm_.SetValue(slot, tokenId);
++            }
++
++            resolvedKvSlotsGm_.SetValue(i, slot);
++        }
++    }
++
++private:
++    __aicore__ inline int32_t ResolveTailSourceSlot(int32_t tokenId)
++    {
++        int64_t logicalBlock = tokenId / blockSize_;
++        int64_t offset = tokenId - logicalBlock * blockSize_;
++        int32_t physicalBlock = originalBlockTableGm_.GetValue(logicalBlock);
++        return static_cast<int32_t>(physicalBlock * blockSize_ + offset);
++    }
++
++    __aicore__ inline int32_t PopFreeSlot()
++    {
++        int32_t nextCount = freeSlotCountGm_.GetValue(0) - 1;
++        freeSlotCountGm_.SetValue(0, nextCount);
++        return freeSlotStackGm_.GetValue(nextCount);
++    }
++
++    __aicore__ inline void CopyFullKvPair(int32_t sourceSlot,
++                                          int32_t managedSlot)
++    {
++        CopySlot(originalKvCache0Gm_, managedKvCache0Gm_, sourceSlot,
++                 managedSlot, kv0SlotElements_);
++        CopySlot(originalKvCache1Gm_, managedKvCache1Gm_, sourceSlot,
++                 managedSlot, kv1SlotElements_);
++    }
++
++    __aicore__ inline void CopySlot(GlobalTensor<T>& src,
++                                    GlobalTensor<T>& dst,
++                                    int32_t sourceSlot,
++                                    int32_t managedSlot,
++                                    int64_t slotElements)
++    {
++        int64_t srcOffset = static_cast<int64_t>(sourceSlot) * slotElements;
++        int64_t dstOffset = static_cast<int64_t>(managedSlot) * slotElements;
++        for (int64_t j = 0; j < slotElements; ++j) {
++            dst.SetValue(dstOffset + j, src.GetValue(srcOffset + j));
++        }
++    }
++
++private:
++    int64_t topkNumel_;
++    int64_t blockSize_;
++    int64_t kv0SlotElements_;
++    int64_t kv1SlotElements_;
++
++    GlobalTensor<int32_t> originalTopkIndicesGm_;
++    GlobalTensor<int32_t> tokenStateGm_;
++    GlobalTensor<int32_t> asuRecordAddrGm_;
++    GlobalTensor<int32_t> hbmSlotOfTokenGm_;
++    GlobalTensor<int32_t> slotOwnerTokenGm_;
++    GlobalTensor<int32_t> freeSlotStackGm_;
++    GlobalTensor<int32_t> freeSlotCountGm_;
++    GlobalTensor<int32_t> originalBlockTableGm_;
++    GlobalTensor<T> originalKvCache0Gm_;
++    GlobalTensor<T> originalKvCache1Gm_;
++    GlobalTensor<T> managedKvCache0Gm_;
++    GlobalTensor<T> managedKvCache1Gm_;
++    GlobalTensor<int32_t> resolvedKvSlotsGm_;
++};
++} // namespace
++
++extern "C" __global__ __aicore__ void asu_kv_resolver(
++    GM_ADDR originalTopkIndices,
++    GM_ADDR tokenState,
++    GM_ADDR asuRecordAddr,
++    GM_ADDR hbmSlotOfToken,
++    GM_ADDR slotOwnerToken,
++    GM_ADDR freeSlotStack,
++    GM_ADDR freeSlotCount,
++    GM_ADDR originalBlockTable,
++    GM_ADDR originalKvCache0,
++    GM_ADDR originalKvCache1,
++    GM_ADDR managedKvCache0,
++    GM_ADDR managedKvCache1,
++    GM_ADDR resolvedKvSlots,
++    GM_ADDR workspace,
++    GM_ADDR tiling)
++{
++    (void)workspace;
++    GET_TILING_DATA(tilingData, tiling);
++    if constexpr (DTYPE_ORIGINAL_KV_CACHE_0 == DT_FLOAT16) {
++        AsuKvResolverKernel<half> kernel;
++        kernel.Init(originalTopkIndices, tokenState, asuRecordAddr,
++                    hbmSlotOfToken, slotOwnerToken, freeSlotStack,
++                    freeSlotCount, originalBlockTable, originalKvCache0,
++                    originalKvCache1, managedKvCache0, managedKvCache1,
++                    resolvedKvSlots, &tilingData);
++        kernel.Process();
++    } else if constexpr (DTYPE_ORIGINAL_KV_CACHE_0 == DT_BF16) {
++#if !(defined(__NPU_ARCH__) && __NPU_ARCH__ == 3003)
++        AsuKvResolverKernel<bfloat16_t> kernel;
++        kernel.Init(originalTopkIndices, tokenState, asuRecordAddr,
++                    hbmSlotOfToken, slotOwnerToken, freeSlotStack,
++                    freeSlotCount, originalBlockTable, originalKvCache0,
++                    originalKvCache1, managedKvCache0, managedKvCache1,
++                    resolvedKvSlots, &tilingData);
++        kernel.Process();
++#endif
++    } else {
++        AsuKvResolverKernel<float> kernel;
++        kernel.Init(originalTopkIndices, tokenState, asuRecordAddr,
++                    hbmSlotOfToken, slotOwnerToken, freeSlotStack,
++                    freeSlotCount, originalBlockTable, originalKvCache0,
++                    originalKvCache1, managedKvCache0, managedKvCache1,
++                    resolvedKvSlots, &tilingData);
++        kernel.Process();
++    }
++}
+diff --git csrc/build_aclnn.sh csrc/build_aclnn.sh
+index 1d0a3742..6c7a4cc9 100644
+--- csrc/build_aclnn.sh
++++ csrc/build_aclnn.sh
+@@ -25,7 +25,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
+     export CPATH=${ABSOLUTE_CATLASS_PATH}:${CPATH}
+ 
+ 
+-    CUSTOM_OPS="moe_grouped_matmul;grouped_matmul_swiglu_quant_weight_nz_tensor_list;lightning_indexer_vllm;sparse_flash_attention;matmul_allreduce_add_rmsnorm;moe_init_routing_custom;moe_gating_top_k;add_rms_norm_bias;apply_top_k_top_p_custom;transpose_kv_cache_by_block;copy_and_expand_eagle_inputs;causal_conv1d;lightning_indexer_quant;"
++    CUSTOM_OPS="moe_grouped_matmul;grouped_matmul_swiglu_quant_weight_nz_tensor_list;lightning_indexer_vllm;sparse_flash_attention;asu_kv_resolver;matmul_allreduce_add_rmsnorm;moe_init_routing_custom;moe_gating_top_k;add_rms_norm_bias;apply_top_k_top_p_custom;transpose_kv_cache_by_block;copy_and_expand_eagle_inputs;causal_conv1d;lightning_indexer_quant;"
+     SOC_ARG="ascend910b"
+ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
+     # ASCEND910C (A3) series
+@@ -46,6 +46,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
+         "grouped_matmul_swiglu_quant_weight_nz_tensor_list"
+         "lightning_indexer_vllm"
+         "sparse_flash_attention"
++        "asu_kv_resolver"
+         "dispatch_ffn_combine"
+         "dispatch_ffn_combine_bf16"
+         "dispatch_gmm_combine_decode"
+diff --git csrc/torch_binding.cpp csrc/torch_binding.cpp
+index 959f10b3..be744ceb 100644
+--- csrc/torch_binding.cpp
++++ csrc/torch_binding.cpp
+@@ -30,6 +30,7 @@
+ #include "aclnn_torch_adapter/op_api_common.h"
+ #include "add_rms_norm_bias/add_rms_norm_bias_torch_adpt.h"
+ #include "apply_top_k_top_p_custom/apply_top_k_top_p_custom_torch_adpt.h"
++#include "asu_kv_resolver/asu_kv_resolver_torch_adpt.h"
+ #include "batch_matmul_transpose/batch_matmul_transpose_torch_adpt.h"
+ #include "dispatch_ffn_combine/dispatch_ffn_combine_torch_adpt.h"
+ #include "dispatch_gmm_combine_decode/dispatch_gmm_combine_decode_torch_adpt.h"
+@@ -806,6 +807,26 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
+     );
+     ops.impl("npu_sparse_flash_attention", torch::kPrivateUse1, &vllm_ascend::npu_sparse_flash_attention);
+ 
++    ops.def(
++        "npu_asu_resolve_kv_slots_single_req(Tensor original_topk_indices,"
++        "                                    int actual_seq_len,"
++        "                                    int managed_prefix_len,"
++        "                                    Tensor! token_state,"
++        "                                    Tensor asu_record_addr,"
++        "                                    Tensor! hbm_slot_of_token,"
++        "                                    Tensor! slot_owner_token,"
++        "                                    Tensor free_slot_stack,"
++        "                                    Tensor! free_slot_count,"
++        "                                    Tensor original_block_table,"
++        "                                    Tensor original_kv_cache_0,"
++        "                                    Tensor original_kv_cache_1,"
++        "                                    Tensor! managed_kv_cache_0,"
++        "                                    Tensor! managed_kv_cache_1,"
++        "                                    int block_size) -> Tensor"
++    );
++    ops.impl("npu_asu_resolve_kv_slots_single_req", torch::kPrivateUse1,
++             &vllm_ascend::npu_asu_resolve_kv_slots_single_req);
++
+     ops.def(
+         "dispatch_ffn_combine(Tensor x, Tensor[] weight1, Tensor[] weight2, Tensor expert_idx,"
+         "                     Tensor[] scale1, Tensor[] scale2, Tensor probs, str group,"
+diff --git csrc/torch_binding_meta.cpp csrc/torch_binding_meta.cpp
+index ed7f7dc8..f4428720 100644
+--- csrc/torch_binding_meta.cpp
++++ csrc/torch_binding_meta.cpp
+@@ -249,6 +249,42 @@ at::Tensor npu_sparse_flash_attention_meta(
+     at::Tensor output = at::empty(query.sizes(), query.options().dtype(query.dtype()));
+     return output;
+ }
++
++at::Tensor npu_asu_resolve_kv_slots_single_req_meta(
++    const at::Tensor &original_topk_indices,
++    int64_t actual_seq_len,
++    int64_t managed_prefix_len,
++    at::Tensor &token_state,
++    const at::Tensor &asu_record_addr,
++    at::Tensor &hbm_slot_of_token,
++    at::Tensor &slot_owner_token,
++    const at::Tensor &free_slot_stack,
++    at::Tensor &free_slot_count,
++    const at::Tensor &original_block_table,
++    const at::Tensor &original_kv_cache_0,
++    const at::Tensor &original_kv_cache_1,
++    at::Tensor &managed_kv_cache_0,
++    at::Tensor &managed_kv_cache_1,
++    int64_t block_size)
++{
++    (void)actual_seq_len;
++    (void)managed_prefix_len;
++    (void)token_state;
++    (void)asu_record_addr;
++    (void)hbm_slot_of_token;
++    (void)slot_owner_token;
++    (void)free_slot_stack;
++    (void)free_slot_count;
++    (void)original_block_table;
++    (void)original_kv_cache_0;
++    (void)original_kv_cache_1;
++    (void)managed_kv_cache_0;
++    (void)managed_kv_cache_1;
++    (void)block_size;
++    return at::empty(original_topk_indices.sizes(),
++                     original_topk_indices.options().dtype(at::kInt));
++}
++
+ std::tuple<at::Tensor, at::Tensor> matmul_allreduce_add_rmsnorm_meta(
+     const at::Tensor &x1,
+     const at::Tensor &x2,
+@@ -598,6 +634,9 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
+     ops.impl("npu_lightning_indexer", &vllm_ascend::meta::npu_lightning_indexer_meta);
+     // Sparse flash attention
+     ops.impl("npu_sparse_flash_attention", &vllm_ascend::meta::npu_sparse_flash_attention_meta);
++    // ASU KV resolver
++    ops.impl("npu_asu_resolve_kv_slots_single_req",
++             &vllm_ascend::meta::npu_asu_resolve_kv_slots_single_req_meta);
+     // MoE dispatch-ffn-combine
+     ops.impl("dispatch_ffn_combine", &vllm_ascend::meta::dispatch_ffn_combine_meta);
+     // matmul allreduce add rmsnorm
+diff --git tests/ut/ops/test_asu_kv_resolver.py tests/ut/ops/test_asu_kv_resolver.py
+new file mode 100644
+index 00000000..29863c60
+--- /dev/null
++++ tests/ut/ops/test_asu_kv_resolver.py
+@@ -0,0 +1,120 @@
++import importlib.util
++from pathlib import Path
++
++import torch
++
++
++def _load_asu_kv_resolver_module():
++    repo_root = Path(__file__).resolve().parents[3]
++    module_path = repo_root / "vllm_ascend" / "ops" / "asu_kv_resolver.py"
++    spec = importlib.util.spec_from_file_location("asu_kv_resolver", module_path)
++    module = importlib.util.module_from_spec(spec)
++    assert spec.loader is not None
++    spec.loader.exec_module(module)
++    return module
++
++
++asu_kv_resolver = _load_asu_kv_resolver_module()
++ASU_ONLY = asu_kv_resolver.ASU_ONLY
++HBM_RESIDENT = asu_kv_resolver.HBM_RESIDENT
++INVALID = asu_kv_resolver.INVALID
++TAIL_HBM = asu_kv_resolver.TAIL_HBM
++asu_resolve_kv_slots_single_req = (
++    asu_kv_resolver.asu_resolve_kv_slots_single_req
++)
++
++
++def test_resolver_installs_asu_and_tail_tokens_into_managed_cache():
++    original_topk_indices = torch.tensor([[[1, 1, 5]]], dtype=torch.int64)
++    original_kv_cache_0 = torch.arange(16, dtype=torch.float32).reshape(8, 2)
++    original_kv_cache_1 = torch.arange(24, dtype=torch.float32).reshape(8, 3)
++    managed_kv_cache_0 = torch.full((4, 2), -1.0)
++    managed_kv_cache_1 = torch.full((4, 3), -1.0)
++    token_state = torch.tensor(
++        [ASU_ONLY, ASU_ONLY, ASU_ONLY, ASU_ONLY, TAIL_HBM, TAIL_HBM],
++        dtype=torch.int32,
++    )
++    asu_record_addr = torch.tensor([0, 4, 0, 0, -1, -1], dtype=torch.int64)
++    hbm_slot_of_token = torch.full((6,), -1, dtype=torch.int64)
++    slot_owner_token = torch.full((4,), INVALID, dtype=torch.int64)
++    free_slot_stack = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
++    free_slot_count = torch.tensor(4, dtype=torch.int64)
++    original_block_table = torch.tensor([2, 0, 3], dtype=torch.int64)
++
++    resolved_kv_slots = asu_resolve_kv_slots_single_req(
++        original_topk_indices,
++        actual_seq_len=6,
++        managed_prefix_len=4,
++        token_state=token_state,
++        asu_record_addr=asu_record_addr,
++        hbm_slot_of_token=hbm_slot_of_token,
++        slot_owner_token=slot_owner_token,
++        free_slot_stack=free_slot_stack,
++        free_slot_count=free_slot_count,
++        original_block_table=original_block_table,
++        original_kv_cache_0=original_kv_cache_0,
++        original_kv_cache_1=original_kv_cache_1,
++        managed_kv_cache_0=managed_kv_cache_0,
++        managed_kv_cache_1=managed_kv_cache_1,
++        block_size=2,
++    )
++
++    assert resolved_kv_slots.tolist() == [[[3, 3, 2]]]
++    assert free_slot_count.item() == 2
++    assert token_state.tolist() == [
++        ASU_ONLY,
++        HBM_RESIDENT,
++        ASU_ONLY,
++        ASU_ONLY,
++        TAIL_HBM,
++        HBM_RESIDENT,
++    ]
++    assert hbm_slot_of_token.tolist() == [-1, 3, -1, -1, -1, 2]
++    assert slot_owner_token.tolist() == [INVALID, INVALID, 5, 1]
++    torch.testing.assert_close(managed_kv_cache_0[3], original_kv_cache_0[4])
++    torch.testing.assert_close(managed_kv_cache_1[3], original_kv_cache_1[4])
++    torch.testing.assert_close(managed_kv_cache_0[2], original_kv_cache_0[7])
++    torch.testing.assert_close(managed_kv_cache_1[2], original_kv_cache_1[7])
++
++
++def test_resolver_reuses_resident_slots_without_consuming_free_slots():
++    original_topk_indices = torch.tensor([[2]], dtype=torch.int32)
++    original_kv_cache_0 = torch.arange(12, dtype=torch.float32).reshape(6, 2)
++    original_kv_cache_1 = torch.arange(18, dtype=torch.float32).reshape(6, 3)
++    managed_kv_cache_0 = torch.full((3, 2), -1.0)
++    managed_kv_cache_1 = torch.full((3, 3), -1.0)
++    managed_kv_cache_0[1] = torch.tensor([101.0, 102.0])
++    managed_kv_cache_1[1] = torch.tensor([201.0, 202.0, 203.0])
++    token_state = torch.tensor([ASU_ONLY, ASU_ONLY, HBM_RESIDENT],
++                               dtype=torch.int32)
++    asu_record_addr = torch.tensor([0, 1, 2], dtype=torch.int64)
++    hbm_slot_of_token = torch.tensor([-1, -1, 1], dtype=torch.int64)
++    slot_owner_token = torch.tensor([INVALID, 2, INVALID], dtype=torch.int64)
++    free_slot_stack = torch.tensor([0, 2, -1], dtype=torch.int64)
++    free_slot_count = torch.tensor(2, dtype=torch.int64)
++    original_block_table = torch.tensor([0, 1], dtype=torch.int64)
++
++    resolved_kv_slots = asu_resolve_kv_slots_single_req(
++        original_topk_indices,
++        actual_seq_len=3,
++        managed_prefix_len=3,
++        token_state=token_state,
++        asu_record_addr=asu_record_addr,
++        hbm_slot_of_token=hbm_slot_of_token,
++        slot_owner_token=slot_owner_token,
++        free_slot_stack=free_slot_stack,
++        free_slot_count=free_slot_count,
++        original_block_table=original_block_table,
++        original_kv_cache_0=original_kv_cache_0,
++        original_kv_cache_1=original_kv_cache_1,
++        managed_kv_cache_0=managed_kv_cache_0,
++        managed_kv_cache_1=managed_kv_cache_1,
++        block_size=2,
++    )
++
++    assert resolved_kv_slots.tolist() == [[1]]
++    assert free_slot_count.item() == 2
++    torch.testing.assert_close(managed_kv_cache_0[1],
++                               torch.tensor([101.0, 102.0]))
++    torch.testing.assert_close(managed_kv_cache_1[1],
++                               torch.tensor([201.0, 202.0, 203.0]))
+diff --git tests/ut/ops/test_asu_kv_resolver_structure.py tests/ut/ops/test_asu_kv_resolver_structure.py
+new file mode 100644
+index 00000000..cde6d75c
+--- /dev/null
++++ tests/ut/ops/test_asu_kv_resolver_structure.py
+@@ -0,0 +1,37 @@
++from pathlib import Path
++
++
++def _repo_root() -> Path:
++    return Path(__file__).resolve().parents[3]
++
++
++def test_asu_kv_resolver_uses_ascend_op_directory_structure():
++    repo_root = _repo_root()
++    op_root = repo_root / "csrc" / "asu_kv_resolver"
++
++    expected_files = [
++        op_root / "asu_kv_resolver_torch_adpt.h",
++        op_root / "op_host" / "CMakeLists.txt",
++        op_root / "op_host" / "asu_kv_resolver_def.cpp",
++        op_root / "op_host" / "asu_kv_resolver_infershape.cpp",
++        op_root / "op_host" / "asu_kv_resolver_tiling.cpp",
++        op_root / "op_host" / "asu_kv_resolver_tiling.h",
++        op_root / "op_kernel" / "asu_kv_resolver.cpp",
++    ]
++    for path in expected_files:
++        assert path.exists(), f"{path.relative_to(repo_root)} is missing"
++
++    assert not (repo_root / "csrc" / "kernels" /
++                "asu_kv_resolver.cpp").exists()
++
++
++def test_asu_kv_resolver_torch_adapter_calls_aclnn_op():
++    repo_root = _repo_root()
++    adapter = (
++        repo_root / "csrc" / "asu_kv_resolver" /
++        "asu_kv_resolver_torch_adpt.h"
++    ).read_text()
++
++    assert "EXEC_NPU_CMD(" in adapter
++    assert "aclnnAsuKvResolver" in adapter
++    assert "SetCustomHandler" not in adapter
+diff --git vllm_ascend/ops/asu_kv_resolver.py vllm_ascend/ops/asu_kv_resolver.py
+new file mode 100644
+index 00000000..eb625e81
+--- /dev/null
++++ vllm_ascend/ops/asu_kv_resolver.py
+@@ -0,0 +1,225 @@
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# This file is a part of the vllm-ascend project.
++#
++
++import torch
++
++INVALID = -1
++ASU_ONLY = 0
++HBM_RESIDENT = 1
++TAIL_HBM = 2
++
++
++def _scalar_tensor_value(tensor: torch.Tensor) -> int:
++    return int(tensor.reshape(-1)[0].item())
++
++
++def _set_scalar_tensor_value(tensor: torch.Tensor, value: int) -> None:
++    tensor.reshape(-1)[0] = value
++
++
++def _tensor_value(tensor: torch.Tensor, index: int) -> int:
++    return int(tensor.reshape(-1)[index].item())
++
++
++def _set_tensor_value(tensor: torch.Tensor, index: int, value: int) -> None:
++    tensor.reshape(-1)[index] = value
++
++
++def _check_slot_tensor(name: str, tensor: torch.Tensor) -> None:
++    if tensor.dim() < 1:
++        raise ValueError(f"{name} must have a slot dimension")
++
++
++def _check_kv_pair_shapes(
++    original_kv_cache_0: torch.Tensor,
++    original_kv_cache_1: torch.Tensor,
++    managed_kv_cache_0: torch.Tensor,
++    managed_kv_cache_1: torch.Tensor,
++) -> None:
++    _check_slot_tensor("original_kv_cache_0", original_kv_cache_0)
++    _check_slot_tensor("original_kv_cache_1", original_kv_cache_1)
++    _check_slot_tensor("managed_kv_cache_0", managed_kv_cache_0)
++    _check_slot_tensor("managed_kv_cache_1", managed_kv_cache_1)
++    if original_kv_cache_0.shape[1:] != managed_kv_cache_0.shape[1:]:
++        raise ValueError("original_kv_cache_0 and managed_kv_cache_0 must "
++                         "have matching per-slot shapes")
++    if original_kv_cache_1.shape[1:] != managed_kv_cache_1.shape[1:]:
++        raise ValueError("original_kv_cache_1 and managed_kv_cache_1 must "
++                         "have matching per-slot shapes")
++
++
++def _pop_free_slot(free_slot_stack: torch.Tensor,
++                   free_slot_count: torch.Tensor) -> int:
++    count = _scalar_tensor_value(free_slot_count)
++    if count <= 0:
++        raise RuntimeError("free_slot_stack does not have enough slots")
++
++    next_count = count - 1
++    slot = _tensor_value(free_slot_stack, next_count)
++    _set_scalar_tensor_value(free_slot_count, next_count)
++    return slot
++
++
++def _resolve_tail_source_slot(original_block_table: torch.Tensor,
++                              token_id: int,
++                              block_size: int) -> int:
++    logical_block = token_id // block_size
++    offset = token_id % block_size
++    block_table = original_block_table.reshape(-1)
++    if logical_block >= block_table.numel():
++        raise IndexError("original_block_table does not cover token_id "
++                         f"{token_id}")
++
++    physical_block = _tensor_value(block_table, logical_block)
++    return physical_block * block_size + offset
++
++
++def _copy_full_kv_pair(
++    original_kv_cache_0: torch.Tensor,
++    original_kv_cache_1: torch.Tensor,
++    source_slot: int,
++    managed_kv_cache_0: torch.Tensor,
++    managed_kv_cache_1: torch.Tensor,
++    managed_slot: int,
++) -> None:
++    if source_slot < 0 or source_slot >= original_kv_cache_0.size(0):
++        raise IndexError(f"source_slot {source_slot} is out of range")
++    if source_slot >= original_kv_cache_1.size(0):
++        raise IndexError(f"source_slot {source_slot} is out of range")
++    if managed_slot < 0 or managed_slot >= managed_kv_cache_0.size(0):
++        raise IndexError(f"managed_slot {managed_slot} is out of range")
++    if managed_slot >= managed_kv_cache_1.size(0):
++        raise IndexError(f"managed_slot {managed_slot} is out of range")
++
++    managed_kv_cache_0[managed_slot].copy_(original_kv_cache_0[source_slot])
++    managed_kv_cache_1[managed_slot].copy_(original_kv_cache_1[source_slot])
++
++
++def _install_token_to_managed_cache(
++    token_id: int,
++    source_slot: int,
++    token_state: torch.Tensor,
++    hbm_slot_of_token: torch.Tensor,
++    slot_owner_token: torch.Tensor,
++    free_slot_stack: torch.Tensor,
++    free_slot_count: torch.Tensor,
++    original_kv_cache_0: torch.Tensor,
++    original_kv_cache_1: torch.Tensor,
++    managed_kv_cache_0: torch.Tensor,
++    managed_kv_cache_1: torch.Tensor,
++) -> int:
++    slot = _pop_free_slot(free_slot_stack, free_slot_count)
++    _copy_full_kv_pair(
++        original_kv_cache_0,
++        original_kv_cache_1,
++        source_slot,
++        managed_kv_cache_0,
++        managed_kv_cache_1,
++        slot,
++    )
++    _set_tensor_value(token_state, token_id, HBM_RESIDENT)
++    _set_tensor_value(hbm_slot_of_token, token_id, slot)
++    _set_tensor_value(slot_owner_token, slot, token_id)
++    return slot
++
++
++def asu_resolve_kv_slots_single_req(
++    original_topk_indices: torch.Tensor,
++    actual_seq_len: int,
++    managed_prefix_len: int,
++    token_state: torch.Tensor,
++    asu_record_addr: torch.Tensor,
++    hbm_slot_of_token: torch.Tensor,
++    slot_owner_token: torch.Tensor,
++    free_slot_stack: torch.Tensor,
++    free_slot_count: torch.Tensor,
++    original_block_table: torch.Tensor,
++    original_kv_cache_0: torch.Tensor,
++    original_kv_cache_1: torch.Tensor,
++    managed_kv_cache_0: torch.Tensor,
++    managed_kv_cache_1: torch.Tensor,
++    block_size: int,
++) -> torch.Tensor:
++    del managed_prefix_len
++    if actual_seq_len < 0:
++        raise ValueError("actual_seq_len must be non-negative")
++    if block_size <= 0:
++        raise ValueError("block_size must be positive")
++
++    _check_kv_pair_shapes(
++        original_kv_cache_0,
++        original_kv_cache_1,
++        managed_kv_cache_0,
++        managed_kv_cache_1,
++    )
++    resolved_kv_slots = torch.empty(
++        original_topk_indices.shape,
++        device=original_topk_indices.device,
++        dtype=torch.int32,
++    )
++
++    topk_flat = original_topk_indices.reshape(-1)
++    resolved_flat = resolved_kv_slots.reshape(-1)
++    for index in range(topk_flat.numel()):
++        token_id = _tensor_value(topk_flat, index)
++        if token_id < 0 or token_id >= actual_seq_len:
++            raise IndexError(f"token_id {token_id} is out of range")
++
++        state = _tensor_value(token_state, token_id)
++        if state == HBM_RESIDENT:
++            slot = _tensor_value(hbm_slot_of_token, token_id)
++        elif state == ASU_ONLY:
++            source_slot = _tensor_value(asu_record_addr, token_id)
++            slot = _install_token_to_managed_cache(
++                token_id,
++                source_slot,
++                token_state,
++                hbm_slot_of_token,
++                slot_owner_token,
++                free_slot_stack,
++                free_slot_count,
++                original_kv_cache_0,
++                original_kv_cache_1,
++                managed_kv_cache_0,
++                managed_kv_cache_1,
++            )
++        elif state == TAIL_HBM:
++            source_slot = _resolve_tail_source_slot(
++                original_block_table,
++                token_id,
++                block_size,
++            )
++            slot = _install_token_to_managed_cache(
++                token_id,
++                source_slot,
++                token_state,
++                hbm_slot_of_token,
++                slot_owner_token,
++                free_slot_stack,
++                free_slot_count,
++                original_kv_cache_0,
++                original_kv_cache_1,
++                managed_kv_cache_0,
++                managed_kv_cache_1,
++            )
++        else:
++            raise ValueError(f"unsupported token_state {state} for token_id "
++                             f"{token_id}")
++
++        _set_tensor_value(resolved_flat, index, slot)
++
++    return resolved_kv_slots

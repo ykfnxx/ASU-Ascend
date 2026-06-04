@@ -1,0 +1,293 @@
+diff --git tests/e2e/nightly/single_node/ops/singlecard_ops/test_asu_decode_sfa_parity.py tests/e2e/nightly/single_node/ops/singlecard_ops/test_asu_decode_sfa_parity.py
+new file mode 100644
+index 00000000..822f7960
+--- /dev/null
++++ tests/e2e/nightly/single_node/ops/singlecard_ops/test_asu_decode_sfa_parity.py
+@@ -0,0 +1,287 @@
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# This file is a part of the vllm-ascend project.
++#
++
++import math
++
++import pytest
++import torch
++
++pytest.importorskip("torch_npu")
++
++from vllm_ascend.attention.asu_kv_cache_manager import (  # noqa: E402
++    ASUFullKVCacheManagerFunctional,
++)
++from vllm_ascend.utils import enable_custom_op  # noqa: E402
++
++_CUSTOM_OP_ENABLED = enable_custom_op()
++
++
++def _npu_available() -> bool:
++    try:
++        return hasattr(torch, "npu") and torch.npu.is_available()
++    except Exception:
++        return False
++
++
++def _has_ascend_op(name: str) -> bool:
++    try:
++        getattr(torch.ops._C_ascend, name)
++    except AttributeError:
++        return False
++    return True
++
++
++def _required_ops_registered() -> bool:
++    return all(
++        _has_ascend_op(name)
++        for name in (
++            "npu_lightning_indexer",
++            "npu_asu_resolve_kv_slots_single_req",
++            "npu_sparse_flash_attention",
++            "npu_sparse_flash_attention_asu",
++        )
++    )
++
++
++pytestmark = pytest.mark.skipif(
++    not _CUSTOM_OP_ENABLED
++    or not _npu_available()
++    or not _required_ops_registered(),
++    reason="requires Ascend NPU and ASU custom ops",
++)
++
++
++def _make_decode_case(dtype: torch.dtype = torch.bfloat16):
++    torch.manual_seed(2026)
++    torch.npu.manual_seed_all(2026)
++
++    device = torch.device("npu")
++    num_tokens = 1
++    actual_seq_len = 2048
++    block_size = 128
++    num_blocks = actual_seq_len // block_size
++    num_q_heads = 64
++    num_kv_heads = 1
++    qk_head_dim = 512
++    rope_head_dim = 64
++    index_head_dim = 128
++    sparse_count = actual_seq_len
++
++    block_table = torch.arange(
++        num_blocks - 1,
++        -1,
++        -1,
++        device=device,
++        dtype=torch.int32,
++    ).unsqueeze(0)
++    actual_seq_lengths_query = torch.tensor(
++        [num_tokens],
++        device=device,
++        dtype=torch.int32,
++    )
++    actual_seq_lengths_key = torch.tensor(
++        [actual_seq_len],
++        device=device,
++        dtype=torch.int32,
++    )
++
++    q_indexer = torch.randn(
++        (num_tokens, num_q_heads, index_head_dim),
++        device=device,
++        dtype=dtype,
++    )
++    indexer_key = torch.randn(
++        (num_blocks, block_size, num_kv_heads, index_head_dim),
++        device=device,
++        dtype=dtype,
++    )
++    weights = torch.ones(
++        (num_tokens, num_q_heads),
++        device=device,
++        dtype=dtype,
++    )
++    query = torch.randn(
++        (num_tokens, num_q_heads, qk_head_dim),
++        device=device,
++        dtype=dtype,
++    )
++    query_rope = torch.randn(
++        (num_tokens, num_q_heads, rope_head_dim),
++        device=device,
++        dtype=dtype,
++    )
++    kv_cache_0 = torch.randn(
++        (num_blocks, block_size, num_kv_heads, qk_head_dim),
++        device=device,
++        dtype=dtype,
++    )
++    kv_cache_1 = torch.randn(
++        (num_blocks, block_size, num_kv_heads, rope_head_dim),
++        device=device,
++        dtype=dtype,
++    )
++
++    return {
++        "actual_seq_len": actual_seq_len,
++        "actual_seq_lengths_key": actual_seq_lengths_key,
++        "actual_seq_lengths_query": actual_seq_lengths_query,
++        "block_size": block_size,
++        "block_table": block_table,
++        "indexer_key": indexer_key,
++        "kv_cache": (kv_cache_0, kv_cache_1, indexer_key),
++        "managed_prefix_len": actual_seq_len - num_tokens,
++        "q_indexer": q_indexer,
++        "query": query,
++        "query_rope": query_rope,
++        "scale_value": 1.0 / math.sqrt(qk_head_dim + rope_head_dim),
++        "sparse_count": sparse_count,
++        "weights": weights,
++    }
++
++
++def _run_lightning_indexer(case: dict) -> torch.Tensor:
++    return torch.ops._C_ascend.npu_lightning_indexer(
++        query=case["q_indexer"],
++        key=case["indexer_key"],
++        weights=case["weights"],
++        actual_seq_lengths_query=case["actual_seq_lengths_query"],
++        actual_seq_lengths_key=case["actual_seq_lengths_key"],
++        block_table=case["block_table"],
++        layout_query="TND",
++        layout_key="PA_BSND",
++        sparse_count=case["sparse_count"],
++        sparse_mode=3,
++    )
++
++
++def _run_origin_sfa(case: dict, topk_indices: torch.Tensor) -> torch.Tensor:
++    kv_cache_0, kv_cache_1, _ = case["kv_cache"]
++    return torch.ops._C_ascend.npu_sparse_flash_attention(
++        query=case["query"],
++        key=kv_cache_0,
++        value=kv_cache_0,
++        sparse_indices=topk_indices,
++        scale_value=case["scale_value"],
++        sparse_block_size=1,
++        block_table=case["block_table"],
++        actual_seq_lengths_query=case["actual_seq_lengths_query"],
++        actual_seq_lengths_kv=case["actual_seq_lengths_key"],
++        query_rope=case["query_rope"],
++        key_rope=kv_cache_1,
++        layout_query="TND",
++        layout_kv="PA_BSND",
++        sparse_mode=3,
++    )
++
++
++def _build_asu_context(case: dict):
++    manager = ASUFullKVCacheManagerFunctional.from_kv_caches(
++        {"layers.0.self_attn": case["kv_cache"]},
++        max_seq_len=case["actual_seq_len"],
++        block_size=case["block_size"],
++        managed_slot_count=case["actual_seq_len"],
++        enabled=True,
++    )
++    manager.reset_single_request(
++        req_id="decode-req-0",
++        actual_seq_len=case["actual_seq_len"],
++        managed_prefix_len=case["managed_prefix_len"],
++        original_block_table=case["block_table"],
++    )
++    return manager.get_layer_context("layers.0.self_attn")
++
++
++def _resolve_asu_slots(
++    case: dict,
++    context,
++    topk_indices: torch.Tensor,
++) -> torch.Tensor:
++    original_kv_cache_0, original_kv_cache_1 = (
++        context.original_kv_cache_views(case["kv_cache"])
++    )
++    return torch.ops._C_ascend.npu_asu_resolve_kv_slots_single_req(
++        original_topk_indices=topk_indices,
++        actual_seq_len=context.actual_seq_len,
++        managed_prefix_len=context.managed_prefix_len,
++        token_state=context.token_state,
++        asu_record_addr=context.asu_record_addr,
++        hbm_slot_of_token=context.hbm_slot_of_token,
++        slot_owner_token=context.slot_owner_token,
++        free_slot_stack=context.free_slot_stack,
++        free_slot_count=context.free_slot_count,
++        original_block_table=case["block_table"],
++        original_kv_cache_0=original_kv_cache_0,
++        original_kv_cache_1=original_kv_cache_1,
++        managed_kv_cache_0=context.managed_kv_cache_0,
++        managed_kv_cache_1=context.managed_kv_cache_1,
++        block_size=context.block_size,
++    )
++
++
++def _run_asu_sfa(
++    case: dict,
++    context,
++    topk_indices: torch.Tensor,
++    resolved_kv_slots: torch.Tensor,
++) -> torch.Tensor:
++    return torch.ops._C_ascend.npu_sparse_flash_attention_asu(
++        query=case["query"],
++        managed_key=context.managed_kv_cache_0,
++        managed_value=context.managed_kv_cache_0,
++        sparse_indices=topk_indices,
++        resolved_kv_slots=resolved_kv_slots,
++        scale_value=case["scale_value"],
++        sparse_block_size=1,
++        actual_seq_lengths_query=case["actual_seq_lengths_query"],
++        actual_seq_lengths_kv=case["actual_seq_lengths_key"],
++        query_rope=case["query_rope"],
++        managed_key_rope=context.managed_kv_cache_1,
++        layout_query="TND",
++        layout_kv="TND",
++        sparse_mode=3,
++    )
++
++
++@torch.inference_mode()
++def test_indexer_asu_management_sfa_matches_origin_sfa_decode():
++    case = _make_decode_case()
++    topk_indices = _run_lightning_indexer(case)
++
++    origin_output = _run_origin_sfa(case, topk_indices)
++
++    context = _build_asu_context(case)
++    resolved_kv_slots = _resolve_asu_slots(case, context, topk_indices)
++    asu_output = _run_asu_sfa(case, context, topk_indices, resolved_kv_slots)
++
++    assert resolved_kv_slots.shape == topk_indices.shape
++    torch.testing.assert_close(
++        asu_output.cpu(),
++        origin_output.cpu(),
++        rtol=2e-2,
++        atol=2e-2,
++    )
++
++    free_slot_count_after_first_resolve = int(context.free_slot_count.cpu().item())
++    resolved_kv_slots_again = _resolve_asu_slots(case, context, topk_indices)
++
++    assert int(context.free_slot_count.cpu().item()) == (
++        free_slot_count_after_first_resolve
++    )
++    torch.testing.assert_close(
++        resolved_kv_slots_again.cpu(),
++        resolved_kv_slots.cpu(),
++    )

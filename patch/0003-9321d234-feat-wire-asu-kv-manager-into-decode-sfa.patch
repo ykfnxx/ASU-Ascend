@@ -1,0 +1,630 @@
+diff --git tests/ut/ops/test_asu_decode_integration_structure.py tests/ut/ops/test_asu_decode_integration_structure.py
+new file mode 100644
+index 00000000..d9a6f6aa
+--- /dev/null
++++ tests/ut/ops/test_asu_decode_integration_structure.py
+@@ -0,0 +1,30 @@
++from pathlib import Path
++
++
++def _repo_root() -> Path:
++    return Path(__file__).resolve().parents[3]
++
++
++def test_model_runner_allocates_asu_manager_after_kv_cache_init():
++    model_runner = (
++        _repo_root() / "vllm_ascend" / "worker" / "model_runner_v1.py"
++    ).read_text()
++
++    assert "ASUFullKVCacheManagerFunctional" in model_runner
++    assert "self.asu_kv_cache_manager" in model_runner
++    assert "ASUFullKVCacheManagerFunctional.from_kv_caches" in model_runner
++    assert "attn_metadata_i.asu_kv_cache_manager" in model_runner
++
++
++def test_sfa_decode_path_has_asu_resolver_and_asu_sfa_branch():
++    sfa_v1 = (_repo_root() / "vllm_ascend" / "attention" /
++              "sfa_v1.py").read_text()
++
++    assert "asu_kv_cache_manager" in sfa_v1
++    assert "def _use_asu_kv_cache" in sfa_v1
++    assert "def _execute_asu_sparse_flash_attention_process" in sfa_v1
++    assert "npu_asu_resolve_kv_slots_single_req" in sfa_v1
++    assert "npu_sparse_flash_attention_asu" in sfa_v1
++    assert "npu_sparse_flash_attention(" in sfa_v1
++    assert "AscendAttentionState.DecodeOnly" in sfa_v1
++    assert "self.enable_dsa_cp" in sfa_v1
+diff --git tests/ut/ops/test_asu_kv_cache_manager.py tests/ut/ops/test_asu_kv_cache_manager.py
+new file mode 100644
+index 00000000..36afa5d9
+--- /dev/null
++++ tests/ut/ops/test_asu_kv_cache_manager.py
+@@ -0,0 +1,109 @@
++import importlib.util
++from pathlib import Path
++
++import torch
++
++
++def _load_asu_kv_cache_manager_module():
++    repo_root = Path(__file__).resolve().parents[3]
++    module_path = (
++        repo_root / "vllm_ascend" / "attention" /
++        "asu_kv_cache_manager.py"
++    )
++    spec = importlib.util.spec_from_file_location("asu_kv_cache_manager",
++                                                  module_path)
++    module = importlib.util.module_from_spec(spec)
++    assert spec.loader is not None
++    spec.loader.exec_module(module)
++    return module
++
++
++def test_asu_kv_cache_feature_gate_defaults_off(monkeypatch):
++    module = _load_asu_kv_cache_manager_module()
++
++    monkeypatch.delenv("VLLM_ASCEND_ENABLE_ASU_KV_CACHE", raising=False)
++    assert module.is_asu_kv_cache_enabled() is False
++
++    monkeypatch.setenv("VLLM_ASCEND_ENABLE_ASU_KV_CACHE", "1")
++    assert module.is_asu_kv_cache_enabled() is True
++
++
++def test_manager_allocates_per_layer_managed_cache_from_pa_cache():
++    module = _load_asu_kv_cache_manager_module()
++    original_kv_caches = {
++        "layers.0.self_attn": (
++            torch.zeros((2, 4, 1, 8), dtype=torch.bfloat16),
++            torch.zeros((2, 4, 1, 2), dtype=torch.bfloat16),
++            torch.zeros((2, 4, 1, 4), dtype=torch.bfloat16),
++        ),
++        "layers.1.self_attn": (
++            torch.zeros((2, 4, 1, 8), dtype=torch.bfloat16),
++            torch.zeros((2, 4, 1, 2), dtype=torch.bfloat16),
++            torch.zeros((2, 4, 1, 4), dtype=torch.bfloat16),
++        ),
++    }
++
++    manager = module.ASUFullKVCacheManagerFunctional.from_kv_caches(
++        original_kv_caches,
++        max_seq_len=8,
++        block_size=4,
++        managed_slot_count=6,
++        enabled=True,
++    )
++
++    layer0 = manager.get_layer_context("layers.0.self_attn")
++    layer1 = manager.get_layer_context("layers.1.self_attn")
++    assert layer0.managed_kv_cache_0.shape == (6, 1, 8)
++    assert layer0.managed_kv_cache_1.shape == (6, 1, 2)
++    assert layer0.managed_kv_cache_0.dtype is torch.bfloat16
++    assert layer1.managed_kv_cache_0.data_ptr() != layer0.managed_kv_cache_0.data_ptr()
++    assert layer0.free_slot_count.item() == 6
++    assert layer0.free_slot_stack.tolist() == [0, 1, 2, 3, 4, 5]
++
++
++def test_manager_resets_single_request_state_before_decode():
++    module = _load_asu_kv_cache_manager_module()
++    original_kv_caches = {
++        "layers.0.self_attn": (
++            torch.zeros((3, 4, 1, 8), dtype=torch.float16),
++            torch.zeros((3, 4, 1, 2), dtype=torch.float16),
++            torch.zeros((3, 4, 1, 4), dtype=torch.float16),
++        ),
++    }
++    manager = module.ASUFullKVCacheManagerFunctional.from_kv_caches(
++        original_kv_caches,
++        max_seq_len=12,
++        block_size=4,
++        managed_slot_count=12,
++        enabled=True,
++    )
++    original_block_table = torch.tensor([[2, 0, 1]], dtype=torch.int32)
++
++    manager.reset_single_request(
++        req_id="req-1",
++        actual_seq_len=6,
++        managed_prefix_len=4,
++        original_block_table=original_block_table,
++    )
++
++    layer = manager.get_layer_context("layers.0.self_attn")
++    assert layer.req_id == "req-1"
++    assert layer.actual_seq_len == 6
++    assert layer.managed_prefix_len == 4
++    assert layer.token_state[:8].tolist() == [
++        module.ASU_ONLY,
++        module.ASU_ONLY,
++        module.ASU_ONLY,
++        module.ASU_ONLY,
++        module.TAIL_HBM,
++        module.TAIL_HBM,
++        module.INVALID,
++        module.INVALID,
++    ]
++    assert layer.asu_record_addr[:4].tolist() == [8, 9, 10, 11]
++    assert layer.free_slot_count.item() == 12
++    assert layer.slot_owner_token[:3].tolist() == [
++        module.INVALID,
++        module.INVALID,
++        module.INVALID,
++    ]
+diff --git vllm_ascend/attention/asu_kv_cache_manager.py vllm_ascend/attention/asu_kv_cache_manager.py
+new file mode 100644
+index 00000000..5515ab26
+--- /dev/null
++++ vllm_ascend/attention/asu_kv_cache_manager.py
+@@ -0,0 +1,275 @@
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# This file is a part of the vllm-ascend project.
++#
++
++import os
++from dataclasses import dataclass
++
++import torch
++
++INVALID = -1
++ASU_ONLY = 0
++HBM_RESIDENT = 1
++TAIL_HBM = 2
++
++ASU_KV_CACHE_ENABLE_ENV = "VLLM_ASCEND_ENABLE_ASU_KV_CACHE"
++ASU_KV_CACHE_SLOT_COUNT_ENV = "VLLM_ASCEND_ASU_KV_CACHE_SLOTS"
++
++
++def is_asu_kv_cache_enabled() -> bool:
++    value = os.getenv(ASU_KV_CACHE_ENABLE_ENV, "")
++    return value.lower() in {"1", "true", "yes", "on"}
++
++
++def get_configured_managed_slot_count() -> int | None:
++    value = os.getenv(ASU_KV_CACHE_SLOT_COUNT_ENV)
++    if value is None or value == "":
++        return None
++    slot_count = int(value)
++    if slot_count <= 0:
++        raise ValueError(f"{ASU_KV_CACHE_SLOT_COUNT_ENV} must be positive")
++    return slot_count
++
++
++def _flatten_pa_cache(cache: torch.Tensor) -> torch.Tensor:
++    if cache.dim() < 2:
++        raise ValueError("PA cache must have block and block-size dimensions")
++    return cache.reshape(cache.shape[0] * cache.shape[1], *cache.shape[2:])
++
++
++@dataclass
++class ASULayerKVCacheContext:
++    layer_name: str
++    managed_kv_cache_0: torch.Tensor
++    managed_kv_cache_1: torch.Tensor
++    token_state: torch.Tensor
++    asu_record_addr: torch.Tensor
++    hbm_slot_of_token: torch.Tensor
++    slot_owner_token: torch.Tensor
++    free_slot_stack: torch.Tensor
++    free_slot_count: torch.Tensor
++    max_seq_len: int
++    managed_slot_count: int
++    block_size: int
++    req_id: str | None = None
++    actual_seq_len: int = 0
++    managed_prefix_len: int = 0
++
++    def original_kv_cache_views(
++        self,
++        kv_cache: tuple[torch.Tensor, ...],
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        return _flatten_pa_cache(kv_cache[0]), _flatten_pa_cache(kv_cache[1])
++
++    def reset_state(
++        self,
++        req_id: str,
++        actual_seq_len: int,
++        managed_prefix_len: int,
++        original_block_table: torch.Tensor,
++    ) -> None:
++        if actual_seq_len < 0:
++            raise ValueError("actual_seq_len must be non-negative")
++        if managed_prefix_len < 0:
++            raise ValueError("managed_prefix_len must be non-negative")
++        if managed_prefix_len > actual_seq_len:
++            raise ValueError("managed_prefix_len must not exceed actual_seq_len")
++        if actual_seq_len > self.max_seq_len:
++            raise RuntimeError("ASU max_seq_len does not cover actual_seq_len")
++
++        self.req_id = req_id
++        self.actual_seq_len = actual_seq_len
++        self.managed_prefix_len = managed_prefix_len
++
++        self.token_state.fill_(INVALID)
++        self.asu_record_addr.fill_(INVALID)
++        self.hbm_slot_of_token.fill_(INVALID)
++        self.slot_owner_token.fill_(INVALID)
++        self.free_slot_stack.copy_(
++            torch.arange(
++                self.managed_slot_count,
++                device=self.free_slot_stack.device,
++                dtype=self.free_slot_stack.dtype,
++            )
++        )
++        self.free_slot_count.reshape(-1)[0] = self.managed_slot_count
++
++        if managed_prefix_len > 0:
++            positions = torch.arange(
++                managed_prefix_len,
++                device=self.asu_record_addr.device,
++                dtype=torch.int64,
++            )
++            logical_blocks = torch.div(
++                positions,
++                self.block_size,
++                rounding_mode="floor",
++            )
++            offsets = positions % self.block_size
++            block_table = original_block_table.reshape(-1).to(
++                device=self.asu_record_addr.device,
++                dtype=torch.int64,
++            )
++            if logical_blocks[-1].item() >= block_table.numel():
++                raise RuntimeError("original_block_table does not cover ASU prefix")
++            source_slots = block_table[logical_blocks] * self.block_size + offsets
++            self.token_state[:managed_prefix_len].fill_(ASU_ONLY)
++            self.asu_record_addr[:managed_prefix_len].copy_(
++                source_slots.to(self.asu_record_addr.dtype)
++            )
++
++        if managed_prefix_len < actual_seq_len:
++            self.token_state[managed_prefix_len:actual_seq_len].fill_(TAIL_HBM)
++
++    def mark_decode_token(self, token_id: int) -> None:
++        if token_id < 0 or token_id >= self.max_seq_len:
++            raise RuntimeError("decode token_id is outside ASU max_seq_len")
++        self.actual_seq_len = max(self.actual_seq_len, token_id + 1)
++        self.token_state[token_id] = TAIL_HBM
++
++
++class ASUFullKVCacheManagerFunctional:
++    def __init__(
++        self,
++        enabled: bool,
++        max_seq_len: int,
++        block_size: int,
++        contexts: dict[str, ASULayerKVCacheContext],
++    ) -> None:
++        self.enabled = enabled
++        self.max_seq_len = max_seq_len
++        self.block_size = block_size
++        self._contexts = contexts
++
++    @classmethod
++    def from_kv_caches(
++        cls,
++        kv_caches: dict[str, tuple[torch.Tensor, ...]],
++        max_seq_len: int,
++        block_size: int,
++        managed_slot_count: int | None = None,
++        enabled: bool | None = None,
++    ) -> "ASUFullKVCacheManagerFunctional":
++        is_enabled = is_asu_kv_cache_enabled() if enabled is None else enabled
++        if not is_enabled:
++            return cls(False, max_seq_len, block_size, {})
++
++        if max_seq_len <= 0:
++            raise ValueError("max_seq_len must be positive")
++        if block_size <= 0:
++            raise ValueError("block_size must be positive")
++
++        slot_count = (
++            managed_slot_count or get_configured_managed_slot_count()
++            or max_seq_len
++        )
++        if slot_count <= 0:
++            raise ValueError("managed_slot_count must be positive")
++
++        contexts: dict[str, ASULayerKVCacheContext] = {}
++        for layer_name, kv_cache in kv_caches.items():
++            if not isinstance(kv_cache, tuple) or len(kv_cache) < 2:
++                continue
++            original_kv_cache_0 = kv_cache[0]
++            original_kv_cache_1 = kv_cache[1]
++            if original_kv_cache_0.dim() < 3 or original_kv_cache_1.dim() < 3:
++                continue
++
++            device = original_kv_cache_0.device
++            managed_kv_cache_0 = torch.empty(
++                (slot_count, *original_kv_cache_0.shape[2:]),
++                device=device,
++                dtype=original_kv_cache_0.dtype,
++            )
++            managed_kv_cache_1 = torch.empty(
++                (slot_count, *original_kv_cache_1.shape[2:]),
++                device=original_kv_cache_1.device,
++                dtype=original_kv_cache_1.dtype,
++            )
++
++            contexts[layer_name] = ASULayerKVCacheContext(
++                layer_name=layer_name,
++                managed_kv_cache_0=managed_kv_cache_0,
++                managed_kv_cache_1=managed_kv_cache_1,
++                token_state=torch.full(
++                    (max_seq_len,),
++                    INVALID,
++                    device=device,
++                    dtype=torch.int32,
++                ),
++                asu_record_addr=torch.full(
++                    (max_seq_len,),
++                    INVALID,
++                    device=device,
++                    dtype=torch.int32,
++                ),
++                hbm_slot_of_token=torch.full(
++                    (max_seq_len,),
++                    INVALID,
++                    device=device,
++                    dtype=torch.int32,
++                ),
++                slot_owner_token=torch.full(
++                    (slot_count,),
++                    INVALID,
++                    device=device,
++                    dtype=torch.int32,
++                ),
++                free_slot_stack=torch.arange(
++                    slot_count,
++                    device=device,
++                    dtype=torch.int32,
++                ),
++                free_slot_count=torch.tensor(
++                    slot_count,
++                    device=device,
++                    dtype=torch.int32,
++                ),
++                max_seq_len=max_seq_len,
++                managed_slot_count=slot_count,
++                block_size=block_size,
++            )
++
++        return cls(True, max_seq_len, block_size, contexts)
++
++    def has_layer(self, layer_name: str) -> bool:
++        return layer_name in self._contexts
++
++    def get_layer_context(self, layer_name: str) -> ASULayerKVCacheContext:
++        return self._contexts[layer_name]
++
++    def reset_single_request(
++        self,
++        req_id: str,
++        actual_seq_len: int,
++        managed_prefix_len: int,
++        original_block_table: torch.Tensor,
++    ) -> None:
++        if not self.enabled:
++            return
++        for context in self._contexts.values():
++            context.reset_state(
++                req_id,
++                actual_seq_len,
++                managed_prefix_len,
++                original_block_table,
++            )
++
++    def mark_decode_token(self, token_id: int) -> None:
++        if not self.enabled:
++            return
++        for context in self._contexts.values():
++            context.mark_decode_token(token_id)
+diff --git vllm_ascend/attention/sfa_v1.py vllm_ascend/attention/sfa_v1.py
+index 692566bf..74b8544e 100644
+--- vllm_ascend/attention/sfa_v1.py
++++ vllm_ascend/attention/sfa_v1.py
+@@ -22,6 +22,9 @@ from vllm.v1.kv_cache_interface import AttentionSpec
+ from vllm_ascend import envs
+ from vllm_ascend.ascend_config import get_ascend_config
+ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
++from vllm_ascend.attention.asu_kv_cache_manager import (
++    ASUFullKVCacheManagerFunctional,
++)
+ from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
+ from vllm_ascend.attention.attention_v1 import AscendAttentionState
+ from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata
+@@ -149,6 +152,9 @@ class AscendSFAMetadata:
+     num_decodes: int = 0
+     num_decode_tokens: int = 0
+     num_prefills: int = 0
++    asu_kv_cache_manager: ASUFullKVCacheManagerFunctional | None = None
++    asu_req_id: str | None = None
++    asu_num_reqs: int = 0
+ 
+ 
+ M = TypeVar("M", bound=AscendSFAMetadata)
+@@ -1024,6 +1030,96 @@ class AscendSFAImpl(MLAAttentionImpl):
+         )
+         return attn_output
+ 
++    def _use_asu_kv_cache(self, layer_name: str, attn_metadata: M) -> bool:
++        manager = getattr(attn_metadata, "asu_kv_cache_manager", None)
++        if manager is None or not manager.enabled:
++            return False
++        if not manager.has_layer(layer_name):
++            return False
++        if self.enable_dsa_cp:
++            return False
++        if attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
++            return False
++        if getattr(attn_metadata, "asu_num_reqs", 0) != 1:
++            return False
++        return attn_metadata.num_actual_tokens == 1
++
++    def _get_asu_actual_seq_len(self, attn_metadata: M) -> int:
++        if attn_metadata.seq_lens_cpu.numel() == 0:
++            raise RuntimeError("ASU decode requires seq_lens_cpu")
++        return int(attn_metadata.seq_lens_cpu.reshape(-1)[0].item())
++
++    def _prepare_asu_layer_context(self, layer_name: str, kv_cache, attn_metadata: M):
++        manager = attn_metadata.asu_kv_cache_manager
++        if manager is None:
++            raise RuntimeError("ASU KV cache manager is not attached")
++        context = manager.get_layer_context(layer_name)
++        actual_seq_len = self._get_asu_actual_seq_len(attn_metadata)
++        req_id = attn_metadata.asu_req_id or "__single_req__"
++
++        if context.req_id != req_id or context.actual_seq_len == 0 or actual_seq_len < context.actual_seq_len:
++            managed_prefix_len = max(0, actual_seq_len - attn_metadata.num_actual_tokens)
++            manager.reset_single_request(
++                req_id=req_id,
++                actual_seq_len=actual_seq_len,
++                managed_prefix_len=managed_prefix_len,
++                original_block_table=attn_metadata.block_table[:1],
++            )
++        elif actual_seq_len > context.actual_seq_len:
++            manager.mark_decode_token(actual_seq_len - 1)
++
++        return context
++
++    def _execute_asu_sparse_flash_attention_process(
++        self,
++        layer_name,
++        ql_nope,
++        q_pe,
++        kv_cache,
++        topk_indices,
++        attn_metadata,
++        actual_seq_lengths_query,
++        actual_seq_lengths_key,
++    ):
++        context = self._prepare_asu_layer_context(layer_name, kv_cache, attn_metadata)
++        original_kv_cache_0, original_kv_cache_1 = context.original_kv_cache_views(kv_cache)
++
++        resolved_kv_slots = torch.ops._C_ascend.npu_asu_resolve_kv_slots_single_req(
++            original_topk_indices=topk_indices,
++            actual_seq_len=context.actual_seq_len,
++            managed_prefix_len=context.managed_prefix_len,
++            token_state=context.token_state,
++            asu_record_addr=context.asu_record_addr,
++            hbm_slot_of_token=context.hbm_slot_of_token,
++            slot_owner_token=context.slot_owner_token,
++            free_slot_stack=context.free_slot_stack,
++            free_slot_count=context.free_slot_count,
++            original_block_table=attn_metadata.block_table[:1],
++            original_kv_cache_0=original_kv_cache_0,
++            original_kv_cache_1=original_kv_cache_1,
++            managed_kv_cache_0=context.managed_kv_cache_0,
++            managed_kv_cache_1=context.managed_kv_cache_1,
++            block_size=context.block_size,
++        )
++
++        attn_output = torch.ops._C_ascend.npu_sparse_flash_attention_asu(
++            query=ql_nope,
++            managed_key=context.managed_kv_cache_0,
++            managed_value=context.managed_kv_cache_0,
++            sparse_indices=topk_indices,
++            resolved_kv_slots=resolved_kv_slots,
++            scale_value=self.scale,
++            sparse_block_size=1,
++            actual_seq_lengths_query=actual_seq_lengths_query,
++            actual_seq_lengths_kv=actual_seq_lengths_key,
++            query_rope=q_pe,
++            managed_key_rope=context.managed_kv_cache_1,
++            layout_query="TND",
++            layout_kv="TND",
++            sparse_mode=3,
++        )
++        return attn_output
++
+     def forward(
+         self,
+         layer_name,
+@@ -1212,9 +1308,21 @@ class AscendSFAImpl(MLAAttentionImpl):
+             actual_seq_lengths_key=actual_seq_lengths_key,
+         )
+ 
+-        attn_output = self._execute_sparse_flash_attention_process(
+-            ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
+-        )
++        if self._use_asu_kv_cache(layer_name, attn_metadata):
++            attn_output = self._execute_asu_sparse_flash_attention_process(
++                layer_name,
++                ql_nope,
++                q_pe,
++                kv_cache,
++                topk_indices,
++                attn_metadata,
++                actual_seq_lengths_query,
++                actual_seq_lengths_key,
++            )
++        else:
++            attn_output = self._execute_sparse_flash_attention_process(
++                ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
++            )
+ 
+         attn_output = self._v_up_proj(attn_output)
+         weight_prefetch_method = get_weight_prefetch_method()
+diff --git vllm_ascend/worker/model_runner_v1.py vllm_ascend/worker/model_runner_v1.py
+index 5df036d1..662a549e 100644
+--- vllm_ascend/worker/model_runner_v1.py
++++ vllm_ascend/worker/model_runner_v1.py
+@@ -91,6 +91,10 @@ from vllm.v1.worker.utils import AttentionGroup
+ 
+ # yapf: enable
+ from vllm_ascend.ascend_config import get_ascend_config
++from vllm_ascend.attention.asu_kv_cache_manager import (
++    ASUFullKVCacheManagerFunctional,
++    is_asu_kv_cache_enabled,
++)
+ from vllm_ascend.attention.attention_v1 import AscendAttentionState
+ from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
+ 
+@@ -259,6 +263,7 @@ class NPUModelRunner(GPUModelRunner):
+ 
+         self.sampler = AscendSampler()
+         self.attn_state: AscendAttentionState | None = None
++        self.asu_kv_cache_manager: ASUFullKVCacheManagerFunctional | None = None
+ 
+         # Ascend-specific configurations
+         self.ascend_config = get_ascend_config()
+@@ -2180,6 +2185,14 @@ class NPUModelRunner(GPUModelRunner):
+                 assert isinstance(attn_metadata, list)
+                 attn_metadata_dict = attn_metadata[ubid]
+ 
++            if hasattr(attn_metadata_i, "asu_kv_cache_manager"):
++                attn_metadata_i.asu_kv_cache_manager = self.asu_kv_cache_manager
++                attn_metadata_i.asu_num_reqs = num_reqs
++                if num_reqs == 1 and self.input_batch.req_ids:
++                    attn_metadata_i.asu_req_id = self.input_batch.req_ids[0]
++                else:
++                    attn_metadata_i.asu_req_id = None
++
+             for layer_name in attn_group.layer_names:
+                 attn_metadata_dict[layer_name] = attn_metadata_i
+ 
+@@ -2666,6 +2679,13 @@ class NPUModelRunner(GPUModelRunner):
+             logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
+             kv_caches[layer_name] = kv_caches[target_layer_name]
+ 
++        self.asu_kv_cache_manager = ASUFullKVCacheManagerFunctional.from_kv_caches(
++            kv_caches,
++            max_seq_len=self.max_model_len,
++            block_size=self.cache_config.block_size,
++            enabled=self.use_sparse and is_asu_kv_cache_enabled(),
++        )
++
+         from vllm.v1.worker.utils import bind_kv_cache
+ 
+         num_attn_module = 2 if self.model_config.hf_text_config.model_type == "longcat_flash" else 1

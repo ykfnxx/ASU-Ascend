@@ -1,0 +1,110 @@
+#include "aicpu_api.h"
+
+#include <stdint.h>
+
+namespace {
+
+constexpr uint32_t INDEX_SIZE = 128U * 1024U;
+constexpr uint32_t SLOT_COUNT = 10U * 1024U;
+constexpr uint32_t FREE_SLOT_COUNT = 2U * 1024U;
+constexpr uint32_t QUERY_COUNT = 2U * 1024U;
+constexpr uint32_t PROTECTED_WORD_BITS = 64U;
+constexpr uint32_t PROTECTED_WORD_COUNT = (SLOT_COUNT + PROTECTED_WORD_BITS - 1U) / PROTECTED_WORD_BITS;
+constexpr int32_t NOT_FOUND = -1;
+
+struct AsuHbmIndexMaintainArgs {
+    uint64_t index;
+    uint64_t slotToIndex;
+    uint64_t freeSlots;
+    uint64_t freeHead;
+    uint64_t lastQuerySlots;
+    uint32_t reqNum;
+    uint32_t seed;
+};
+
+uint32_t Hash32(uint32_t x)
+{
+    x ^= x >> 16;
+    x *= 0x7feb352dU;
+    x ^= x >> 15;
+    x *= 0x846ca68bU;
+    x ^= x >> 16;
+    return x;
+}
+
+void ClearProtectedSlots(uint64_t* protectedSlots)
+{
+    for (uint32_t i = 0; i < PROTECTED_WORD_COUNT; ++i) {
+        protectedSlots[i] = 0ULL;
+    }
+}
+
+void MarkProtectedSlot(uint64_t* protectedSlots, int32_t slot)
+{
+    uint32_t slotId = static_cast<uint32_t>(slot);
+    protectedSlots[slotId / PROTECTED_WORD_BITS] |= 1ULL << (slotId % PROTECTED_WORD_BITS);
+}
+
+int IsProtectedSlot(const uint64_t* protectedSlots, uint32_t slot)
+{
+    return (protectedSlots[slot / PROTECTED_WORD_BITS] & (1ULL << (slot % PROTECTED_WORD_BITS))) != 0ULL;
+}
+
+void MaintainEviction(int32_t* index,
+                      int32_t* slotToIndex,
+                      int32_t* freeSlots,
+                      int32_t* freeHead,
+                      const int32_t* lastQuerySlots,
+                      uint32_t reqNum,
+                      uint32_t seed)
+{
+    uint64_t protectedSlots[PROTECTED_WORD_COUNT];
+
+    for (uint32_t reqId = 0; reqId < reqNum; ++reqId) {
+        int32_t* reqIndex = index + reqId * INDEX_SIZE;
+        int32_t* reqSlotToIndex = slotToIndex + reqId * SLOT_COUNT;
+        int32_t* reqFreeSlots = freeSlots + reqId * FREE_SLOT_COUNT;
+        const int32_t* reqLastQuerySlots = lastQuerySlots + reqId * QUERY_COUNT;
+        int32_t head = freeHead[reqId];
+        if (head == 0) {
+            continue;
+        }
+        uint32_t start = Hash32(seed ^ reqId) % SLOT_COUNT;
+
+        ClearProtectedSlots(protectedSlots);
+        for (uint32_t i = 0; i < QUERY_COUNT; ++i) {
+            MarkProtectedSlot(protectedSlots, reqLastQuerySlots[i]);
+        }
+
+        for (uint32_t slot = start; head > 0;) {
+            int32_t indexId = reqSlotToIndex[slot];
+            if (indexId != NOT_FOUND && IsProtectedSlot(protectedSlots, slot) == 0) {
+                reqSlotToIndex[slot] = NOT_FOUND;
+                reqIndex[static_cast<uint32_t>(indexId)] = NOT_FOUND;
+                --head;
+                reqFreeSlots[static_cast<uint32_t>(head)] = static_cast<int32_t>(slot);
+            }
+            ++slot;
+            if (slot == SLOT_COUNT) {
+                slot = 0;
+            }
+        }
+
+        freeHead[reqId] = head;
+    }
+}
+
+}  // namespace
+
+__global__ __aicpu__ uint32_t asu_hbm_index_maintain_kernel(void* args)
+{
+    auto* maintainArgs = reinterpret_cast<AsuHbmIndexMaintainArgs*>(args);
+    MaintainEviction(reinterpret_cast<int32_t*>(maintainArgs->index),
+                     reinterpret_cast<int32_t*>(maintainArgs->slotToIndex),
+                     reinterpret_cast<int32_t*>(maintainArgs->freeSlots),
+                     reinterpret_cast<int32_t*>(maintainArgs->freeHead),
+                     reinterpret_cast<const int32_t*>(maintainArgs->lastQuerySlots),
+                     maintainArgs->reqNum,
+                     maintainArgs->seed);
+    return 0;
+}

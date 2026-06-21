@@ -8,7 +8,7 @@ constexpr uint32_t INDEX_SIZE = 128U * 1024U;
 constexpr uint32_t SLOT_COUNT = 10U * 1024U;
 constexpr uint32_t FREE_SLOT_COUNT = 2U * 1024U;
 constexpr uint32_t QUERY_COUNT = 2U * 1024U;
-constexpr uint32_t TILE_LEN = 64U;
+constexpr uint32_t INDEX_TILE_LEN = 16U * 1024U;
 constexpr int32_t NOT_FOUND = -1;
 
 class KernelAsuHbmIndexLookup {
@@ -34,15 +34,15 @@ public:
         queryIndexGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(queryIndex), reqNum_ * QUERY_COUNT);
         slotOutGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(slotOut), reqNum_ * QUERY_COUNT);
 
-        pipe_->InitBuffer(queryBuf_, TILE_LEN * sizeof(int32_t));
-        pipe_->InitBuffer(indexBuf_, TILE_LEN * sizeof(int32_t));
-        pipe_->InitBuffer(outBuf_, TILE_LEN * sizeof(int32_t));
-        pipe_->InitBuffer(candidateBuf_, TILE_LEN * sizeof(int32_t));
-        pipe_->InitBuffer(deltaBuf_, TILE_LEN * sizeof(int32_t));
-        pipe_->InitBuffer(clampBuf_, TILE_LEN * sizeof(int32_t));
-        pipe_->InitBuffer(helperBuf_, TILE_LEN * sizeof(int32_t));
-        pipe_->InitBuffer(offsetBuf_, TILE_LEN * sizeof(uint32_t));
-        pipe_->InitBuffer(maskBuf_, TILE_LEN * sizeof(uint8_t));
+        pipe_->InitBuffer(queryBuf_, QUERY_COUNT * sizeof(int32_t));
+        pipe_->InitBuffer(indexBuf_, INDEX_TILE_LEN * sizeof(int32_t));
+        pipe_->InitBuffer(outBuf_, QUERY_COUNT * sizeof(int32_t));
+        pipe_->InitBuffer(candidateBuf_, QUERY_COUNT * sizeof(int32_t));
+        pipe_->InitBuffer(deltaBuf_, QUERY_COUNT * sizeof(int32_t));
+        pipe_->InitBuffer(clampBuf_, QUERY_COUNT * sizeof(int32_t));
+        pipe_->InitBuffer(helperBuf_, QUERY_COUNT * sizeof(int32_t));
+        pipe_->InitBuffer(offsetBuf_, QUERY_COUNT * sizeof(uint32_t));
+        pipe_->InitBuffer(maskBuf_, QUERY_COUNT * sizeof(uint8_t));
     }
 
     __aicore__ inline void Process()
@@ -63,14 +63,18 @@ public:
         auto offsetTileU32 = offsetBuf_.Get<uint32_t>();
         auto maskTile = maskBuf_.Get<uint8_t>();
 
-        queryTile.SetSize(TILE_LEN);
-        indexTile.SetSize(TILE_LEN);
-        outTile.SetSize(TILE_LEN);
-        deltaTile.SetSize(TILE_LEN);
-        clampTile.SetSize(TILE_LEN);
-        helperTile.SetSize(TILE_LEN);
-        offsetTile.SetSize(TILE_LEN);
-        maskTile.SetSize(TILE_LEN);
+        queryTile.SetSize(QUERY_COUNT);
+        indexTile.SetSize(INDEX_TILE_LEN);
+        indexTileFloat.SetSize(INDEX_TILE_LEN);
+        outTile.SetSize(QUERY_COUNT);
+        outTileFloat.SetSize(QUERY_COUNT);
+        candidateTileFloat.SetSize(QUERY_COUNT);
+        deltaTile.SetSize(QUERY_COUNT);
+        clampTile.SetSize(QUERY_COUNT);
+        helperTile.SetSize(QUERY_COUNT);
+        offsetTile.SetSize(QUERY_COUNT);
+        offsetTileU32.SetSize(QUERY_COUNT);
+        maskTile.SetSize(QUERY_COUNT);
 
         for (uint32_t reqId = coreId; reqId < reqNum_; reqId += blockNum) {
             uint32_t indexReqBase = reqId * INDEX_SIZE;
@@ -79,52 +83,49 @@ public:
             uint32_t queryReqBase = reqId * QUERY_COUNT;
             int32_t freeHead = freeHeadGm_.GetValue(reqId);
 
-            for (uint32_t queryBase = 0; queryBase < QUERY_COUNT; queryBase += TILE_LEN) {
-                DataCopy(queryTile, queryIndexGm_[queryReqBase + queryBase], TILE_LEN);
-                Duplicate(outTile, NOT_FOUND, TILE_LEN);
+            DataCopy(queryTile, queryIndexGm_[queryReqBase], QUERY_COUNT);
+            Duplicate(outTile, NOT_FOUND, QUERY_COUNT);
+            PipeBarrier<PIPE_ALL>();
+
+            for (uint32_t indexBase = 0; indexBase < INDEX_SIZE; indexBase += INDEX_TILE_LEN) {
+                DataCopy(indexTile, indexGm_[indexReqBase + indexBase], INDEX_TILE_LEN);
                 PipeBarrier<PIPE_ALL>();
 
-                for (uint32_t indexBase = 0; indexBase < INDEX_SIZE; indexBase += TILE_LEN) {
-                    DataCopy(indexTile, indexGm_[indexReqBase + indexBase], TILE_LEN);
-                    PipeBarrier<PIPE_ALL>();
+                Adds(deltaTile, queryTile, -static_cast<int32_t>(indexBase), QUERY_COUNT);
+                Relu(clampTile, deltaTile, QUERY_COUNT);
+                Adds(helperTile, clampTile, -static_cast<int32_t>(INDEX_TILE_LEN - 1U), QUERY_COUNT);
+                Relu(helperTile, helperTile, QUERY_COUNT);
+                Muls(helperTile, helperTile, static_cast<int32_t>(-1), QUERY_COUNT);
+                Add(clampTile, clampTile, helperTile, QUERY_COUNT);
 
-                    Adds(deltaTile, queryTile, -static_cast<int32_t>(indexBase), TILE_LEN);
-                    Relu(clampTile, deltaTile, TILE_LEN);
-                    Adds(helperTile, clampTile, -static_cast<int32_t>(TILE_LEN - 1U), TILE_LEN);
-                    Relu(helperTile, helperTile, TILE_LEN);
-                    Muls(helperTile, helperTile, static_cast<int32_t>(-1), TILE_LEN);
-                    Add(clampTile, clampTile, helperTile, TILE_LEN);
+                Muls(offsetTile, clampTile, static_cast<int32_t>(sizeof(int32_t)), QUERY_COUNT);
+                Muls(helperTile, clampTile, static_cast<int32_t>(-1), QUERY_COUNT);
+                Add(helperTile, helperTile, deltaTile, QUERY_COUNT);
+                CompareScalar(maskTile, helperTile, static_cast<int32_t>(0), CMPMODE::EQ, QUERY_COUNT);
 
-                    Muls(offsetTile, clampTile, static_cast<int32_t>(sizeof(int32_t)), TILE_LEN);
-                    Muls(helperTile, clampTile, static_cast<int32_t>(-1), TILE_LEN);
-                    Add(helperTile, helperTile, deltaTile, TILE_LEN);
-                    CompareScalar(maskTile, helperTile, static_cast<int32_t>(0), CMPMODE::EQ, TILE_LEN);
-
-                    Gather(candidateTileFloat, indexTileFloat, offsetTileU32, 0, TILE_LEN);
-                    Select(outTileFloat, maskTile, candidateTileFloat, outTileFloat,
-                           SELMODE::VSEL_TENSOR_TENSOR_MODE, TILE_LEN);
-                    PipeBarrier<PIPE_ALL>();
-                }
-
-                for (uint32_t i = 0; i < TILE_LEN; ++i) {
-                    int32_t slot = outTile.GetValue(i);
-                    if (slot == NOT_FOUND) {
-                        int32_t indexId = queryTile.GetValue(i);
-                        slot = indexGm_.GetValue(indexReqBase + static_cast<uint32_t>(indexId));
-                        if (slot == NOT_FOUND) {
-                            slot = freeSlotsGm_.GetValue(freeReqBase + static_cast<uint32_t>(freeHead));
-                            ++freeHead;
-                            indexGm_.SetValue(indexReqBase + static_cast<uint32_t>(indexId), slot);
-                            slotToIndexGm_.SetValue(slotReqBase + static_cast<uint32_t>(slot), indexId);
-                        }
-                        outTile.SetValue(i, slot);
-                    }
-                }
-
+                Gather(candidateTileFloat, indexTileFloat, offsetTileU32, 0, QUERY_COUNT);
+                Select(outTileFloat, maskTile, candidateTileFloat, outTileFloat,
+                       SELMODE::VSEL_TENSOR_TENSOR_MODE, QUERY_COUNT);
                 PipeBarrier<PIPE_ALL>();
-                DataCopy(slotOutGm_[queryReqBase + queryBase], outTile, TILE_LEN);
             }
 
+            for (uint32_t i = 0; i < QUERY_COUNT; ++i) {
+                int32_t slot = outTile.GetValue(i);
+                if (slot == NOT_FOUND) {
+                    int32_t indexId = queryTile.GetValue(i);
+                    slot = indexGm_.GetValue(indexReqBase + static_cast<uint32_t>(indexId));
+                    if (slot == NOT_FOUND) {
+                        slot = freeSlotsGm_.GetValue(freeReqBase + static_cast<uint32_t>(freeHead));
+                        ++freeHead;
+                        indexGm_.SetValue(indexReqBase + static_cast<uint32_t>(indexId), slot);
+                        slotToIndexGm_.SetValue(slotReqBase + static_cast<uint32_t>(slot), indexId);
+                    }
+                    outTile.SetValue(i, slot);
+                }
+            }
+
+            PipeBarrier<PIPE_ALL>();
+            DataCopy(slotOutGm_[queryReqBase], outTile, QUERY_COUNT);
             freeHeadGm_.SetValue(reqId, freeHead);
         }
     }
@@ -177,7 +178,12 @@ extern "C" void asu_hbm_index_lookup_do(uint32_t blockDim,
                                          uint32_t reqNum)
 {
 #ifndef ASCENDC_CPU_DEBUG
-    asu_hbm_index_lookup<<<blockDim, nullptr, stream>>>(index, slotToIndex, freeSlots,
-                                                        freeHead, queryIndex, slotOut, reqNum);
+    asu_hbm_index_lookup<<<blockDim, nullptr, stream>>>((GM_ADDR)index,
+                                                        (GM_ADDR)slotToIndex,
+                                                        (GM_ADDR)freeSlots,
+                                                        (GM_ADDR)freeHead,
+                                                        (GM_ADDR)queryIndex,
+                                                        (GM_ADDR)slotOut,
+                                                        reqNum);
 #endif
 }

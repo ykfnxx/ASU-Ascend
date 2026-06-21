@@ -1,0 +1,75 @@
+[
+  {
+    "op": "AsuHbmIndexMaintain",
+    "input_desc": [
+      {
+        "name": "index",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["int32"]
+      },
+      {
+        "name": "slotToIndex",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["int32"]
+      },
+      {
+        "name": "freeSlots",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["int32"]
+      },
+      {
+        "name": "freeHead",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["int32"]
+      },
+      {
+        "name": "lastQuerySlots",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["int32"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "indexOut",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["int32"]
+      },
+      {
+        "name": "slotToIndexOut",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["int32"]
+      },
+      {
+        "name": "freeSlotsOut",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["int32"]
+      },
+      {
+        "name": "freeHeadOut",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["int32"]
+      }
+    ],
+    "attr": [
+      {
+        "name": "reqNum",
+        "param_type": "required",
+        "type": "int"
+      },
+      {
+        "name": "seed",
+        "param_type": "required",
+        "type": "int"
+      }
+    ]
+  }
+]

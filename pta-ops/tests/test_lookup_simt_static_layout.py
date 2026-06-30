@@ -17,6 +17,7 @@ def test_lookup_simt_pta_tree_exists():
         "include/asu_hbm_index_lookup_simt_constants.h",
         "src/asu_hbm_index_lookup_simt_kernel.cpp",
         "src/asu_hbm_index_lookup_simt_torch.cpp",
+        "scripts/bench_lookup_simt.py",
         "scripts/validate_lookup_simt.py",
     ]
 
@@ -78,3 +79,22 @@ def test_lookup_simt_build_files_target_ascend_950_pta():
     assert "SOC_VERSION" in build
     assert "PTA" in readme
     assert "Ascend 950" in readme
+
+
+def test_lookup_simt_benchmark_preloads_fresh_npu_states():
+    bench = read("scripts/bench_lookup_simt.py")
+
+    for token in [
+        "default=100",
+        "default=50",
+        "default=0.10",
+        "preload_benchmark_states",
+        "to_npu(torch, case.index)",
+        "torch.npu.synchronize()",
+        "time.perf_counter()",
+        "elapsed_time",
+        "expected_lookup_allocate",
+        "unique_misses_per_req",
+        "outputs.append",
+    ]:
+        assert token in bench

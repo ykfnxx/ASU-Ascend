@@ -11,7 +11,7 @@ __simt_vf__ __launch_bounds__(ASU_HBM_SIMT_THREADS) inline void AsuHbmIndexLooku
     __gm__ int32_t* index,
     __gm__ int32_t* slot_to_index,
     __gm__ int32_t* free_slots,
-    __gm__ int32_t* free_head,
+    __gm__ int32_t* alloc_count,
     __gm__ int32_t* query_index,
     __gm__ int32_t* slot_out,
     uint32_t req_id)
@@ -28,33 +28,26 @@ __simt_vf__ __launch_bounds__(ASU_HBM_SIMT_THREADS) inline void AsuHbmIndexLooku
     const uint32_t simt_block_id = static_cast<uint32_t>(blockIdx.x);
     const uint32_t linear_thread_id = thread_id + simt_block_id * thread_count;
 
-    for (uint32_t pos = linear_thread_id; pos < ASU_HBM_QUERY_COUNT; pos += thread_count) {
-        const int32_t index_id = req_query_index[pos];
-        __gm__ int32_t* slot_ptr = req_index + static_cast<uint32_t>(index_id);
-        const int32_t slot = *slot_ptr;
-        if (slot == ASU_HBM_NOT_FOUND) {
-            (void)asc_atomic_cas(slot_ptr, ASU_HBM_NOT_FOUND, ASU_HBM_CLAIMING);
-        }
+    if (thread_id == 0U && simt_block_id == 0U) {
+        alloc_count[req_id] = 0;
     }
 
     asc_threadfence_block();
     asc_syncthreads();
 
-    if (thread_id == 0U && simt_block_id == 0U) {
-        int32_t head = free_head[req_id];
-        for (uint32_t pos = 0; pos < ASU_HBM_QUERY_COUNT; ++pos) {
-            const int32_t index_id = req_query_index[pos];
-            __gm__ int32_t* slot_ptr = req_index + static_cast<uint32_t>(index_id);
-            int32_t slot = *slot_ptr;
-
-            if (slot == ASU_HBM_CLAIMING) {
-                slot = req_free_slots[static_cast<uint32_t>(head)];
-                ++head;
+    for (uint32_t pos = linear_thread_id; pos < ASU_HBM_QUERY_COUNT; pos += thread_count) {
+        const int32_t index_id = req_query_index[pos];
+        __gm__ int32_t* slot_ptr = req_index + static_cast<uint32_t>(index_id);
+        const int32_t slot = *slot_ptr;
+        if (slot == ASU_HBM_NOT_FOUND) {
+            const int32_t old_slot = asc_atomic_cas(slot_ptr, ASU_HBM_NOT_FOUND, ASU_HBM_CLAIMING);
+            if (old_slot == ASU_HBM_NOT_FOUND) {
+                const int32_t rank = asc_atomic_add(alloc_count + req_id, 1);
+                const int32_t slot = req_free_slots[static_cast<uint32_t>(rank)];
                 *slot_ptr = slot;
                 req_slot_to_index[static_cast<uint32_t>(slot)] = index_id;
             }
         }
-        free_head[req_id] = head;
     }
 
     asc_threadfence_block();
@@ -71,7 +64,7 @@ __simt_vf__ __launch_bounds__(ASU_HBM_SIMT_THREADS) inline void AsuHbmIndexLooku
 extern "C" __global__ __aicore__ void asu_hbm_index_lookup_simt_kernel(GM_ADDR index,
                                                                         GM_ADDR slot_to_index,
                                                                         GM_ADDR free_slots,
-                                                                        GM_ADDR free_head,
+                                                                        GM_ADDR alloc_count,
                                                                         GM_ADDR query_index,
                                                                         GM_ADDR slot_out,
                                                                         uint32_t req_num)
@@ -82,11 +75,11 @@ extern "C" __global__ __aicore__ void asu_hbm_index_lookup_simt_kernel(GM_ADDR i
     }
 
     asc_vf_call<AsuHbmIndexLookupSimt>(
-        dim3{ASU_HBM_SIMT_THREADS, 1U, 1U},
+        dim3(ASU_HBM_SIMT_THREADS),
         reinterpret_cast<__gm__ int32_t*>(index),
         reinterpret_cast<__gm__ int32_t*>(slot_to_index),
         reinterpret_cast<__gm__ int32_t*>(free_slots),
-        reinterpret_cast<__gm__ int32_t*>(free_head),
+        reinterpret_cast<__gm__ int32_t*>(alloc_count),
         reinterpret_cast<__gm__ int32_t*>(query_index),
         reinterpret_cast<__gm__ int32_t*>(slot_out),
         req_id);
@@ -96,7 +89,7 @@ extern "C" void asu_hbm_index_lookup_simt_do(void* stream,
                                              void* index,
                                              void* slot_to_index,
                                              void* free_slots,
-                                             void* free_head,
+                                             void* alloc_count,
                                              void* query_index,
                                              void* slot_out,
                                              uint32_t req_num)
@@ -106,7 +99,7 @@ extern "C" void asu_hbm_index_lookup_simt_do(void* stream,
         reinterpret_cast<GM_ADDR>(index),
         reinterpret_cast<GM_ADDR>(slot_to_index),
         reinterpret_cast<GM_ADDR>(free_slots),
-        reinterpret_cast<GM_ADDR>(free_head),
+        reinterpret_cast<GM_ADDR>(alloc_count),
         reinterpret_cast<GM_ADDR>(query_index),
         reinterpret_cast<GM_ADDR>(slot_out),
         req_num);

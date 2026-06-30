@@ -15,7 +15,7 @@ extern "C" void asu_hbm_index_lookup_simt_do(void* stream,
                                              void* index,
                                              void* slot_to_index,
                                              void* free_slots,
-                                             void* free_head,
+                                             void* alloc_count,
                                              void* query_index,
                                              void* slot_out,
                                              uint32_t req_num);

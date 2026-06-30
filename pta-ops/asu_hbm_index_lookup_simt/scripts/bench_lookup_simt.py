@@ -19,10 +19,10 @@ sys.path.insert(0, str(OPS_SCRIPTS_DIR))
 from asu_hbm_index_common import (  # noqa: E402
     FREE_SLOT_COUNT,
     INDEX_SIZE,
+    NOT_FOUND,
     QUERY_COUNT,
     RESIDENT_SLOT_COUNT,
     SLOT_COUNT,
-    expected_lookup_allocate,
     make_index_case,
     require_numpy,
     require_runtime,
@@ -35,7 +35,6 @@ class BenchmarkState:
     index: object
     slot_to_index: object
     free_slots: object
-    free_head: object
     query_index: object
 
 
@@ -138,7 +137,6 @@ def preload_benchmark_states(torch, req_num: int, miss_ratio: float, count: int,
                 index=to_npu(torch, case.index),
                 slot_to_index=to_npu(torch, case.slot_to_index),
                 free_slots=to_npu(torch, case.free_slots),
-                free_head=to_npu(torch, case.free_head),
                 query_index=to_npu(torch, case.query_index),
             )
         )
@@ -149,7 +147,7 @@ def preload_benchmark_states(torch, req_num: int, miss_ratio: float, count: int,
 def estimate_state_bytes(req_num: int) -> int:
     int32_bytes = 4
     per_req = INDEX_SIZE + SLOT_COUNT + FREE_SLOT_COUNT + QUERY_COUNT
-    return (req_num * per_req + req_num) * int32_bytes
+    return req_num * per_req * int32_bytes
 
 
 def call_lookup(module: ModuleType, state: BenchmarkState, req_num: int):
@@ -157,29 +155,54 @@ def call_lookup(module: ModuleType, state: BenchmarkState, req_num: int):
         state.index,
         state.slot_to_index,
         state.free_slots,
-        state.free_head,
         state.query_index,
         req_num,
     )
 
 
+def assert_lookup_semantics(slot_out, index_before, slot_to_index, free_slots, query_index, index_after) -> int:
+    unique_misses = 0
+    for req_id in range(query_index.shape[0]):
+        assigned_slots = set()
+        free_slot_set = {int(slot) for slot in free_slots[req_id]}
+        for index_id_np in set(query_index[req_id].tolist()):
+            index_id = int(index_id_np)
+            before_slot = int(index_before[req_id, index_id])
+            after_slot = int(index_after[req_id, index_id])
+            if before_slot == NOT_FOUND:
+                unique_misses += 1
+                assert after_slot != NOT_FOUND, (req_id, index_id)
+                assert after_slot in free_slot_set, (req_id, index_id, after_slot)
+                assert after_slot not in assigned_slots, (req_id, index_id, after_slot)
+                assert int(slot_to_index[req_id, after_slot]) == index_id, (req_id, index_id, after_slot)
+                assigned_slots.add(after_slot)
+            else:
+                assert after_slot == before_slot, (req_id, index_id, before_slot, after_slot)
+
+        for pos, index_id_np in enumerate(query_index[req_id]):
+            index_id = int(index_id_np)
+            assert int(slot_out[req_id, pos]) == int(index_after[req_id, index_id]), (req_id, pos, index_id)
+    return unique_misses
+
+
 def verify_one_state(torch, module: ModuleType, req_num: int, miss_ratio: float, seed: int, shuffle: bool) -> None:
-    np = require_numpy()
     case = make_ratio_case(req_num, miss_ratio, seed, 0, shuffle)
-    expected = expected_lookup_allocate(case)
     state = BenchmarkState(
         index=to_npu(torch, case.index),
         slot_to_index=to_npu(torch, case.slot_to_index),
         free_slots=to_npu(torch, case.free_slots),
-        free_head=to_npu(torch, case.free_head),
         query_index=to_npu(torch, case.query_index),
     )
     slot_out = call_lookup(module, state, req_num)
     torch.npu.synchronize()
-    np.testing.assert_array_equal(slot_out.cpu().numpy().reshape(req_num, QUERY_COUNT), expected.slot_out)
-    np.testing.assert_array_equal(state.index.cpu().numpy(), expected.index)
-    np.testing.assert_array_equal(state.slot_to_index.cpu().numpy(), expected.slot_to_index)
-    np.testing.assert_array_equal(state.free_head.cpu().numpy(), expected.free_head)
+    assert_lookup_semantics(
+        slot_out.cpu().numpy().reshape(req_num, QUERY_COUNT),
+        case.index,
+        state.slot_to_index.cpu().numpy(),
+        case.free_slots,
+        case.query_index,
+        state.index.cpu().numpy(),
+    )
 
 
 def run_states(torch, module: ModuleType, states: Sequence[BenchmarkState], req_num: int):

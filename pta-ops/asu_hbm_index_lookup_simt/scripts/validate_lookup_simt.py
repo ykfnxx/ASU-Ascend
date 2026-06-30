@@ -14,10 +14,9 @@ OPS_SCRIPTS_DIR = REPO_ROOT / "ops" / "scripts"
 sys.path.insert(0, str(OPS_SCRIPTS_DIR))
 
 from asu_hbm_index_common import (  # noqa: E402
+    NOT_FOUND,
     QUERY_COUNT,
-    expected_lookup_allocate,
     make_index_case,
-    require_numpy,
     require_runtime,
     to_npu,
 )
@@ -64,9 +63,33 @@ def make_npu_tensors(torch, case):
         "index": to_npu(torch, case.index),
         "slot_to_index": to_npu(torch, case.slot_to_index),
         "free_slots": to_npu(torch, case.free_slots),
-        "free_head": to_npu(torch, case.free_head),
         "query_index": to_npu(torch, case.query_index),
     }
+
+
+def assert_lookup_semantics(slot_out, index_before, slot_to_index, free_slots, query_index, index_after) -> int:
+    unique_misses = 0
+    for req_id in range(query_index.shape[0]):
+        assigned_slots = set()
+        free_slot_set = {int(slot) for slot in free_slots[req_id]}
+        for index_id_np in set(query_index[req_id].tolist()):
+            index_id = int(index_id_np)
+            before_slot = int(index_before[req_id, index_id])
+            after_slot = int(index_after[req_id, index_id])
+            if before_slot == NOT_FOUND:
+                unique_misses += 1
+                assert after_slot != NOT_FOUND, (req_id, index_id)
+                assert after_slot in free_slot_set, (req_id, index_id, after_slot)
+                assert after_slot not in assigned_slots, (req_id, index_id, after_slot)
+                assert int(slot_to_index[req_id, after_slot]) == index_id, (req_id, index_id, after_slot)
+                assigned_slots.add(after_slot)
+            else:
+                assert after_slot == before_slot, (req_id, index_id, before_slot, after_slot)
+
+        for pos, index_id_np in enumerate(query_index[req_id]):
+            index_id = int(index_id_np)
+            assert int(slot_out[req_id, pos]) == int(index_after[req_id, index_id]), (req_id, pos, index_id)
+    return unique_misses
 
 
 def main() -> None:
@@ -74,28 +97,29 @@ def main() -> None:
     torch = require_runtime(args.device)
     module = load_extension(args.module_path, args.build_dir)
     case = make_index_case(args.req_num, args.pattern)
-    expected = expected_lookup_allocate(case)
     tensors = make_npu_tensors(torch, case)
 
     slot_out = module.asu_hbm_index_lookup_simt(
         tensors["index"],
         tensors["slot_to_index"],
         tensors["free_slots"],
-        tensors["free_head"],
         tensors["query_index"],
         args.req_num,
     )
     torch.npu.synchronize()
 
-    np = require_numpy()
-    np.testing.assert_array_equal(slot_out.cpu().numpy().reshape(args.req_num, QUERY_COUNT), expected.slot_out)
-    np.testing.assert_array_equal(tensors["index"].cpu().numpy(), expected.index)
-    np.testing.assert_array_equal(tensors["slot_to_index"].cpu().numpy(), expected.slot_to_index)
-    np.testing.assert_array_equal(tensors["free_head"].cpu().numpy(), expected.free_head)
+    unique_misses = assert_lookup_semantics(
+        slot_out.cpu().numpy().reshape(args.req_num, QUERY_COUNT),
+        case.index,
+        tensors["slot_to_index"].cpu().numpy(),
+        case.free_slots,
+        case.query_index,
+        tensors["index"].cpu().numpy(),
+    )
 
     print(
         "PASS lookup_simt: req_num={} pattern={} unique_misses={}".format(
-            args.req_num, args.pattern, int(expected.free_head.sum())
+            args.req_num, args.pattern, unique_misses
         )
     )
 

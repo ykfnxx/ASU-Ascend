@@ -61,11 +61,34 @@ def test_lookup_simt_constants_and_launcher_symbols():
     assert "asc_vf_call" in kernel
     assert "asc_syncthreads" in kernel
     assert "asc_atomic_cas" in kernel
+    assert "asc_atomic_add" in kernel
     assert "ASU_HBM_CLAIMING" in kernel
+    assert "alloc_count" in kernel
+    assert "alloc_count = at::empty" in wrapper
     assert "threadIdx.x" in kernel
     assert "blockIdx.x" in kernel
     assert "PYBIND11_MODULE" in wrapper
     assert "asu_hbm_index_lookup_simt" in wrapper
+
+
+def test_lookup_simt_uses_stateless_parallel_allocation():
+    header = read("include/asu_hbm_index_lookup_simt_constants.h")
+    kernel = read("src/asu_hbm_index_lookup_simt_kernel.cpp")
+    wrapper = read("src/asu_hbm_index_lookup_simt_torch.cpp")
+    readme = read("README.md")
+    validate = read("scripts/validate_lookup_simt.py")
+    bench = read("scripts/bench_lookup_simt.py")
+
+    assert "void* free_head" not in header
+    assert "at::Tensor free_head" not in wrapper
+    assert "CheckInt32NpuContiguous(free_head" not in wrapper
+    assert "int32_t head = free_head[req_id]" not in kernel
+    assert "for (uint32_t pos = 0; pos < ASU_HBM_QUERY_COUNT; ++pos)" not in kernel
+    assert "rank = asc_atomic_add" in kernel
+    assert "slot = req_free_slots[static_cast<uint32_t>(rank)]" in kernel
+    assert "free_head" not in readme
+    assert "assert_lookup_semantics" in validate
+    assert "assert_lookup_semantics" in bench
 
 
 def test_lookup_simt_build_files_target_ascend_950_pta():
@@ -93,7 +116,7 @@ def test_lookup_simt_benchmark_preloads_fresh_npu_states():
         "torch.npu.synchronize()",
         "time.perf_counter()",
         "elapsed_time",
-        "expected_lookup_allocate",
+        "assert_lookup_semantics",
         "unique_misses_per_req",
         "outputs.append",
     ]:

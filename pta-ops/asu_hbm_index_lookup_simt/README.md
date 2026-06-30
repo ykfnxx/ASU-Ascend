@@ -8,12 +8,11 @@ Inputs are contiguous `torch.int32` NPU tensors:
 
 - `index`: `[req_num, 128K]`, maps index id to slot id, with `-1` for not found.
 - `slot_to_index`: `[req_num, 10K]`, updated on allocation.
-- `free_slots`: `[req_num, 2K]`, free slot ids.
-- `free_head`: `[req_num]`, allocation head, updated in place.
+- `free_slots`: `[req_num, 2K]`, complete per-step free slot ids.
 - `query_index`: `[req_num, 2K]`, query ids.
 - `req_num`: number of requests to process.
 
-The function returns `slot_out` with the same shape as `query_index`. A miss is allocated from `free_slots[req_id, free_head[req_id]]`, and duplicate misses inside one query batch allocate only once. Allocation follows query order so the result matches `ops/scripts/asu_hbm_index_common.py::expected_lookup_allocate`.
+The function returns `slot_out` with the same shape as `query_index`. A unique miss is claimed with SIMT CAS, assigned a per-request rank with SIMT atomic add, and allocated from `free_slots[req_id, rank]`. Duplicate misses inside one query batch allocate only once and reuse the same final slot. Slot assignment order is intentionally not tied to query order.
 
 Preconditions:
 

@@ -145,6 +145,53 @@ offload_k_pe_cache[slot_id] = loaded_k_pe
 
 prefill 阶段在原生 KV cache 已写入后，将已生成的 KV 按 decode miss load 所需格式写入 MicroKV。
 
+### 5.1 插入点
+
+prefill 写入应放在 `vllm_ascend/attention/sfa_v1.py` 的 `AscendSFAImpl.forward()` 中，位置是原生 KV cache 写入完成之后、lightning indexer 调用之前。
+
+具体顺序是：
+
+```text
+exec_kv() 或 _sfa_preprocess_with_mlapo() 写入 kv_cache[0] / kv_cache[1]
+npu_scatter_nd_update_() 写入 kv_cache[2]
+if offload_v0_enabled and current batch contains prefill tokens:
+    persist_prefill_kv_to_microkv(layer_name, kv_cache, slot_mapping, attn_metadata)
+topk_indices = indexer_select_post_process(...)
+```
+
+选择这个位置的原因：
+
+1. `kv_cache[0]` 和 `kv_cache[1]` 已经按原 `slot_mapping` 写入完成。
+2. MLAPO 路径和 native 路径都能覆盖，因为 helper 从原 cache 读取，而不是依赖 `exec_kv()` 的返回值。
+3. SFA 尚未执行，prefill 写入失败可以在调试路径中显式报错，不会产生错误 attention 输出。
+4. 该逻辑只在 SFA layer 内执行，可以自然获得 `layer_name` 和该层的 `kv_cache`。
+
+v0 不应直接使用 native 路径中 `exec_kv()` 的返回值作为 MicroKV 写入源。非 CP 路径下 `exec_kv()` 当前返回 `None`，MLAPO 路径也不会通过该返回值暴露完整 KV。因此 prefill 写入 helper 应使用 `slot_mapping` 从 `kv_cache[0]` / `kv_cache[1]` 读取已落入原 cache 的单 token KV：
+
+```text
+slot = slot_mapping[token_index]
+k_nope = kv_cache[0].view(flat_slot_layout)[slot]
+k_pe = kv_cache[1].view(flat_slot_layout)[slot]
+```
+
+只有满足以下条件的 token 才写入 MicroKV：
+
+1. 当前 attention state 不是 `DecodeOnly` 或 `SpecDecoding`。
+2. `token_pos < prefill_len[req_id]`。
+3. `slot_mapping[token_index] >= 0`。
+4. 当前 layer 是 SFA layer，且 v0 开关已启用。
+
+为了支持上述过滤，`model_runner_v1.py` 需要把每个 token 的 CPU 侧 request 归属和位置传入 attention metadata 或 forward context：
+
+```text
+req_ids: list[str]
+token_req_indices_cpu: int32[num_actual_tokens]
+token_positions_cpu: int64[num_actual_tokens]
+prefill_lens_cpu: int32[num_reqs]
+```
+
+其中 `prefill_lens_cpu` 使用每个请求的 prompt token 数，decode 阶段新增 token 不属于 MicroKV 覆盖范围。
+
 写入范围：
 
 1. 只写 prefill 已生成 token。
@@ -367,3 +414,31 @@ v0 校验通过后，下一阶段再考虑：
 3. 将 miss load 和 eviction 下沉到更接近生产路径的 cache manager。
 4. 去除 CPU 参与的同步调试路径。
 5. 支持图捕获、CP、量化和 scale。
+
+## 13. 预计修改文件
+
+### 13.1 vllm-ascend
+
+| 文件 | 修改目的 |
+|---|---|
+| `vllm_ascend/attention/offload_kv_cache_v0.py` | 新增 v0 旁路模块，封装 MicroKV client、MLA token record 序列化/反序列化、prefill 写入、decode lookup、miss load、旁路 cache 管理和正确性比较。 |
+| `vllm_ascend/attention/sfa_v1.py` | 在 `AscendSFAImpl.forward()` 中增加两个最小插入点：原生 KV 写完后触发 prefill 写 MicroKV；`indexer_select_post_process()` 返回后、SFA 前触发旁路 lookup 和校验。扩展 `AscendSFAMetadata`，携带 v0 所需的 request/token CPU metadata。 |
+| `vllm_ascend/attention/utils.py` | 扩展 `AscendCommonAttentionMetadata`，增加 `req_ids`、`token_req_indices_cpu`、`token_positions_cpu`、`prefill_lens_cpu` 等字段，并在 `unpadded()` 中保持字段一致。 |
+| `vllm_ascend/worker/model_runner_v1.py` | 在 `_prepare_inputs()` 中基于 `req_indices` 和 `positions_np` 构造 v0 CPU metadata；在构造 `AscendCommonAttentionMetadata` 时传入这些字段；在 runner 初始化或 KV cache 初始化阶段创建持久化的 v0 旁路 cache manager；调用 `set_ascend_forward_context()` 时把 manager 挂入 forward context。 |
+| `vllm_ascend/ascend_forward_context.py` | 给 `set_ascend_forward_context()` 增加可选 `offload_kv_cache_v0` 参数，并把它加入 `_EXTRA_CTX.extra_attrs`，使 attention layer 能访问同一个跨 forward step 持久存在的 v0 manager。 |
+| `vllm_ascend/envs.py` | 增加 v0 调试开关和 MicroKV socket 配置，例如 `VLLM_ASCEND_KV_OFFLOAD_V0_VALIDATE`、`MICROKV_SOCKET`。 |
+
+### 13.2 MicroKV
+
+| 文件 | 修改目的 |
+|---|---|
+| `MicroKV/python/microkv/client.py` | 增加 `KV_MLA_TOKEN` 常量，明确 cache type `0` 在 v0 中表示完整 MLA token record；如需要，增加 record helper 的薄封装入口。 |
+| `MicroKV/python/microkv/__init__.py` | 导出 `KV_MLA_TOKEN`，便于 vllm-ascend 调试模块直接引用。 |
+| `MicroKV/docs/design.md` | 补充 v0 中 `KV_MLA_TOKEN` 的语义，说明 value 存储完整 `k_nope + k_pe` record，而不是单独 K tensor。 |
+
+### 13.3 测试
+
+| 文件 | 修改目的 |
+|---|---|
+| `tests` 或 `vllm_ascend` 对应单元测试目录 | 增加 record pack/unpack、`token_pos -> offload_slot_id` table 更新、eviction 后 table 失效、MicroKV miss 跳过、shape/dtype mismatch 报错等单元测试。 |
+| `MicroKV/tests/test_microkv_e2e.py` | 增加 `KV_MLA_TOKEN` value 往返测试，确认 MicroKV 仍只保存 opaque bytes，不解释 MLA record。 |

@@ -1,0 +1,6 @@
+[project]
+name = "microkv"
+version = "0.1.0"
+description = "Lightweight Unix socket in-memory KV service for KV cache validation"
+requires-python = ">=3.10"
+dependencies = []

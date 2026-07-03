@@ -3,7 +3,7 @@ import unittest
 
 
 from microkv_test_utils import MicroKVServer
-from microkv import DSA_INDEX, KV_ATTENTION_K, KV_ATTENTION_V, make_key
+from microkv import DSA_INDEX, KV_ATTENTION_K, KV_ATTENTION_V, KV_MLA_TOKEN, make_key
 
 
 SLOT_RECORD = struct.Struct("<qI")
@@ -115,6 +115,17 @@ class MicroKVE2ETest(unittest.TestCase):
             self.assertEqual(client.batch_get(KV_ATTENTION_K, [key_a, key_b]), [b"k-a", b"k-b"])
             self.assertEqual(client.batch_get(KV_ATTENTION_V, [key_a, key_b]), [b"v-a", b"v-b"])
             self.assertEqual(client.batch_get(DSA_INDEX, [key_a, key_b]), [struct.pack("<I", 77), None])
+
+    def test_mla_token_record_roundtrip_uses_opaque_value(self) -> None:
+        with MicroKVServer() as server:
+            client = server.client
+            assert client is not None
+            key = make_key("mla-req", layer_id=12, token_pos=34, cache_type=KV_MLA_TOKEN)
+            value = b"mla-record-header" + b"k-nope-bytes" + b"k-pe-bytes"
+
+            client.batch_put(KV_MLA_TOKEN, [key], [value])
+
+            self.assertEqual(client.batch_get(KV_MLA_TOKEN, [key]), [value])
 
 
 if __name__ == "__main__":

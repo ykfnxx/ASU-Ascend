@@ -5,6 +5,7 @@ from typing import Iterable
 
 
 KV_ATTENTION_K = 0
+KV_MLA_TOKEN = KV_ATTENTION_K
 KV_ATTENTION_V = 1
 DSA_INDEX = 2
 DSA_INDEX_SCALE = 3

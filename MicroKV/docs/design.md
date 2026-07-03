@@ -55,7 +55,7 @@ pybind11 只能将 C++ 接口暴露给**同进程** Python。独立进程必须�
 | `req_index` | request 的唯一索引，可以是 `req_id` 的 hash 或 vllm 内部 req_idx，占 16 字节 |
 | `layer_id` | 模型层号，从 `layer_name` 解析，例如 `model.layers.12.self_attn` → `12` |
 | `token_pos` | token 在完整序列中的位置，使用完整序列位置而非 block 内 offset |
-| `cache_type` | cache 类型编号，Phase 1 只使用 `0` |
+| `cache_type` | cache 类型编号，Phase 1 只使用 `0`；KV offload v0 中 `0` 也命名为 `KV_MLA_TOKEN` |
 | `reserved` | 预留扩展 |
 
 ## 5. Cache Type 设计
@@ -67,6 +67,8 @@ enum class KVCacheType : uint8_t {
     KV_ATTENTION_K = 0,   // 一个 token 的 K 数据
 };
 ```
+
+KV offload v0 复用 type `0` 作为 `KV_MLA_TOKEN`，表示一个完整 MLA token record。该 record 的 value 由调用方编码，包含 `k_nope` 和 `k_pe` 两段 payload；MicroKV 仍只按 opaque bytes 存取，不解释 record header、tensor shape 或 slot 语义。
 
 后续可扩展：
 
@@ -152,6 +154,8 @@ public:
 }  // namespace microkv
 ```
 
+服务端接口只接收 `uint8_t type`，不需要新增 C++ 枚举即可支持 `KV_MLA_TOKEN`。Python 客户端导出 `KV_MLA_TOKEN = 0`，用于把 v0 MLA record 的调用方语义与旧的 `KV_ATTENTION_K` 名称区分开。
+
 ## 8. Python 客户端接口
 
 ```python
@@ -229,9 +233,9 @@ Phase 1 验证流程：
 
 ```
 准备阶段：
-    从原始 KV cache 按 token 抽取 K 数据
-    key = make_key(req_index, layer_id, token_pos)
-    client.put(KV_ATTENTION_K, key, caller_defined_value)
+    从原始 KV cache 按 token 抽取 k_nope 和 k_pe
+    key = make_key(req_id, layer_id, token_pos, cache_type=KV_MLA_TOKEN)
+    client.put(KV_MLA_TOKEN, key, caller_defined_mla_record)
 
 Forward 旁路：
     NPU lookup 算子返回 topk_indices

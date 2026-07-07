@@ -97,20 +97,29 @@ vllm serve <deepseek-v3.2-sfa-model> \
 
 调试时若只想"启动即跑一个固定 prompt、看一次输出"，用离线脚本 [`examples/run_offload_once.py`](./examples/run_offload_once.py) 更直接——进程内加载引擎，走的是与 `vllm serve` 相同的 model runner / SFA forward / offload hook，无需 HTTP 客户端。
 
+该脚本**自包含**：在 `import vllm` 之前就把 `MicroKV/python` 插入 `sys.path`、并给 `MICROKV_SOCKET` 和 offload 开关设好默认值（默认走 validate 路径），所以除了 MicroKV 服务外**不必再手动 export**。只需：
+
 ```bash
 # 终端 1：MicroKV（同 §6）
 cd MicroKV && make && ./build/kv_stored --socket /tmp/microkv.sock
 
-# 终端 2：离线跑一个固定输入
-export PYTHONPATH=/path/to/MicroKV/python:$PYTHONPATH
-export MICROKV_SOCKET=/tmp/microkv.sock
-export VLLM_ASCEND_KV_OFFLOAD_V0_VALIDATE=1          # 冒烟建议用 validate（越界 topk 跳过而非报错）
-export VLLM_ASCEND_KV_OFFLOAD_V0_REF_HBM_OPS=1       # 可选：无真实新算子时用参考实现
-
+# 终端 2：离线跑一个固定输入（默认 validate 路径）
 python docs/v0.1.1/examples/run_offload_once.py weights/tiny-random-glm-moe-dsa
 ```
 
-脚本要点：`enforce_eager=True`、`max_num_seqs=1`；`max_tokens>0` 才会产生 decode 步触发 offload lookup（prefill 只负责写 MicroKV / resident 窗口）。prompt 与 token 数可用环境变量 `OFFLOAD_PROMPT` / `OFFLOAD_MAX_TOKENS` 覆盖。
+需要改路径/模式时用环境变量覆盖（shell 导出优先于脚本默认）：
+
+```bash
+export VLLM_ASCEND_KV_OFFLOAD_V0_COMPACT_SFA=1 VLLM_ASCEND_KV_OFFLOAD_V0_MAX_PINNED_REQS=1  # 改走 compact
+export VLLM_ASCEND_KV_OFFLOAD_V0_REF_HBM_OPS=1        # 无真实新算子时用参考实现
+export MICROKV_SOCKET=/run/microkv.sock               # 换 socket（须与服务端一致）
+export MICROKV_PYTHON_PATH=/path/to/MicroKV/python    # microkv 不在默认相对路径时指定
+python docs/v0.1.1/examples/run_offload_once.py <model>
+```
+
+> 关于为什么 env 要在脚本顶部、`import vllm` 之前处理：`VLLM_ASCEND_*` / `MICROKV_SOCKET` 由 offload manager 在 `LLM()` 构造时惰性读取，提前设即可；而 `PYTHONPATH` 只在解释器启动时读入 `sys.path`，进程内改无效，所以脚本改用 `sys.path.insert` 而非设 `PYTHONPATH`。
+
+脚本要点：`enforce_eager=True`、`max_num_seqs=1`；`max_tokens>0` 才会产生 decode 步触发 offload lookup（prefill 只负责写 MicroKV / resident 窗口）。prompt 与 token 数可用 `OFFLOAD_PROMPT` / `OFFLOAD_MAX_TOKENS` 覆盖。脚本启动时会打印解析后的 offload env，便于确认模式。
 
 想跑离线一批请求（而非单条）可改用 `vllm run-batch -i input.jsonl -o output.jsonl --model <model> --enforce-eager`，同样不连 server。`vllm chat` / `vllm complete` 则是 OpenAI HTTP 客户端，需要先起 `vllm serve`，不属于自包含方式。
 

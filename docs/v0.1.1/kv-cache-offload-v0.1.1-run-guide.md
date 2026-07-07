@@ -75,19 +75,23 @@ normal_allocator_blocks = total_vllm_blocks - R
 ## 6. 启动示例
 
 ```bash
-# 终端 1：启动 MicroKV server
-<microkv-server> --socket /tmp/microkv.sock
+# 终端 1：启动 MicroKV server（先 make 构建，产出 build/kv_stored）
+cd MicroKV && make
+./build/kv_stored --socket /tmp/microkv.sock
 
 # 终端 2：启动 vLLM
-VLLM_ASCEND_KV_OFFLOAD_V0_COMPACT_SFA=1 \
-VLLM_ASCEND_KV_OFFLOAD_V0_MAX_PINNED_REQS=1 \
-MICROKV_SOCKET=/tmp/microkv.sock \
-python -m vllm.entrypoints.openai.api_server \
-  --model <deepseek-v3.2-sfa-model> \
+export PYTHONPATH=/path/to/MicroKV/python:$PYTHONPATH   # 让 microkv 客户端可导入
+export MICROKV_SOCKET=/tmp/microkv.sock                 # 须与服务端 --socket 一致
+export VLLM_ASCEND_KV_OFFLOAD_V0_COMPACT_SFA=1
+export VLLM_ASCEND_KV_OFFLOAD_V0_MAX_PINNED_REQS=1
+
+vllm serve <deepseek-v3.2-sfa-model> \
   --enforce-eager \
   --gpu-memory-utilization 0.9 \
   --max-num-seqs 1
 ```
+
+> `vllm serve <model>` 与 `python -m vllm.entrypoints.openai.api_server --model <model>` 等价（两者最终都调用同一个 `run_server`）；若 `vllm` 不在 PATH，可退回后者。
 
 ## 7. 已知限制（属于设计范围，非缺陷）
 

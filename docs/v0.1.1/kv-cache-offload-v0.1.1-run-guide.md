@@ -22,7 +22,7 @@ compact SFA 路径当前**只覆盖**：
 | 依赖 | 说明 |
 |---|---|
 | MicroKV server | 需先启动并监听 `MICROKV_SOCKET`；prefill 写入、decode miss 读取都走它 |
-| 真实 HBM index 算子 | `torch.ops._C_ascend.asu_hbm_index_lookup`、`asu_hbm_index_maintain_aicpu` 必须已注册 |
+| HBM index 算子 | 默认用真实算子 `torch.ops._C_ascend.asu_hbm_index_lookup` / `asu_hbm_index_maintain_aicpu`（须已注册）。bring-up 阶段可用 `VLLM_ASCEND_KV_OFFLOAD_V0_REF_HBM_OPS=1` 切换为纯 Python 参考实现，此时**不要求**真实新算子（见 §3） |
 | 模型 | 走 SFA / DeepSeek sparse attention 的模型（V3.2 类），使用 `npu_sparse_flash_attention` |
 | 分支 | vllm-ascend `feat/kv-offload-v011-compact-sfa`（含 offload block carve-out 改动） |
 
@@ -32,7 +32,12 @@ compact SFA 路径当前**只覆盖**：
 export VLLM_ASCEND_KV_OFFLOAD_V0_COMPACT_SFA=1      # 开 v0.1.1 compact 路径
 export VLLM_ASCEND_KV_OFFLOAD_V0_MAX_PINNED_REQS=1  # 必须 > 0，否则启动报错
 export MICROKV_SOCKET=/tmp/microkv.sock             # 与 MicroKV server 监听地址一致
+
+# 可选：bring-up 阶段用纯 Python 参考算子，绕开尚未注册的真实新算子
+export VLLM_ASCEND_KV_OFFLOAD_V0_REF_HBM_OPS=1
 ```
+
+`VLLM_ASCEND_KV_OFFLOAD_V0_REF_HBM_OPS=1` 时，lookup/maintain 用 `offload_kv_cache_v0_ref_ops.py` 的纯 Python 实现（语义对齐 kernel），此时无需 `_C_ascend.asu_hbm_index_*`；但 SFA / lightning indexer 仍是既有真实算子，仍需 NPU。仅用于验证框架接线，不追求性能。
 
 注意：
 
@@ -99,10 +104,11 @@ python -m vllm.entrypoints.openai.api_server \
 cd vllm-ascend
 python3 -m unittest \
   tests.ut.attention.test_offload_kv_cache_v0_carveout \
-  tests.ut.attention.test_offload_kv_cache_v0_ownership -v
+  tests.ut.attention.test_offload_kv_cache_v0_ownership \
+  tests.ut.attention.test_offload_kv_cache_v0_ref_ops -v
 ```
 
-覆盖：carve-out 算术、offload 尾部与 scheduler 范围不相交、registry 划分、启动 fail-fast。
+覆盖：carve-out 算术、offload 尾部与 scheduler 范围不相交、registry 划分、启动 fail-fast；以及参考 lookup/maintain 的命中/miss/重复 token/回补/protected 语义与 index↔slot_to_index 双向一致性。
 
 需在 Ascend 环境补充的 e2e：
 
@@ -119,7 +125,8 @@ python3 -m unittest \
 | `KV offload v0 requires eager mode` | 未加 `--enforce-eager` / 开了 cudagraph |
 | offload pool leaves no memory for normal K/V blocks | `R >= total_blocks`，KV 显存预算太小或 `MAX_PINNED_REQS` 太大 |
 | `offload tensor blocks ... != scheduler blocks ... + reserved` | page/split 对齐异常，需排查 tensor 分配 |
-| lookup/maintain op 不存在 | `_C_ascend` 算子未注册 |
+| lookup/maintain op 不存在 | `_C_ascend` 算子未注册；bring-up 阶段可设 `VLLM_ASCEND_KV_OFFLOAD_V0_REF_HBM_OPS=1` 用参考实现 |
+| `reference maintain cannot reclaim enough free slots` | 用参考算子时可回收的非 protected 已占用 slot 少于 `free_head`，属异常状态需排查 |
 | MicroKV miss after compact lookup | prefill 未写入 / socket 不通 / key 不匹配 |
 | compact SFA topk token outside supported prefill range | topk 选到 `>= prefill_len` 的已生成 token（见 §7 限制 2） |
 | does not support DSA CP / Sparse C8 indexer | 关闭对应特性 |

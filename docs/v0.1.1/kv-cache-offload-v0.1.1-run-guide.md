@@ -130,3 +130,34 @@ python3 -m unittest \
 | MicroKV miss after compact lookup | prefill 未写入 / socket 不通 / key 不匹配 |
 | compact SFA topk token outside supported prefill range | topk 选到 `>= prefill_len` 的已生成 token（见 §7 限制 2） |
 | does not support DSA CP / Sparse C8 indexer | 关闭对应特性 |
+
+## 10. 本次改动文件清单
+
+vllm-ascend 仓库分支 `feat/kv-offload-v011-compact-sfa`，两次提交：`38beaf1d40`（offload block carve-out）、`db009081c2`（纯 Python 参考算子）。
+
+### 10.1 offload block carve-out（`38beaf1d40`）
+
+| 文件 | 类型 | 责任 |
+|---|---|---|
+| `vllm_ascend/attention/offload_kv_cache_v0_ownership.py` | 修改 | 新增纯函数 `offload_reserved_blocks` / `offload_reserved_bytes` / `inflated_tensor_size`；`build_static_offload_blocks` 复用之 |
+| `vllm_ascend/attention/offload_kv_cache_v0.py` | 修改 | 新增 `OffloadKVCacheV0Manager.offload_reserved_blocks()`，统一 `R` 计算 |
+| `vllm_ascend/worker/model_runner_v1.py` | 修改 | `initialize_kv_cache` 里调用 `_reserve_offload_blocks_in_kv_cache_config` 撑大 attention 层 tensor；register 处加尾部隔离断言 |
+| `vllm_ascend/worker/worker.py` | 修改 | `determine_available_memory` 里预留 offload pool 内存（`_reserve_offload_kv_cache_memory`），不足则启动 fail-fast |
+| `tests/ut/attention/test_offload_kv_cache_v0_carveout.py` | 新增 | carve-out 算术、尾部与 scheduler 范围不相交、registry 划分、启动 fail-fast |
+
+### 10.2 纯 Python 参考 HBM index 算子（`db009081c2`）
+
+| 文件 | 类型 | 责任 |
+|---|---|---|
+| `vllm_ascend/attention/offload_kv_cache_v0_ref_ops.py` | 新增 | 对齐 kernel 语义的纯 Python lookup/maintain 及 torch 包装层 |
+| `vllm_ascend/envs.py` | 修改 | 新增开关 `VLLM_ASCEND_KV_OFFLOAD_V0_REF_HBM_OPS` |
+| `vllm_ascend/worker/model_runner_v1.py` | 修改 | 开关打开时把参考算子注入 manager 的 `lookup_op` / `maintain_op` |
+| `tests/ut/attention/test_offload_kv_cache_v0_ref_ops.py` | 新增 | hash32、lookup/maintain 命中/miss/重复/回补/protected 语义与双向一致性 |
+
+### 10.3 文档（ASU-Ascend 仓库）
+
+| 文件 | 类型 | 责任 |
+|---|---|---|
+| `docs/v0.1.1/kv-cache-offload-v0.1.1-run-guide.md` | 新增 | 本运行与测试指南 |
+
+汇总：vllm-ascend 侧 3 个新增文件（1 个实现 + 2 个测试）、5 个修改文件；ASU-Ascend 侧 1 个新增文档。

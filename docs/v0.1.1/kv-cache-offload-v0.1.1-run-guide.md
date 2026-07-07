@@ -93,6 +93,27 @@ vllm serve <deepseek-v3.2-sfa-model> \
 
 > `vllm serve <model>` 与 `python -m vllm.entrypoints.openai.api_server --model <model>` 等价（两者最终都调用同一个 `run_server`）；若 `vllm` 不在 PATH，可退回后者。
 
+### 6.1 离线固定输入运行（不起 server）
+
+调试时若只想"启动即跑一个固定 prompt、看一次输出"，用离线脚本 [`examples/run_offload_once.py`](./examples/run_offload_once.py) 更直接——进程内加载引擎，走的是与 `vllm serve` 相同的 model runner / SFA forward / offload hook，无需 HTTP 客户端。
+
+```bash
+# 终端 1：MicroKV（同 §6）
+cd MicroKV && make && ./build/kv_stored --socket /tmp/microkv.sock
+
+# 终端 2：离线跑一个固定输入
+export PYTHONPATH=/path/to/MicroKV/python:$PYTHONPATH
+export MICROKV_SOCKET=/tmp/microkv.sock
+export VLLM_ASCEND_KV_OFFLOAD_V0_VALIDATE=1          # 冒烟建议用 validate（越界 topk 跳过而非报错）
+export VLLM_ASCEND_KV_OFFLOAD_V0_REF_HBM_OPS=1       # 可选：无真实新算子时用参考实现
+
+python docs/v0.1.1/examples/run_offload_once.py weights/tiny-random-glm-moe-dsa
+```
+
+脚本要点：`enforce_eager=True`、`max_num_seqs=1`；`max_tokens>0` 才会产生 decode 步触发 offload lookup（prefill 只负责写 MicroKV / resident 窗口）。prompt 与 token 数可用环境变量 `OFFLOAD_PROMPT` / `OFFLOAD_MAX_TOKENS` 覆盖。
+
+想跑离线一批请求（而非单条）可改用 `vllm run-batch -i input.jsonl -o output.jsonl --model <model> --enforce-eager`，同样不连 server。`vllm chat` / `vllm complete` 则是 OpenAI HTTP 客户端，需要先起 `vllm serve`，不属于自包含方式。
+
 ## 7. 已知限制（属于设计范围，非缺陷）
 
 1. **CAPACITY 未接线**：见 §3。
@@ -189,5 +210,6 @@ python3 -m unittest \
 | 文件 | 类型 | 责任 |
 |---|---|---|
 | `docs/v0.1.1/kv-cache-offload-v0.1.1-run-guide.md` | 新增 | 本运行与测试指南 |
+| `docs/v0.1.1/examples/run_offload_once.py` | 新增 | 离线固定输入单请求运行脚本（见 §6.1） |
 
-汇总：vllm-ascend 侧共 32 个文件（新增 23、修改 9；其中 csrc 两个算子目录各 7 个新增文件）；ASU-Ascend 侧 1 个新增文档。
+汇总：vllm-ascend 侧共 32 个文件（新增 23、修改 9；其中 csrc 两个算子目录各 7 个新增文件）；ASU-Ascend 侧 2 个新增文件（文档 + 离线示例脚本）。

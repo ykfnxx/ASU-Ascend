@@ -131,33 +131,59 @@ python3 -m unittest \
 | compact SFA topk token outside supported prefill range | topk 选到 `>= prefill_len` 的已生成 token（见 §7 限制 2） |
 | does not support DSA CP / Sparse C8 indexer | 关闭对应特性 |
 
-## 10. 本次改动文件清单
+## 10. 改动文件清单
 
-vllm-ascend 仓库分支 `feat/kv-offload-v011-compact-sfa`，两次提交：`38beaf1d40`（offload block carve-out）、`db009081c2`（纯 Python 参考算子）。
+范围：vllm-ascend 仓库上游基线 `36e15a2fdc` 之后的全部 offload 提交，分支 `feat/kv-offload-v011-compact-sfa`。
 
-### 10.1 offload block carve-out（`38beaf1d40`）
+涉及提交（旧→新）：
+
+| 提交 | 说明 |
+|---|---|
+| `6e867c102e` | Add v0 KV offload validation path（v0 旁路校验） |
+| `7a139ee59a` | wire asu hbm index real ops（接入真实 lookup/maintain 算子） |
+| `a374ca2a95` | add kv offload compact sfa path（v0.1.1 compact SFA） |
+| `38beaf1d40` | carve offload pinned blocks out of the normal KV allocator（block carve-out） |
+| `db009081c2` | add pure-Python reference HBM index ops（纯 Python 参考算子） |
+
+### 10.1 算子内核 `csrc/`
 
 | 文件 | 类型 | 责任 |
 |---|---|---|
-| `vllm_ascend/attention/offload_kv_cache_v0_ownership.py` | 修改 | 新增纯函数 `offload_reserved_blocks` / `offload_reserved_bytes` / `inflated_tensor_size`；`build_static_offload_blocks` 复用之 |
-| `vllm_ascend/attention/offload_kv_cache_v0.py` | 修改 | 新增 `OffloadKVCacheV0Manager.offload_reserved_blocks()`，统一 `R` 计算 |
-| `vllm_ascend/worker/model_runner_v1.py` | 修改 | `initialize_kv_cache` 里调用 `_reserve_offload_blocks_in_kv_cache_config` 撑大 attention 层 tensor；register 处加尾部隔离断言 |
-| `vllm_ascend/worker/worker.py` | 修改 | `determine_available_memory` 里预留 offload pool 内存（`_reserve_offload_kv_cache_memory`），不足则启动 fail-fast |
-| `tests/ut/attention/test_offload_kv_cache_v0_carveout.py` | 新增 | carve-out 算术、尾部与 scheduler 范围不相交、registry 划分、启动 fail-fast |
+| `csrc/asu_hbm_index_lookup/`（`*_torch_adpt.h`、`op_host/*`、`op_kernel/asu_hbm_index_lookup.cpp`，共 7 个文件） | 新增 | HBM index lookup 算子：host tiling/proto/def + AICore kernel + torch 适配 |
+| `csrc/asu_hbm_index_maintain_aicpu/`（`README.md`、`*_torch_adpt.h`、`op_host/*`、`op_kernel/*`，共 7 个文件） | 新增 | HBM index maintain（AICPU）算子及 torch 适配 |
+| `csrc/torch_binding.cpp` | 修改 | 注册上述两个算子到 `torch.ops._C_ascend` |
 
-### 10.2 纯 Python 参考 HBM index 算子（`db009081c2`）
+### 10.2 框架 `vllm_ascend/`
 
 | 文件 | 类型 | 责任 |
 |---|---|---|
-| `vllm_ascend/attention/offload_kv_cache_v0_ref_ops.py` | 新增 | 对齐 kernel 语义的纯 Python lookup/maintain 及 torch 包装层 |
-| `vllm_ascend/envs.py` | 修改 | 新增开关 `VLLM_ASCEND_KV_OFFLOAD_V0_REF_HBM_OPS` |
-| `vllm_ascend/worker/model_runner_v1.py` | 修改 | 开关打开时把参考算子注入 manager 的 `lookup_op` / `maintain_op` |
-| `tests/ut/attention/test_offload_kv_cache_v0_ref_ops.py` | 新增 | hash32、lookup/maintain 命中/miss/重复/回补/protected 语义与双向一致性 |
+| `vllm_ascend/attention/offload_kv_cache_v0.py` | 新增 | offload manager：MicroKV 持久化、旁路校验、compact 输入准备、resident 窗口、算子调用 |
+| `vllm_ascend/attention/offload_kv_cache_v0_ownership.py` | 新增 | block owner registry、静态 carve-out、compact block table、reserved 块/字节纯函数 |
+| `vllm_ascend/attention/offload_kv_cache_v0_ref_ops.py` | 新增 | 纯 Python 参考 lookup/maintain 及 torch 包装层 |
+| `vllm_ascend/attention/sfa_v1.py` | 修改 | indexer 后、SFA 前接入 offload hook：persist / validate / compact 输入切换 |
+| `vllm_ascend/attention/utils.py` | 修改 | offload 路径所需的元数据/工具改动 |
+| `vllm_ascend/ascend_forward_context.py` | 修改 | 通过 `_EXTRA_CTX` 透传 offload manager 与 capturing 标志 |
+| `vllm_ascend/envs.py` | 修改 | 开关：`VALIDATE` / `COMPACT_SFA` / `MAX_PINNED_REQS` / `MICROKV_SOCKET` / `CAPACITY` / `REF_HBM_OPS` |
+| `vllm_ascend/worker/model_runner_v1.py` | 修改 | 构造 manager、注册 offload pool、block carve-out、参考算子注入、release |
+| `vllm_ascend/worker/worker.py` | 修改 | `determine_available_memory` 预留 offload pool 内存 + 启动 fail-fast |
 
-### 10.3 文档（ASU-Ascend 仓库）
+### 10.3 单元测试 `tests/`
+
+| 文件 | 类型 | 责任 |
+|---|---|---|
+| `tests/ut/attention/test_offload_kv_cache_v0.py` | 新增 | manager 核心：MicroKV record、compact 输入、physical slot 写入 |
+| `tests/ut/attention/test_offload_kv_cache_v0_ownership.py` | 新增 | block ownership、compact block table、slot 映射 |
+| `tests/ut/attention/test_offload_kv_cache_v0_carveout.py` | 新增 | carve-out 算术、尾部与 scheduler 范围不相交、启动 fail-fast |
+| `tests/ut/attention/test_offload_kv_cache_v0_ref_ops.py` | 新增 | 参考 lookup/maintain 语义与双向一致性 |
+| `tests/ut/attention/test_sfa_v1_compact_static.py` | 新增 | compact wiring 静态检查（indexer/SFA 输入切换、envs/构造） |
+| `tests/ut/ops/test_asu_hbm_index_csrc_wiring.py` | 新增 | csrc 算子注册/绑定检查 |
+| `tests/ut/attention/test_sfa_v1.py` | 修改 | 补充 offload hook 相关用例 |
+| `tests/ut/attention/test_attention_v1.py` | 修改 | 相关回归调整 |
+
+### 10.4 文档（ASU-Ascend 仓库）
 
 | 文件 | 类型 | 责任 |
 |---|---|---|
 | `docs/v0.1.1/kv-cache-offload-v0.1.1-run-guide.md` | 新增 | 本运行与测试指南 |
 
-汇总：vllm-ascend 侧 3 个新增文件（1 个实现 + 2 个测试）、5 个修改文件；ASU-Ascend 侧 1 个新增文档。
+汇总：vllm-ascend 侧共 32 个文件（新增 23、修改 9；其中 csrc 两个算子目录各 7 个新增文件）；ASU-Ascend 侧 1 个新增文档。

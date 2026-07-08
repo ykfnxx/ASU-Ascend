@@ -162,7 +162,7 @@ python3 -m unittest \
 | lookup/maintain op 不存在 | `_C_ascend` 算子未注册；bring-up 阶段可设 `VLLM_ASCEND_KV_OFFLOAD_V0_REF_HBM_OPS=1` 用参考实现 |
 | `reference maintain cannot reclaim enough free slots` | 用参考算子时可回收的非 protected 已占用 slot 少于 `free_head`，属异常状态需排查 |
 | MicroKV miss after compact lookup | prefill 未写入 / socket 不通 / key 不匹配 |
-| compact SFA topk token outside supported prefill range | topk 选到 `>= prefill_len` 的已生成 token（见 §7 限制 2） |
+| compact SFA topk token outside supported key range | topk 选到当前 `actual_seq_lengths_key` 之外，或超过 HBM index `INDEX_SIZE` |
 | does not support DSA CP / Sparse C8 indexer | 关闭对应特性 |
 
 ## 10. 改动文件清单
@@ -178,14 +178,35 @@ python3 -m unittest \
 | `a374ca2a95` | add kv offload compact sfa path（v0.1.1 compact SFA） |
 | `38beaf1d40` | carve offload pinned blocks out of the normal KV allocator（block carve-out） |
 | `db009081c2` | add pure-Python reference HBM index ops（纯 Python 参考算子） |
+| `0649e5986a` | log KV offload persist/validate/compact stats for layer 0（layer 0 统计日志） |
+| `eebfd969bd` | trace kv offload hbm index ops（lookup/maintain free slot trace） |
+| `29915086f7` | add direct aicpu maintain path（maintain 降级为 ASU direct AICPU `.so` 注入） |
+| `df323df8a1` | add direct lookup op path（lookup 降级为 ASU direct AIV `.so` 注入） |
 
 ### 10.1 算子内核 `csrc/`
 
 | 文件 | 类型 | 责任 |
 |---|---|---|
-| `csrc/asu_hbm_index_lookup/`（`*_torch_adpt.h`、`op_host/*`、`op_kernel/asu_hbm_index_lookup.cpp`，共 7 个文件） | 新增 | HBM index lookup 算子：host tiling/proto/def + AICore kernel + torch 适配 |
-| `csrc/asu_hbm_index_maintain_aicpu/`（`README.md`、`*_torch_adpt.h`、`op_host/*`、`op_kernel/*`，共 7 个文件） | 新增 | HBM index maintain（AICPU）算子及 torch 适配 |
-| `csrc/torch_binding.cpp` | 修改 | 注册上述两个算子到 `torch.ops._C_ascend` |
+| `csrc/asu_hbm_index_lookup/README.md` | 新增 | lookup 当前 direct `.so` 使用说明，并保留 packaged custom-op 路线说明 |
+| `csrc/asu_hbm_index_lookup/asu_hbm_index_lookup_torch_adpt.h` | 新增 | lookup packaged custom-op 的 torch adapter |
+| `csrc/asu_hbm_index_lookup/op_host/CMakeLists.txt` | 新增 | lookup op_host build 入口 |
+| `csrc/asu_hbm_index_lookup/op_host/asu_hbm_index_lookup_def.cpp` | 新增 | lookup op def |
+| `csrc/asu_hbm_index_lookup/op_host/asu_hbm_index_lookup_proto.cpp` | 新增 | lookup op proto |
+| `csrc/asu_hbm_index_lookup/op_host/asu_hbm_index_lookup_tiling.cpp` | 新增 | lookup tiling 实现 |
+| `csrc/asu_hbm_index_lookup/op_host/asu_hbm_index_lookup_tiling.h` | 新增 | lookup tiling 结构 |
+| `csrc/asu_hbm_index_lookup/op_kernel/asu_hbm_index_lookup.cpp` | 新增 | lookup AICore kernel |
+| `csrc/asu_hbm_index_lookup/tmp/README.md` | 新增 | lookup direct 调试路径说明 |
+| `csrc/asu_hbm_index_lookup/tmp/direct_lookup.py` | 新增 | ASU direct lookup `.so` 的 ctypes callable；保持 `lookup_op(...) -> slot_out` 调用格式 |
+| `csrc/asu_hbm_index_maintain_aicpu/README.md` | 新增 | maintain 当前 direct `.so` 使用说明，并记录 packaged AICPU custom-op 未打通 |
+| `csrc/asu_hbm_index_maintain_aicpu/asu_hbm_index_maintain_aicpu_torch_adpt.h` | 新增 | maintain packaged custom-op 的 torch adapter |
+| `csrc/asu_hbm_index_maintain_aicpu/op_host/CMakeLists.txt` | 新增 | maintain op_host build 入口 |
+| `csrc/asu_hbm_index_maintain_aicpu/op_host/asu_hbm_index_maintain_aicpu_def.cpp` | 新增 | maintain op def |
+| `csrc/asu_hbm_index_maintain_aicpu/op_host/asu_hbm_index_maintain_aicpu_proto.cpp` | 新增 | maintain op proto |
+| `csrc/asu_hbm_index_maintain_aicpu/op_kernel/asu_hbm_index_maintain_aicpu.cpp` | 新增 | ASU direct AICPU maintain launcher 源码 |
+| `csrc/asu_hbm_index_maintain_aicpu/op_kernel/asu_hbm_index_maintain_aicpu_kernel.aicpu` | 新增 | maintain AICPU kernel 逻辑 |
+| `csrc/asu_hbm_index_maintain_aicpu/tmp/README.md` | 新增 | maintain direct 调试路径说明 |
+| `csrc/asu_hbm_index_maintain_aicpu/tmp/direct_maintain.py` | 新增 | ASU direct AICPU maintain `.so` 的 ctypes callable；保持当前 `maintain_op(...)` 调用格式 |
+| `csrc/torch_binding.cpp` | 修改 | 注册 lookup / maintain packaged custom-op 到 `torch.ops._C_ascend`；当前 direct bring-up 可不依赖该注册 |
 
 ### 10.2 框架 `vllm_ascend/`
 
@@ -197,8 +218,8 @@ python3 -m unittest \
 | `vllm_ascend/attention/sfa_v1.py` | 修改 | indexer 后、SFA 前接入 offload hook：persist / validate / compact 输入切换 |
 | `vllm_ascend/attention/utils.py` | 修改 | offload 路径所需的元数据/工具改动 |
 | `vllm_ascend/ascend_forward_context.py` | 修改 | 通过 `_EXTRA_CTX` 透传 offload manager 与 capturing 标志 |
-| `vllm_ascend/envs.py` | 修改 | 开关：`VALIDATE` / `COMPACT_SFA` / `MAX_PINNED_REQS` / `MICROKV_SOCKET` / `CAPACITY` / `REF_HBM_OPS` |
-| `vllm_ascend/worker/model_runner_v1.py` | 修改 | 构造 manager、注册 offload pool、block carve-out、参考算子注入、release |
+| `vllm_ascend/envs.py` | 修改 | 开关：`VALIDATE` / `COMPACT_SFA` / `MAX_PINNED_REQS` / `MICROKV_SOCKET` / `CAPACITY` / `REF_HBM_OPS` / `DIRECT_LOOKUP_LIB` / `DIRECT_AICPU_MAINTAIN_LIB` / `TRACE_INDEX_OPS` |
+| `vllm_ascend/worker/model_runner_v1.py` | 修改 | 构造 manager、注册 offload pool、block carve-out、参考算子注入、direct lookup/maintain 注入、release |
 | `vllm_ascend/worker/worker.py` | 修改 | `determine_available_memory` 预留 offload pool 内存 + 启动 fail-fast |
 
 ### 10.3 单元测试 `tests/`
@@ -220,5 +241,6 @@ python3 -m unittest \
 |---|---|---|
 | `docs/v0.1.1/kv-cache-offload-v0.1.1-run-guide.md` | 新增 | 本运行与测试指南 |
 | `docs/v0.1.1/examples/run_offload_once.py` | 新增 | 离线固定输入单请求运行脚本（见 §6.1） |
+| `docs/v0.1/kv-cache-offload-v0.1-custom-op-usage.md` | 修改 | 更新为 lookup / maintain 均走 ASU direct `.so` 的当前使用方式 |
 
-汇总：vllm-ascend 侧共 32 个文件（新增 23、修改 9；其中 csrc 两个算子目录各 7 个新增文件）；ASU-Ascend 侧 2 个新增文件（文档 + 离线示例脚本）。
+汇总：vllm-ascend 侧相对基线共 37 个文件（新增 28、修改 9），其中非 test 文件 29 个、test 文件 8 个；`csrc/` 侧 20 个文件（lookup 10、maintain 9、`torch_binding.cpp` 1）。ASU-Ascend 文档侧当前维护 3 个相关文件（run guide、direct 使用说明、离线示例脚本）。

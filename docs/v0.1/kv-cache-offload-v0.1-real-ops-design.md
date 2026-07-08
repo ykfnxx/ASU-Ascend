@@ -3,6 +3,7 @@
 > 状态：Design
 > 范围：vllm-ascend SFA eager 调试路径
 > 目标：在不改变原 SFA 计算流的前提下，将 v0 的 Python 旁路校验接入真实 HBM index 算子
+> 使用方法：[kv-cache-offload-v0.1-custom-op-usage.md](./kv-cache-offload-v0.1-custom-op-usage.md)
 
 ## 1. 设计结论
 

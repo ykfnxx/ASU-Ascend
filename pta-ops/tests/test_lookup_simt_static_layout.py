@@ -86,6 +86,9 @@ def test_lookup_simt_constants_and_launcher_symbols():
     assert "threadIdx.x" in kernel
     assert "PYBIND11_MODULE" in wrapper
     assert "asu_hbm_index_lookup_simt" in wrapper
+    assert '#include "torch_npu/csrc/core/npu/NPUGuard.h"' in wrapper
+    assert "c10_npu::NPUGuard npu_guard(device)" in wrapper
+    assert "OptionalNPUGuard" not in wrapper
 
 
 def test_lookup_simt_closes_allocation_eviction_and_lru_state():

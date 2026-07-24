@@ -5,6 +5,7 @@
 #include <tuple>
 
 #include <torch/extension.h>
+#include "torch_npu/csrc/core/npu/NPUGuard.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 
 namespace {
@@ -119,7 +120,7 @@ std::tuple<at::Tensor, at::Tensor> asu_hbm_index_lookup_simt(
         at::empty(query_token_ids.sizes(),
                   query_token_ids.options().dtype(at::kBool));
 
-    const c10_npu::OptionalNPUGuard npu_guard(device);
+    const c10_npu::NPUGuard npu_guard(device);
     auto acl_stream = c10_npu::getCurrentNPUStream().stream(false);
     asu_hbm_index_lookup_simt_do(
         acl_stream,

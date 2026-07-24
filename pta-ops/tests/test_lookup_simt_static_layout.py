@@ -18,7 +18,6 @@ def test_lookup_simt_pta_tree_exists():
         "build.sh",
         "include/asu_hbm_index_lookup_simt_constants.h",
         "src/asu_hbm_index_lookup_simt_kernel.cpp",
-        "src/asu_hbm_index_lookup_simt_torch.cpp",
         "python/lookup_lru_reference.py",
         "python/random_workload.py",
         "scripts/check_soc_version.sh",
@@ -52,7 +51,7 @@ def test_lookup_simt_keeps_original_sources_isolated():
 def test_lookup_simt_constants_and_launcher_symbols():
     constants = read("include/asu_hbm_index_lookup_simt_constants.h")
     kernel = read("src/asu_hbm_index_lookup_simt_kernel.cpp")
-    wrapper = read("src/asu_hbm_index_lookup_simt_torch.cpp")
+    runtime = read("scripts/lookup_simt_common.py")
 
     for token in [
         "ASU_HBM_INDEX_SIZE = 128U * 1024U",
@@ -80,31 +79,30 @@ def test_lookup_simt_constants_and_launcher_symbols():
     assert "stale_count" in kernel
     assert "victim_token" in kernel
     assert "miss_mask" in kernel
-    assert "workspace_size" in wrapper
-    assert "std::tuple<at::Tensor, at::Tensor>" in wrapper
-    assert "at::kBool" in wrapper
+    assert "WORKSPACE_STRIDE" in runtime
+    assert "slot_ids=torch.empty_like(query_token_ids)" in runtime
+    assert "dtype=torch.bool" in runtime
     assert "threadIdx.x" in kernel
-    assert "PYBIND11_MODULE" in wrapper
-    assert "asu_hbm_index_lookup_simt" in wrapper
-    assert '#include "torch_npu/csrc/core/npu/NPUGuard.h"' in wrapper
-    assert "c10_npu::NPUGuard npu_guard(device)" in wrapper
-    assert "OptionalNPUGuard" not in wrapper
+    assert "ctypes.CDLL" in runtime
+    assert "library.asu_hbm_index_lookup_simt_do" in runtime
+    assert "current_stream_ptr(torch)" in runtime
+    assert "importlib" not in runtime
+    assert "PYBIND11_MODULE" not in kernel
 
 
 def test_lookup_simt_closes_allocation_eviction_and_lru_state():
     header = read("include/asu_hbm_index_lookup_simt_constants.h")
     kernel = read("src/asu_hbm_index_lookup_simt_kernel.cpp")
-    wrapper = read("src/asu_hbm_index_lookup_simt_torch.cpp")
+    runtime = read("scripts/lookup_simt_common.py")
     readme = read("README.md")
     validate = read("scripts/validate_lookup_simt.py")
     bench = read("scripts/bench_lookup_simt.py")
     workload = read("python/random_workload.py")
 
     assert "void* free_head" not in header
-    assert "at::Tensor free_head" not in wrapper
     assert "free_slots" not in header
-    assert "free_slots" not in wrapper
     assert "free_slots" not in kernel
+    assert "free_slots" not in runtime
     assert "token_to_slot" in header
     assert "slot_to_token" in header
     assert "lru_slots" in header
@@ -141,14 +139,16 @@ def test_lookup_simt_kernel_is_valid_cxx_with_api_stubs():
     )
 
 
-def test_lookup_simt_build_files_target_ascend_950_pta():
+def test_lookup_simt_builds_direct_ascend_950_kernel_library():
     cmake = read("CMakeLists.txt")
     build = read("build.sh")
     build_driver = read("scripts/build_lookup_simt.sh")
     readme = read("README.md")
 
     assert "ascendc_library" in cmake
-    assert "pybind11_add_module" in cmake
+    assert "pybind11_add_module" not in cmake
+    assert "find_package(Torch" not in cmake
+    assert "torch_npu" not in cmake
     assert (
         "ascendc_include_directories("
         "asu_hbm_index_lookup_simt_kernel PRIVATE"
@@ -159,7 +159,6 @@ def test_lookup_simt_build_files_target_ascend_950_pta():
     ) not in cmake
     assert "ASU_HBM_INDEX_LOOKUP_SIMT_INCLUDE_DIR" in cmake
     assert "\ninclude_directories(" not in cmake
-    assert 'set(Python3_EXECUTABLE "${PYTHON_BIN}")' in cmake
     assert (
         'set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)'
         in cmake
@@ -171,15 +170,14 @@ def test_lookup_simt_build_files_target_ascend_950_pta():
     assert "Unsupported Ascend 950 SOC_VERSION" not in cmake
     assert "unsupported Ascend 950 SOC_VERSION" not in build
     assert "unsupported Ascend 950 SOC_VERSION" not in build_driver
-    assert "import torch_npu" in build_driver
-    assert "built module:" in build_driver
-    assert "set(CMAKE_SKIP_RPATH FALSE)" in cmake
-    assert cmake.index("include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)") < cmake.index(
-        "set(CMAKE_SKIP_RPATH FALSE)"
-    )
-    assert 'BUILD_RPATH "$ORIGIN;$ORIGIN/lib;' in cmake
-    assert 'INSTALL_RPATH "$ORIGIN;$ORIGIN/lib;' in cmake
-    assert "PTA" in readme
+    assert "import torch_npu" not in build_driver
+    assert "PYTHON_BIN" not in build_driver
+    assert "built library:" in build_driver
+    assert "asu_hbm_index_lookup_simt_do" in build_driver
+    assert "libasu_hbm_index_lookup_simt_kernel.so" in build_driver
+    assert "CMAKE_SKIP_RPATH" not in cmake
+    assert "BUILD_RPATH" not in cmake
+    assert "ctypes.CDLL" in readme
     assert "Ascend 950" in readme
 
 

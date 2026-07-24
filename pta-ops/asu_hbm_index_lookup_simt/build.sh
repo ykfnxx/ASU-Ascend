@@ -4,7 +4,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOC_VERSION="${SOC_VERSION:-}"
 BUILD_DIR="${BUILD_DIR:-${SCRIPT_DIR}/build}"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
 ASCEND_CANN_PACKAGE_PATH="${ASCEND_CANN_PACKAGE_PATH:-${ASCEND_HOME_PATH:-${ASCEND_INSTALL_PATH:-/usr/local/Ascend/ascend-toolkit/latest}}}"
 
 if [[ -z "${SOC_VERSION}" ]]; then
@@ -19,6 +18,5 @@ fi
 
 cmake -S "${SCRIPT_DIR}" -B "${BUILD_DIR}" \
   -DSOC_VERSION="${SOC_VERSION}" \
-  -DASCEND_CANN_PACKAGE_PATH="${ASCEND_CANN_PACKAGE_PATH}" \
-  -DPYTHON_BIN="${PYTHON_BIN}"
+  -DASCEND_CANN_PACKAGE_PATH="${ASCEND_CANN_PACKAGE_PATH}"
 cmake --build "${BUILD_DIR}" -j"$(nproc)"

@@ -17,7 +17,7 @@ from lookup_simt_common import (
     call_lookup,
     estimate_state_bytes,
     expected_result,
-    load_extension,
+    load_kernel,
     require_runtime,
     to_npu_state,
 )
@@ -44,7 +44,12 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--build-dir", type=Path, default=PKG_DIR / "build")
-    parser.add_argument("--module-path", type=Path, default=None)
+    parser.add_argument(
+        "--library-path",
+        type=Path,
+        default=None,
+        help="optional path to libasu_hbm_index_lookup_simt_kernel.so",
+    )
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--req-num", type=int, default=1)
     parser.add_argument(
@@ -102,7 +107,7 @@ def prepare_output_dir(output_dir: Path) -> tuple[Path, Path, Path]:
 def verify_one_state(
     np: Any,
     torch: Any,
-    module: Any,
+    kernel: Any,
     req_num: int,
     hit_count: int,
     seed: int,
@@ -115,8 +120,8 @@ def verify_one_state(
         case_id=0,
     )
     expected = expected_result(np, case)
-    state = to_npu_state(torch, module, case)
-    outputs = call_lookup(module, state, req_num)
+    state = to_npu_state(torch, case)
+    outputs = call_lookup(kernel, torch, state, req_num)
     torch.npu.synchronize()
     assert_runtime_result(np, state, outputs, expected)
 
@@ -124,13 +129,11 @@ def verify_one_state(
 def preload_states(
     np: Any,
     torch: Any,
-    module: Any,
     args: argparse.Namespace,
 ) -> tuple[list[Any], list[Any]]:
     states = [
         to_npu_state(
             torch,
-            module,
             make_random_case(
                 np,
                 args.req_num,
@@ -147,12 +150,12 @@ def preload_states(
 
 def run_warmup(
     torch: Any,
-    module: Any,
+    kernel: Any,
     states: list[Any],
     req_num: int,
 ) -> None:
     retained_outputs = [
-        call_lookup(module, state, req_num) for state in states
+        call_lookup(kernel, torch, state, req_num) for state in states
     ]
     torch.npu.synchronize()
     if len(retained_outputs) != len(states):
@@ -181,7 +184,7 @@ def create_experimental_config(torch_npu: Any, export_type: str) -> Any:
 def profile_states(
     torch: Any,
     torch_npu: Any,
-    module: Any,
+    kernel: Any,
     states: list[Any],
     args: argparse.Namespace,
     raw_root: Path,
@@ -212,7 +215,7 @@ def profile_states(
     ):
         for state in states:
             retained_outputs.append(
-                call_lookup(module, state, args.req_num)
+                call_lookup(kernel, torch, state, args.req_num)
             )
         torch.npu.synchronize()
 
@@ -312,7 +315,7 @@ def write_manifest(
     args: argparse.Namespace,
     torch: Any,
     torch_npu: Any,
-    module_path: Path,
+    library_path: Path,
     raw_profile: Path,
     parsed_files: list[Path],
 ) -> None:
@@ -354,7 +357,7 @@ def write_manifest(
             "device_name": device_name(torch, args.device),
             "torch_version": getattr(torch, "__version__", None),
             "torch_npu_version": getattr(torch_npu, "__version__", None),
-            "extension_module": str(module_path),
+            "kernel_library": str(library_path),
             "git_commit": git_commit(PKG_DIR),
         },
         "outputs": {
@@ -373,7 +376,7 @@ def main() -> None:
     validate_args(args)
     run_root, raw_root, parsed_root = prepare_output_dir(args.output_dir)
     np, torch, torch_npu = require_runtime(args.device)
-    module, module_path = load_extension(args.module_path, args.build_dir)
+    kernel = load_kernel(args.library_path, args.build_dir)
     miss_count = QUERY_COUNT - args.hit_count
     state_mib = estimate_state_bytes(args.req_num) / 1024.0 / 1024.0
 
@@ -389,7 +392,7 @@ def main() -> None:
             args.seed,
         )
     )
-    print(f"module: {module_path}")
+    print(f"library: {kernel.path}")
     print(f"output: {run_root}")
     print(
         "preload estimate: {:.2f} MiB/state, {:.2f} MiB total "
@@ -403,20 +406,20 @@ def main() -> None:
         verify_one_state(
             np,
             torch,
-            module,
+            kernel,
             args.req_num,
             args.hit_count,
             args.seed,
         )
         print("verify: PASS")
 
-    warmup, captured = preload_states(np, torch, module, args)
-    run_warmup(torch, module, warmup, args.req_num)
+    warmup, captured = preload_states(np, torch, args)
+    run_warmup(torch, kernel, warmup, args.req_num)
     print("warmup: PASS")
     profile_states(
         torch,
         torch_npu,
-        module,
+        kernel,
         captured,
         args,
         raw_root,
@@ -433,7 +436,7 @@ def main() -> None:
         args=args,
         torch=torch,
         torch_npu=torch_npu,
-        module_path=module_path,
+        library_path=kernel.path,
         raw_profile=raw_profile,
         parsed_files=parsed_files,
     )

@@ -1,6 +1,6 @@
 # ASU HBM Token Lookup for Ascend 950 SIMT
 
-本目录提供一个独立 PTA 原型，在一次 Ascend 950 SIMT kernel 中完成：
+本目录提供一个独立 AscendC 原型，在一次 Ascend 950 SIMT kernel 中完成：
 
 1. `token_id -> slot_id` 查询；
 2. 唯一 miss 的 slot 分配；
@@ -10,18 +10,24 @@
 算子不执行 host/device KV IO。调用方根据返回的 `miss_mask`，把
 `query_token_ids[miss_mask]` 对应的数据加载到 `slot_ids[miss_mask]`。
 
-## Python 接口
+## 调用接口
 
 ```python
-slot_ids, miss_mask = module.asu_hbm_index_lookup_simt(
-    token_to_slot,
-    slot_to_token,
-    lru_slots,
-    query_token_ids,
-    req_num,
-    workspace=None,
-)
+kernel = load_kernel(library_path, build_dir)
+state = to_npu_state(torch, case)
+slot_ids, miss_mask = call_lookup(kernel, torch, state, req_num)
 ```
+
+Python 不导入扩展模块，也不要求 `PyInit_*`。脚本和仓库中原有的 910
+AIV benchmark 一样，用 `ctypes.CDLL` 加载
+`libasu_hbm_index_lookup_simt_kernel.so`，取得 C launcher
+`asu_hbm_index_lookup_simt_do`，再传入当前 NPU stream 和各 tensor 的
+device pointer。`slot_ids`、`miss_mask` 和 workspace 由调用脚本提前分配。
+
+完整 PTA 注册算子还需要 op_host、shape/tiling、custom OPP 安装和
+`TORCH_LIBRARY` binding，适合最终集成到 vLLM-Ascend，但不是独立 kernel
+验证和 benchmark 的必要条件。这里选择直接 launcher 路径，避免引入
+pybind11、Torch C++ ABI 和 Python extension 的初始化符号。
 
 所有输入 tensor 必须 contiguous，并位于同一 NPU：
 
@@ -115,7 +121,7 @@ workspace 使用全局 NPU memory，避免依赖动态 shared memory：
 
 ```python
 workspace = torch.empty(
-    module.workspace_size(req_num),
+    req_num * (3 * 10 * 1024 + 3 * 256 + 4),
     dtype=torch.int32,
     device="npu",
 )
@@ -163,8 +169,8 @@ id。
 
 ## 编译
 
-仅支持 Ascend 950。环境需要 CANN、CMake，以及同一 Python 环境中的
-`torch`、`torch-npu` 和 `pybind11`：
+仅支持 Ascend 950。编译需要 CANN 和 CMake；运行验证和 benchmark 的
+Python 环境需要 `torch` 和 `torch-npu`，不再需要 `pybind11`：
 
 ```bash
 cd pta-ops/asu_hbm_index_lookup_simt
@@ -178,7 +184,6 @@ SOC_VERSION="$(
 bash scripts/build_lookup_simt.sh \
   --cann-path /usr/local/Ascend/ascend-toolkit/latest \
   --soc-version "${SOC_VERSION}" \
-  --python python3 \
   --build-dir build
 ```
 
@@ -188,14 +193,18 @@ bash scripts/build_lookup_simt.sh \
 `--value-only` 只输出 runtime 返回值，可安全用于命令替换。
 
 编译脚本不校验型号格式，只通过 `--soc-version` 将用户给出的值原样传给
-CANN/CMake。随后检查 Python 构建依赖，完成 configure/build，并打印最终
-Python extension 的路径。该参数没有默认型号；也可以使用低层入口：
+CANN/CMake。构建过程不依赖 Python、PyTorch 或 torch-npu；完成后会校验
+launcher 导出符号，并打印最终 kernel library 的路径。该参数没有默认型号；
+也可以使用低层入口：
 
 ```bash
 SOC_VERSION="${SOC_VERSION}" ./build.sh
 ```
 
 ## 测试
+
+在新的 shell 中运行真机脚本前，先执行同一套 CANN 的
+`source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh`。
 
 不需要 NPU 的 reference 和源码静态验证：
 
@@ -243,7 +252,7 @@ profiles/lookup-hit1536/
 ├── raw/                 # torch-npu 原始 profile
 ├── parsed/
 │   └── ASCEND_PROFILER_OUTPUT/
-└── manifest.json        # workload、环境、extension 和产物清单
+└── manifest.json        # workload、环境、kernel library 和产物清单
 ```
 
 `tensorboard_trace_handler` 使用同步解析

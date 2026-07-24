@@ -9,7 +9,7 @@ from lookup_simt_common import (
     assert_runtime_result,
     call_lookup,
     expected_result,
-    load_extension,
+    load_kernel,
     require_runtime,
     to_npu_state,
 )
@@ -32,7 +32,12 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--build-dir", type=Path, default=PKG_DIR / "build")
-    parser.add_argument("--module-path", type=Path, default=None)
+    parser.add_argument(
+        "--library-path",
+        type=Path,
+        default=None,
+        help="optional path to libasu_hbm_index_lookup_simt_kernel.so",
+    )
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--req-num", type=int, default=2)
     parser.add_argument(
@@ -60,7 +65,7 @@ def main() -> None:
     args = parse_args()
     validate_args(args)
     np, torch, _ = require_runtime(args.device)
-    module, module_path = load_extension(args.module_path, args.build_dir)
+    kernel = load_kernel(args.library_path, args.build_dir)
     case = make_random_case(
         np,
         args.req_num,
@@ -69,9 +74,9 @@ def main() -> None:
         case_id=args.case_id,
     )
     expected = expected_result(np, case)
-    state = to_npu_state(torch, module, case)
+    state = to_npu_state(torch, case)
 
-    outputs = call_lookup(module, state, args.req_num)
+    outputs = call_lookup(kernel, torch, state, args.req_num)
     torch.npu.synchronize()
     assert_runtime_result(np, state, outputs, expected)
 
@@ -80,13 +85,13 @@ def main() -> None:
     )
     print(
         "PASS lookup_simt: req_num={} hit_count={} miss_count={} "
-        "seed={} case_id={} module={}".format(
+        "seed={} case_id={} library={}".format(
             args.req_num,
             case.hit_count,
             case.miss_count,
             args.seed,
             args.case_id,
-            module_path,
+            kernel.path,
         )
     )
     print(

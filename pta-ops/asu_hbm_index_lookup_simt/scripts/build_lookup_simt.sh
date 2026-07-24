@@ -4,7 +4,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PKG_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BUILD_DIR_ARG="build"
-PYTHON_BIN_ARG="${PYTHON_BIN:-python3}"
 CANN_PATH_ARG="${ASCEND_CANN_PACKAGE_PATH:-${ASCEND_HOME_PATH:-${ASCEND_INSTALL_PATH:-/usr/local/Ascend/ascend-toolkit/latest}}}"
 SOC_VERSION_ARG="${SOC_VERSION:-}"
 JOBS_ARG="$(nproc)"
@@ -20,7 +19,6 @@ Options:
   --build-dir PATH  CMake build directory (default: build under package)
   --cann-path PATH  CANN ascend-toolkit path
   --soc-version SOC Exact SOC_VERSION (required unless set in environment)
-  --python PATH     Python interpreter with torch, torch-npu, pybind11
   --jobs N          Parallel build jobs (default: nproc)
   -h, --help        Show this help
 EOF
@@ -48,11 +46,6 @@ while (($#)); do
     --soc-version)
       require_option_value "$@"
       SOC_VERSION_ARG="$2"
-      shift 2
-      ;;
-    --python)
-      require_option_value "$@"
-      PYTHON_BIN_ARG="$2"
       shift 2
       ;;
     --jobs)
@@ -100,37 +93,29 @@ if ! command -v cmake >/dev/null 2>&1; then
   echo "cmake is not available in PATH" >&2
   exit 2
 fi
-if ! command -v "${PYTHON_BIN_ARG}" >/dev/null 2>&1; then
-  echo "Python interpreter is not available: ${PYTHON_BIN_ARG}" >&2
-  exit 2
-fi
-
-"${PYTHON_BIN_ARG}" - <<'PY'
-import pybind11
-import torch
-import torch_npu
-
-print(f"torch={torch.__version__}")
-print(f"torch_npu={getattr(torch_npu, '__version__', 'unknown')}")
-print(f"pybind11={pybind11.__version__}")
-PY
-
 echo "SOC_VERSION=${SOC_VERSION_ARG}"
 echo "ASCEND_CANN_PACKAGE_PATH=${CANN_PATH_ARG}"
 echo "BUILD_DIR=${BUILD_DIR}"
 
 cmake -S "${PKG_DIR}" -B "${BUILD_DIR}" \
   -DSOC_VERSION="${SOC_VERSION_ARG}" \
-  -DASCEND_CANN_PACKAGE_PATH="${CANN_PATH_ARG}" \
-  -DPYTHON_BIN="${PYTHON_BIN_ARG}"
+  -DASCEND_CANN_PACKAGE_PATH="${CANN_PATH_ARG}"
 cmake --build "${BUILD_DIR}" --parallel "${JOBS_ARG}"
 
-MODULE_PATH="$(
-  find "${BUILD_DIR}" -type f -name 'asu_hbm_index_lookup_simt*.so' \
-    -print -quit
-)"
-if [[ -z "${MODULE_PATH}" ]]; then
-  echo "build finished but no Python extension was found under ${BUILD_DIR}" >&2
+LIBRARY_PATH="${BUILD_DIR}/lib/libasu_hbm_index_lookup_simt_kernel.so"
+if [[ ! -f "${LIBRARY_PATH}" ]]; then
+  LIBRARY_PATH="$(
+    find "${BUILD_DIR}" -type f \
+      -name 'libasu_hbm_index_lookup_simt_kernel.so' -print -quit
+  )"
+fi
+if [[ -z "${LIBRARY_PATH}" || ! -f "${LIBRARY_PATH}" ]]; then
+  echo "build finished but the SIMT kernel library was not found under ${BUILD_DIR}" >&2
   exit 1
 fi
-echo "built module: ${MODULE_PATH}"
+if command -v nm >/dev/null 2>&1 && ! nm -D --defined-only "${LIBRARY_PATH}" |
+  awk '$NF == "asu_hbm_index_lookup_simt_do" { found = 1 } END { exit !found }'; then
+  echo "kernel library does not export asu_hbm_index_lookup_simt_do: ${LIBRARY_PATH}" >&2
+  exit 1
+fi
+echo "built library: ${LIBRARY_PATH}"

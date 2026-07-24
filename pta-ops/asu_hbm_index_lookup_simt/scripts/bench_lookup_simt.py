@@ -16,7 +16,7 @@ from lookup_simt_common import (
     call_lookup,
     estimate_state_bytes,
     expected_result,
-    load_extension,
+    load_kernel,
     require_runtime,
     to_npu_state,
 )
@@ -40,7 +40,12 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--build-dir", type=Path, default=PKG_DIR / "build")
-    parser.add_argument("--module-path", type=Path, default=None)
+    parser.add_argument(
+        "--library-path",
+        type=Path,
+        default=None,
+        help="optional path to libasu_hbm_index_lookup_simt_kernel.so",
+    )
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--req-num", type=int, default=50)
     parser.add_argument("--rounds", type=int, default=100)
@@ -88,7 +93,7 @@ def validate_args(args: argparse.Namespace) -> None:
 def verify_one_state(
     np: Any,
     torch: Any,
-    module: Any,
+    kernel: Any,
     req_num: int,
     hit_count: int,
     seed: int,
@@ -101,8 +106,8 @@ def verify_one_state(
         case_id=0,
     )
     expected = expected_result(np, case)
-    state = to_npu_state(torch, module, case)
-    outputs = call_lookup(module, state, req_num)
+    state = to_npu_state(torch, case)
+    outputs = call_lookup(kernel, torch, state, req_num)
     torch.npu.synchronize()
     assert_runtime_result(np, state, outputs, expected)
 
@@ -110,7 +115,6 @@ def verify_one_state(
 def preload_states(
     np: Any,
     torch: Any,
-    module: Any,
     req_num: int,
     hit_count: int,
     count: int,
@@ -120,7 +124,6 @@ def preload_states(
     states = [
         to_npu_state(
             torch,
-            module,
             make_random_case(
                 np,
                 req_num,
@@ -137,11 +140,13 @@ def preload_states(
 
 def warmup_states(
     torch: Any,
-    module: Any,
+    kernel: Any,
     states: list[Any],
     req_num: int,
 ) -> None:
-    outputs = [call_lookup(module, state, req_num) for state in states]
+    outputs = [
+        call_lookup(kernel, torch, state, req_num) for state in states
+    ]
     torch.npu.synchronize()
     if len(outputs) != len(states):
         raise RuntimeError("warmup output retention failed")
@@ -149,7 +154,7 @@ def warmup_states(
 
 def run_states(
     torch: Any,
-    module: Any,
+    kernel: Any,
     states: list[Any],
     req_num: int,
 ) -> tuple[float, float]:
@@ -161,7 +166,7 @@ def run_states(
     start_event.record()
     wall_start = time.perf_counter()
     for state in states:
-        outputs.append(call_lookup(module, state, req_num))
+        outputs.append(call_lookup(kernel, torch, state, req_num))
     end_event.record()
     torch.npu.synchronize()
     wall_ms = (time.perf_counter() - wall_start) * 1000.0
@@ -184,7 +189,7 @@ def main() -> None:
     args = parse_args()
     validate_args(args)
     np, torch, _ = require_runtime(args.device)
-    module, module_path = load_extension(args.module_path, args.build_dir)
+    kernel = load_kernel(args.library_path, args.build_dir)
     miss_count = QUERY_COUNT - args.hit_count
     batch_rounds = args.batch_rounds or args.rounds
     batch_rounds = min(batch_rounds, args.rounds)
@@ -203,7 +208,7 @@ def main() -> None:
             args.seed,
         )
     )
-    print(f"module: {module_path}")
+    print(f"library: {kernel.path}")
     print(
         "preload estimate: {:.2f} MiB/state, at most {:.2f} MiB of "
         "input/state/workspace tensors".format(
@@ -216,7 +221,7 @@ def main() -> None:
         verify_one_state(
             np,
             torch,
-            module,
+            kernel,
             args.req_num,
             args.hit_count,
             args.seed,
@@ -234,7 +239,6 @@ def main() -> None:
         states = preload_states(
             np,
             torch,
-            module,
             args.req_num,
             args.hit_count,
             state_count,
@@ -246,13 +250,13 @@ def main() -> None:
         if warmup_remaining:
             warmup_states(
                 torch,
-                module,
+                kernel,
                 states[:warmup_remaining],
                 args.req_num,
             )
         wall_ms, event_ms = run_states(
             torch,
-            module,
+            kernel,
             states[warmup_remaining:],
             args.req_num,
         )
@@ -270,7 +274,7 @@ def main() -> None:
     wall_avg_us = total_wall_ms * 1000.0 / launches
     event_avg_us = total_event_ms * 1000.0 / launches
     summary = {
-        "module": str(module_path),
+        "library": str(kernel.path),
         "device": args.device,
         "req_num": args.req_num,
         "rounds": args.rounds,

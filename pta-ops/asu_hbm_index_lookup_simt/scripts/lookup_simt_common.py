@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import importlib.util
+import ctypes
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from types import ModuleType
 from typing import Any
 
 
@@ -16,6 +15,11 @@ from python.lookup_lru_reference import (  # noqa: E402
     LookupState,
     lookup_allocate_evict,
 )
+from python.random_workload import QUERY_COUNT, SLOT_COUNT  # noqa: E402
+
+
+SIMT_THREADS = 256
+WORKSPACE_STRIDE = 3 * SLOT_COUNT + 3 * SIMT_THREADS + 4
 
 
 @dataclass
@@ -24,7 +28,16 @@ class NpuLookupState:
     slot_to_token: Any
     lru_slots: Any
     query_token_ids: Any
+    slot_ids: Any
+    miss_mask: Any
     workspace: Any
+
+
+@dataclass
+class LoadedKernel:
+    library: Any
+    function: Any
+    path: Path
 
 
 def require_runtime(device_id: int):
@@ -41,59 +54,91 @@ def require_runtime(device_id: int):
     return np, torch, torch_npu
 
 
-def find_module_path(build_dir: Path) -> Path:
+def find_library_path(build_dir: Path) -> Path:
+    build_root = build_dir.expanduser().resolve()
+    expected = build_root / "lib" / "libasu_hbm_index_lookup_simt_kernel.so"
+    if expected.is_file():
+        return expected
     candidates = sorted(
-        build_dir.expanduser().resolve().rglob("asu_hbm_index_lookup_simt*.so")
+        build_root.rglob("libasu_hbm_index_lookup_simt_kernel.so")
     )
     if not candidates:
         raise FileNotFoundError(
-            f"could not find asu_hbm_index_lookup_simt*.so under {build_dir}; "
-            "pass --module-path explicitly"
+            "could not find libasu_hbm_index_lookup_simt_kernel.so under "
+            f"{build_dir}; pass --library-path explicitly"
         )
     return candidates[0]
 
 
-def load_extension(module_path: Path | None, build_dir: Path) -> tuple[ModuleType, Path]:
-    if module_path is None:
-        module_path = find_module_path(build_dir)
-    module_path = module_path.expanduser().resolve()
-    if not module_path.exists():
-        raise FileNotFoundError(f"extension module does not exist: {module_path}")
-    spec = importlib.util.spec_from_file_location(
-        "asu_hbm_index_lookup_simt", module_path
-    )
-    if spec is None or spec.loader is None:
-        raise ImportError(f"could not create import spec for {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module, module_path
+def load_kernel(
+    library_path: Path | None,
+    build_dir: Path,
+) -> LoadedKernel:
+    if library_path is None:
+        library_path = find_library_path(build_dir)
+    library_path = library_path.expanduser().resolve()
+    if not library_path.is_file():
+        raise FileNotFoundError(f"kernel library does not exist: {library_path}")
+
+    library = ctypes.CDLL(str(library_path), mode=ctypes.RTLD_GLOBAL)
+    try:
+        function = library.asu_hbm_index_lookup_simt_do
+    except AttributeError as exc:
+        raise ImportError(
+            f"{library_path} does not export asu_hbm_index_lookup_simt_do"
+        ) from exc
+    function.argtypes = [ctypes.c_void_p] * 8 + [ctypes.c_uint32]
+    function.restype = None
+    return LoadedKernel(library=library, function=function, path=library_path)
 
 
-def to_npu_state(torch: Any, module: ModuleType, case: Any) -> NpuLookupState:
+def to_npu_state(torch: Any, case: Any) -> NpuLookupState:
     req_num = case.token_to_slot.shape[0]
+    query_token_ids = torch.from_numpy(case.query_token_ids).to("npu")
     return NpuLookupState(
         token_to_slot=torch.from_numpy(case.token_to_slot).to("npu"),
         slot_to_token=torch.from_numpy(case.slot_to_token).to("npu"),
         lru_slots=torch.from_numpy(case.lru_slots).to("npu"),
-        query_token_ids=torch.from_numpy(case.query_token_ids).to("npu"),
+        query_token_ids=query_token_ids,
+        slot_ids=torch.empty_like(query_token_ids),
+        miss_mask=torch.empty(
+            query_token_ids.shape,
+            dtype=torch.bool,
+            device=query_token_ids.device,
+        ),
         workspace=torch.empty(
-            module.workspace_size(req_num),
+            req_num * WORKSPACE_STRIDE,
             dtype=torch.int32,
             device="npu",
         ),
     )
 
 
-def call_lookup(module: ModuleType, state: NpuLookupState, req_num: int):
-    return module.asu_hbm_index_lookup_simt(
-        state.token_to_slot,
-        state.slot_to_token,
-        state.lru_slots,
-        state.query_token_ids,
-        req_num,
-        state.workspace,
+def current_stream_ptr(torch: Any) -> int:
+    stream_ptr = getattr(torch.npu.current_stream(), "npu_stream", None)
+    if stream_ptr is None:
+        raise RuntimeError("torch.npu.current_stream() has no npu_stream")
+    return int(stream_ptr)
+
+
+def call_lookup(
+    kernel: LoadedKernel,
+    torch: Any,
+    state: NpuLookupState,
+    req_num: int,
+):
+    kernel.function(
+        ctypes.c_void_p(current_stream_ptr(torch)),
+        ctypes.c_void_p(state.token_to_slot.data_ptr()),
+        ctypes.c_void_p(state.slot_to_token.data_ptr()),
+        ctypes.c_void_p(state.lru_slots.data_ptr()),
+        ctypes.c_void_p(state.query_token_ids.data_ptr()),
+        ctypes.c_void_p(state.slot_ids.data_ptr()),
+        ctypes.c_void_p(state.miss_mask.data_ptr()),
+        ctypes.c_void_p(state.workspace.data_ptr()),
+        ctypes.c_uint32(req_num),
     )
+    return state.slot_ids, state.miss_mask
 
 
 def expected_result(np: Any, case: Any):
@@ -146,10 +191,9 @@ def assert_runtime_result(
 
 def estimate_state_bytes(req_num: int) -> int:
     index_size = 128 * 1024
-    slot_count = 10 * 1024
-    query_count = 2 * 1024
-    workspace_int32 = 3 * slot_count + 3 * 256 + 4
+    workspace_int32 = WORKSPACE_STRIDE
     return req_num * (
-        (index_size + slot_count + query_count + workspace_int32) * 4
-        + slot_count * 2
+        (index_size + SLOT_COUNT + 2 * QUERY_COUNT + workspace_int32) * 4
+        + SLOT_COUNT * 2
+        + QUERY_COUNT
     )

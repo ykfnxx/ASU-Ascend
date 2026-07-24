@@ -21,12 +21,14 @@ def test_lookup_simt_pta_tree_exists():
         "src/asu_hbm_index_lookup_simt_torch.cpp",
         "python/lookup_lru_reference.py",
         "python/random_workload.py",
+        "scripts/check_soc_version.sh",
         "scripts/build_lookup_simt.sh",
         "scripts/bench_lookup_simt.py",
         "scripts/lookup_simt_common.py",
         "scripts/profile_lookup_simt.py",
         "scripts/validate_lookup_simt.py",
         "tests/test_reference.py",
+        "tests/fixtures/ascend950pr_board_info.txt",
         "tests/stubs/kernel_operator.h",
         "tests/stubs/simt_api/common_functions.h",
         "tests/stubs/simt_api/device_atomic_functions.h",
@@ -147,14 +149,34 @@ def test_lookup_simt_build_files_target_ascend_950_pta():
     assert "pybind11_add_module" in cmake
     assert 'set(Python3_EXECUTABLE "${PYTHON_BIN}")' in cmake
     assert 'SOC_VERSION "Ascend950"' in cmake
-    assert "Ascend950 only" in cmake
+    assert "^Ascend950(PR|DT)_" in cmake
     assert 'SOC_VERSION:-Ascend950' in build
-    assert "Ascend950 only" in build
-    assert "-DSOC_VERSION=Ascend950" in build_driver
+    assert "^Ascend950(PR|DT)_" in build
+    assert "--soc-version" in build_driver
+    assert '-DSOC_VERSION="${SOC_VERSION_ARG}"' in build_driver
     assert "import torch_npu" in build_driver
     assert "built module:" in build_driver
     assert "PTA" in readme
     assert "Ascend 950" in readme
+
+
+def test_lookup_simt_soc_checker_composes_chip_and_npu_names():
+    checker = PKG_DIR / "scripts" / "check_soc_version.sh"
+    fixture = PKG_DIR / "tests" / "fixtures" / "ascend950pr_board_info.txt"
+    completed = subprocess.run(
+        [
+            "bash",
+            str(checker),
+            "--board-info-file",
+            str(fixture),
+            "--value-only",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.stdout.strip() == "Ascend950PR_950_1234"
 
 
 def test_lookup_simt_random_workload_has_exact_hits_and_shuffled_misses():

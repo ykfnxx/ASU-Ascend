@@ -6,6 +6,7 @@ PKG_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BUILD_DIR_ARG="build"
 PYTHON_BIN_ARG="${PYTHON_BIN:-python3}"
 CANN_PATH_ARG="${ASCEND_CANN_PACKAGE_PATH:-${ASCEND_HOME_PATH:-${ASCEND_INSTALL_PATH:-/usr/local/Ascend/ascend-toolkit/latest}}}"
+SOC_VERSION_ARG="${SOC_VERSION:-Ascend950}"
 JOBS_ARG="$(nproc)"
 
 usage() {
@@ -18,6 +19,7 @@ Usage:
 Options:
   --build-dir PATH  CMake build directory (default: build under package)
   --cann-path PATH  CANN ascend-toolkit path
+  --soc-version SOC Full Ascend 950 SOC_VERSION
   --python PATH     Python interpreter with torch, torch-npu, pybind11
   --jobs N          Parallel build jobs (default: nproc)
   -h, --help        Show this help
@@ -41,6 +43,11 @@ while (($#)); do
     --cann-path)
       require_option_value "$@"
       CANN_PATH_ARG="$2"
+      shift 2
+      ;;
+    --soc-version)
+      require_option_value "$@"
+      SOC_VERSION_ARG="$2"
       shift 2
       ;;
     --python)
@@ -75,6 +82,12 @@ if ! [[ "${JOBS_ARG}" =~ ^[1-9][0-9]*$ ]]; then
   echo "--jobs must be a positive integer; got ${JOBS_ARG}" >&2
   exit 2
 fi
+if [[ "${SOC_VERSION_ARG}" != "Ascend950" &&
+      ! "${SOC_VERSION_ARG}" =~ ^Ascend950(PR|DT)_[[:alnum:]_.-]+$ ]]; then
+  echo "unsupported Ascend 950 SOC_VERSION: ${SOC_VERSION_ARG}" >&2
+  echo "run scripts/check_soc_version.sh to obtain the full value" >&2
+  exit 2
+fi
 if [[ ! -d "${CANN_PATH_ARG}" ]]; then
   echo "CANN path does not exist: ${CANN_PATH_ARG}" >&2
   exit 2
@@ -104,12 +117,12 @@ print(f"torch_npu={getattr(torch_npu, '__version__', 'unknown')}")
 print(f"pybind11={pybind11.__version__}")
 PY
 
-echo "SOC_VERSION=Ascend950"
+echo "SOC_VERSION=${SOC_VERSION_ARG}"
 echo "ASCEND_CANN_PACKAGE_PATH=${CANN_PATH_ARG}"
 echo "BUILD_DIR=${BUILD_DIR}"
 
 cmake -S "${PKG_DIR}" -B "${BUILD_DIR}" \
-  -DSOC_VERSION=Ascend950 \
+  -DSOC_VERSION="${SOC_VERSION_ARG}" \
   -DASCEND_CANN_PACKAGE_PATH="${CANN_PATH_ARG}" \
   -DPYTHON_BIN="${PYTHON_BIN_ARG}"
 cmake --build "${BUILD_DIR}" --parallel "${JOBS_ARG}"

@@ -168,15 +168,31 @@ id。
 
 ```bash
 cd pta-ops/asu_hbm_index_lookup_simt
+
+# 950PR/950DT 的完整值为 <Chip Name>_<NPU Name>
+bash scripts/check_soc_version.sh --device 0
+SOC_VERSION="$(
+  bash scripts/check_soc_version.sh --device 0 --value-only
+)"
+
 bash scripts/build_lookup_simt.sh \
   --cann-path /usr/local/Ascend/ascend-toolkit/latest \
+  --soc-version "${SOC_VERSION}" \
   --python python3 \
   --build-dir build
 ```
 
-脚本固定传入 `SOC_VERSION=Ascend950`，检查 Python 构建依赖，完成 CMake
-configure/build，并打印最终 Python extension 的路径。已有低层入口
-`SOC_VERSION=Ascend950 ./build.sh` 仍可直接使用。
+检查脚本执行 `npu-smi info -t board -i 0`，将 `Chip Name` 和
+`NPU Name` 拼为完整 `SOC_VERSION`；例如
+`Ascend950PR_950_1234`。`--value-only` 只输出该值，可安全用于命令替换。
+
+编译脚本通过 `--soc-version` 将完整型号传给 CMake，检查 Python 构建
+依赖，完成 configure/build，并打印最终 Python extension 的路径。也可以
+使用低层入口：
+
+```bash
+SOC_VERSION="${SOC_VERSION}" ./build.sh
+```
 
 ## 测试
 

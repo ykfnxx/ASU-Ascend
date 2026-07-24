@@ -87,7 +87,7 @@ set(ASU_HBM_INDEX_LOOKUP_SIMT_INCLUDE_DIR
 ascendc_library(asu_hbm_index_lookup_simt_kernel SHARED
   ${CMAKE_CURRENT_SOURCE_DIR}/src/asu_hbm_index_lookup_simt_kernel.cpp
 )
-target_include_directories(asu_hbm_index_lookup_simt_kernel PRIVATE
+ascendc_include_directories(asu_hbm_index_lookup_simt_kernel PRIVATE
   ${ASU_HBM_INDEX_LOOKUP_SIMT_INCLUDE_DIR}
   ${ASCEND_CANN_PACKAGE_PATH}/include
 )

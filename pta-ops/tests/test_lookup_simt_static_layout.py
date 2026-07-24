@@ -1,3 +1,5 @@
+import shutil
+import subprocess
 from pathlib import Path
 
 
@@ -17,8 +19,18 @@ def test_lookup_simt_pta_tree_exists():
         "include/asu_hbm_index_lookup_simt_constants.h",
         "src/asu_hbm_index_lookup_simt_kernel.cpp",
         "src/asu_hbm_index_lookup_simt_torch.cpp",
+        "python/lookup_lru_reference.py",
+        "python/random_workload.py",
+        "scripts/build_lookup_simt.sh",
         "scripts/bench_lookup_simt.py",
+        "scripts/lookup_simt_common.py",
+        "scripts/profile_lookup_simt.py",
         "scripts/validate_lookup_simt.py",
+        "tests/test_reference.py",
+        "tests/stubs/kernel_operator.h",
+        "tests/stubs/simt_api/common_functions.h",
+        "tests/stubs/simt_api/device_atomic_functions.h",
+        "tests/stubs/simt_api/device_sync_functions.h",
     ]
 
     for file_name in required_files:
@@ -44,11 +56,11 @@ def test_lookup_simt_constants_and_launcher_symbols():
     for token in [
         "ASU_HBM_INDEX_SIZE = 128U * 1024U",
         "ASU_HBM_SLOT_COUNT = 10U * 1024U",
-        "ASU_HBM_FREE_SLOT_COUNT = 2U * 1024U",
         "ASU_HBM_QUERY_COUNT = 2U * 1024U",
         "ASU_HBM_NOT_FOUND = -1",
         "ASU_HBM_CLAIMING = -2",
         "ASU_HBM_SIMT_THREADS = 256U",
+        "ASU_HBM_WORKSPACE_STRIDE",
     ]:
         assert token in constants
 
@@ -61,47 +73,102 @@ def test_lookup_simt_constants_and_launcher_symbols():
     assert "asc_vf_call" in kernel
     assert "asc_syncthreads" in kernel
     assert "asc_atomic_cas" in kernel
-    assert "asc_atomic_add" in kernel
     assert "ASU_HBM_CLAIMING" in kernel
-    assert "alloc_count" in kernel
-    assert "alloc_count = at::empty" in wrapper
+    assert "hit_slots" in kernel
+    assert "evictable_slots" in kernel
+    assert "stale_count" in kernel
+    assert "victim_token" in kernel
+    assert "miss_mask" in kernel
+    assert "workspace_size" in wrapper
+    assert "std::tuple<at::Tensor, at::Tensor>" in wrapper
+    assert "at::kBool" in wrapper
     assert "threadIdx.x" in kernel
-    assert "blockIdx.x" in kernel
     assert "PYBIND11_MODULE" in wrapper
     assert "asu_hbm_index_lookup_simt" in wrapper
 
 
-def test_lookup_simt_uses_stateless_parallel_allocation():
+def test_lookup_simt_closes_allocation_eviction_and_lru_state():
     header = read("include/asu_hbm_index_lookup_simt_constants.h")
     kernel = read("src/asu_hbm_index_lookup_simt_kernel.cpp")
     wrapper = read("src/asu_hbm_index_lookup_simt_torch.cpp")
     readme = read("README.md")
     validate = read("scripts/validate_lookup_simt.py")
     bench = read("scripts/bench_lookup_simt.py")
+    workload = read("python/random_workload.py")
 
     assert "void* free_head" not in header
     assert "at::Tensor free_head" not in wrapper
-    assert "CheckInt32NpuContiguous(free_head" not in wrapper
-    assert "int32_t head = free_head[req_id]" not in kernel
-    assert "for (uint32_t pos = 0; pos < ASU_HBM_QUERY_COUNT; ++pos)" not in kernel
-    assert "rank = asc_atomic_add" in kernel
-    assert "slot = req_free_slots[static_cast<uint32_t>(rank)]" in kernel
+    assert "free_slots" not in header
+    assert "free_slots" not in wrapper
+    assert "free_slots" not in kernel
+    assert "token_to_slot" in header
+    assert "slot_to_token" in header
+    assert "lru_slots" in header
+    assert "miss_mask" in header
+    assert "req_token_to_slot[static_cast<uint32_t>(victim_token)]" in kernel
+    assert "req_slot_to_token[victim_slot] = token" in kernel
+    assert "untouched stale slots + newly allocated miss slots" in kernel
+    assert "host_cache" not in kernel
+    assert "device_buffer" not in kernel
+    assert "expected_result" in validate
+    assert "assert_runtime_result" in validate
+    assert "expected_result" in bench
+    assert "make_random_case" in workload
     assert "free_head" not in readme
-    assert "assert_lookup_semantics" in validate
-    assert "assert_lookup_semantics" in bench
+
+
+def test_lookup_simt_kernel_is_valid_cxx_with_api_stubs():
+    compiler = shutil.which("c++")
+    if compiler is None:
+        return
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-DASCENDC_CPU_DEBUG",
+            f"-I{PKG_DIR / 'include'}",
+            f"-I{PKG_DIR / 'tests' / 'stubs'}",
+            "-fsyntax-only",
+            str(PKG_DIR / "src" / "asu_hbm_index_lookup_simt_kernel.cpp"),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_lookup_simt_build_files_target_ascend_950_pta():
     cmake = read("CMakeLists.txt")
     build = read("build.sh")
+    build_driver = read("scripts/build_lookup_simt.sh")
     readme = read("README.md")
 
     assert "ascendc_library" in cmake
     assert "pybind11_add_module" in cmake
-    assert "Ascend950" in build
-    assert "SOC_VERSION" in build
+    assert 'set(Python3_EXECUTABLE "${PYTHON_BIN}")' in cmake
+    assert 'SOC_VERSION "Ascend950"' in cmake
+    assert "Ascend950 only" in cmake
+    assert 'SOC_VERSION:-Ascend950' in build
+    assert "Ascend950 only" in build
+    assert "-DSOC_VERSION=Ascend950" in build_driver
+    assert "import torch_npu" in build_driver
+    assert "built module:" in build_driver
     assert "PTA" in readme
     assert "Ascend 950" in readme
+
+
+def test_lookup_simt_random_workload_has_exact_hits_and_shuffled_misses():
+    workload = read("python/random_workload.py")
+
+    for token in [
+        "validate_hit_count",
+        "rng.sample(range(SLOT_COUNT), hit_count)",
+        "rng.sample(range(SLOT_COUNT, INDEX_SIZE), miss_count)",
+        "rng.shuffle(query)",
+        "case_id",
+        "req_id",
+    ]:
+        assert token in workload
 
 
 def test_lookup_simt_benchmark_preloads_fresh_npu_states():
@@ -110,14 +177,38 @@ def test_lookup_simt_benchmark_preloads_fresh_npu_states():
     for token in [
         "default=100",
         "default=50",
-        "default=0.10",
-        "preload_benchmark_states",
-        "to_npu(torch, case.index)",
+        "--hit-count",
+        "DEFAULT_HIT_COUNT = 1843",
+        "make_random_case",
+        "preload_states",
+        "to_npu_state",
         "torch.npu.synchronize()",
+        "torch.npu.Event",
         "time.perf_counter()",
         "elapsed_time",
-        "assert_lookup_semantics",
-        "unique_misses_per_req",
+        "verify_one_state",
         "outputs.append",
+        "event_ns_per_query",
+        "randomized_miss_positions",
     ]:
         assert token in bench
+
+
+def test_lookup_simt_profile_is_single_op_and_directly_parsed():
+    profile = read("scripts/profile_lookup_simt.py")
+
+    for token in [
+        "--hit-count",
+        "make_random_case",
+        "preload_states",
+        "torch_npu.profiler.profile",
+        "torch_npu.profiler.tensorboard_trace_handler",
+        "analyse_flag=True",
+        "async_mode=False",
+        "ProfilerLevel.Level1",
+        "outputs",
+        "ASCEND_PROFILER_OUTPUT",
+        "manifest.json",
+        "randomized_miss_positions",
+    ]:
+        assert token in profile

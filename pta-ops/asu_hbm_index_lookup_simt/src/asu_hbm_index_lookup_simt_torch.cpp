@@ -2,99 +2,153 @@
 
 #include <cstdint>
 #include <limits>
+#include <tuple>
 
 #include <torch/extension.h>
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 
 namespace {
 
-void CheckInt32NpuContiguous(const at::Tensor& tensor, const char* name)
+void CheckNpuContiguous(const at::Tensor& tensor, const char* name)
 {
     TORCH_CHECK(tensor.defined(), name, " must be defined");
     TORCH_CHECK(tensor.device().type() == c10::DeviceType::PrivateUse1,
                 name, " must be an NPU tensor");
-    TORCH_CHECK(tensor.scalar_type() == at::kInt,
-                name, " must be torch.int32");
     TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
 }
 
-int64_t RequiredElements(int64_t req_num, uint32_t per_req, const char* name)
+void CheckNpuDtype(const at::Tensor& tensor,
+                   at::ScalarType dtype,
+                   const char* name)
 {
-    TORCH_CHECK(req_num > 0, "req_num must be positive");
-    TORCH_CHECK(req_num <= static_cast<int64_t>(std::numeric_limits<uint32_t>::max()),
-                "req_num is too large for ", name);
-    TORCH_CHECK(req_num <= std::numeric_limits<int64_t>::max() / static_cast<int64_t>(per_req),
-                name, " element count overflows int64");
-    return req_num * static_cast<int64_t>(per_req);
+    CheckNpuContiguous(tensor, name);
+    TORCH_CHECK(tensor.scalar_type() == dtype,
+                name, " has an invalid dtype: ", tensor.scalar_type());
 }
 
-void CheckMinElements(const at::Tensor& tensor, int64_t expected, const char* name)
-{
-    TORCH_CHECK(tensor.numel() >= expected,
-                name, " must have at least ", expected, " elements; got ", tensor.numel());
-}
-
-void CheckExactElements(const at::Tensor& tensor, int64_t expected, const char* name)
-{
-    TORCH_CHECK(tensor.numel() == expected,
-                name, " must have exactly ", expected, " elements; got ", tensor.numel());
-}
-
-void CheckSameDevice(const at::Tensor& tensor, const c10::Device& expected_device, const char* name)
+void CheckSameDevice(const at::Tensor& tensor,
+                     const c10::Device& expected_device,
+                     const char* name)
 {
     TORCH_CHECK(tensor.device() == expected_device,
-                name, " must be on device ", expected_device, "; got ", tensor.device());
+                name, " must be on device ", expected_device,
+                "; got ", tensor.device());
+}
+
+uint32_t CheckedReqNum(int64_t req_num)
+{
+    TORCH_CHECK(req_num > 0, "req_num must be positive");
+    TORCH_CHECK(
+        req_num <= static_cast<int64_t>(std::numeric_limits<uint32_t>::max()),
+        "req_num exceeds uint32 range");
+    return static_cast<uint32_t>(req_num);
+}
+
+void CheckShape2D(const at::Tensor& tensor,
+                  int64_t rows,
+                  int64_t columns,
+                  const char* name)
+{
+    TORCH_CHECK(tensor.dim() == 2,
+                name, " must be a 2D tensor; got ", tensor.dim(), " dimensions");
+    TORCH_CHECK(tensor.size(0) == rows && tensor.size(1) == columns,
+                name, " must have shape [", rows, ", ", columns,
+                "]; got ", tensor.sizes());
+}
+
+int64_t WorkspaceElements(int64_t req_num)
+{
+    CheckedReqNum(req_num);
+    TORCH_CHECK(
+        static_cast<uint64_t>(req_num) <=
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) /
+                ASU_HBM_WORKSPACE_STRIDE,
+        "workspace element count overflows int64");
+    return static_cast<int64_t>(
+        static_cast<uint64_t>(req_num) * ASU_HBM_WORKSPACE_STRIDE);
 }
 
 }  // namespace
 
-at::Tensor asu_hbm_index_lookup_simt(at::Tensor index,
-                                     at::Tensor slot_to_index,
-                                     at::Tensor free_slots,
-                                     at::Tensor query_index,
-                                     int64_t req_num)
+int64_t asu_hbm_index_lookup_simt_workspace_size(int64_t req_num)
 {
-    CheckInt32NpuContiguous(index, "index");
-    CheckInt32NpuContiguous(slot_to_index, "slot_to_index");
-    CheckInt32NpuContiguous(free_slots, "free_slots");
-    CheckInt32NpuContiguous(query_index, "query_index");
+    return WorkspaceElements(req_num);
+}
 
-    const c10::Device device = index.device();
-    CheckSameDevice(slot_to_index, device, "slot_to_index");
-    CheckSameDevice(free_slots, device, "free_slots");
-    CheckSameDevice(query_index, device, "query_index");
+std::tuple<at::Tensor, at::Tensor> asu_hbm_index_lookup_simt(
+    at::Tensor token_to_slot,
+    at::Tensor slot_to_token,
+    at::Tensor lru_slots,
+    at::Tensor query_token_ids,
+    int64_t req_num,
+    at::Tensor workspace)
+{
+    CheckNpuDtype(token_to_slot, at::kInt, "token_to_slot");
+    CheckNpuDtype(slot_to_token, at::kInt, "slot_to_token");
+    CheckNpuDtype(lru_slots, at::kShort, "lru_slots");
+    CheckNpuDtype(query_token_ids, at::kInt, "query_token_ids");
 
-    const int64_t required_index = RequiredElements(req_num, ASU_HBM_INDEX_SIZE, "index");
-    const int64_t required_slot_to_index = RequiredElements(req_num, ASU_HBM_SLOT_COUNT, "slot_to_index");
-    const int64_t required_free_slots = RequiredElements(req_num, ASU_HBM_FREE_SLOT_COUNT, "free_slots");
-    const int64_t required_query = RequiredElements(req_num, ASU_HBM_QUERY_COUNT, "query_index");
+    const c10::Device device = token_to_slot.device();
+    CheckSameDevice(slot_to_token, device, "slot_to_token");
+    CheckSameDevice(lru_slots, device, "lru_slots");
+    CheckSameDevice(query_token_ids, device, "query_token_ids");
 
-    CheckMinElements(index, required_index, "index");
-    CheckMinElements(slot_to_index, required_slot_to_index, "slot_to_index");
-    CheckMinElements(free_slots, required_free_slots, "free_slots");
-    CheckExactElements(query_index, required_query, "query_index");
+    const uint32_t req_num_u32 = CheckedReqNum(req_num);
+    CheckShape2D(token_to_slot, req_num, ASU_HBM_INDEX_SIZE,
+                 "token_to_slot");
+    CheckShape2D(slot_to_token, req_num, ASU_HBM_SLOT_COUNT,
+                 "slot_to_token");
+    CheckShape2D(lru_slots, req_num, ASU_HBM_SLOT_COUNT,
+                 "lru_slots");
+    CheckShape2D(query_token_ids, req_num, ASU_HBM_QUERY_COUNT,
+                 "query_token_ids");
 
-    at::Tensor slot_out = at::empty_like(query_index);
-    at::Tensor alloc_count = at::empty({req_num}, query_index.options());
+    const int64_t required_workspace = WorkspaceElements(req_num);
+    if (!workspace.defined()) {
+        workspace = at::empty({required_workspace}, query_token_ids.options());
+    } else {
+        CheckNpuDtype(workspace, at::kInt, "workspace");
+        CheckSameDevice(workspace, device, "workspace");
+        TORCH_CHECK(workspace.numel() >= required_workspace,
+                    "workspace has ", workspace.numel(),
+                    " int32 elements; need ", required_workspace);
+    }
+
+    at::Tensor slot_ids = at::empty_like(query_token_ids);
+    at::Tensor miss_mask =
+        at::empty(query_token_ids.sizes(),
+                  query_token_ids.options().dtype(at::kBool));
+
     const c10_npu::OptionalNPUGuard npu_guard(device);
     auto acl_stream = c10_npu::getCurrentNPUStream().stream(false);
-    const uint32_t req_num_u32 = static_cast<uint32_t>(req_num);
-
     asu_hbm_index_lookup_simt_do(
         acl_stream,
-        reinterpret_cast<void*>(index.data_ptr<int32_t>()),
-        reinterpret_cast<void*>(slot_to_index.data_ptr<int32_t>()),
-        reinterpret_cast<void*>(free_slots.data_ptr<int32_t>()),
-        reinterpret_cast<void*>(alloc_count.data_ptr<int32_t>()),
-        const_cast<void*>(reinterpret_cast<const void*>(query_index.data_ptr<int32_t>())),
-        reinterpret_cast<void*>(slot_out.data_ptr<int32_t>()),
+        reinterpret_cast<void*>(token_to_slot.data_ptr<int32_t>()),
+        reinterpret_cast<void*>(slot_to_token.data_ptr<int32_t>()),
+        reinterpret_cast<void*>(lru_slots.data_ptr<int16_t>()),
+        const_cast<void*>(
+            reinterpret_cast<const void*>(query_token_ids.data_ptr<int32_t>())),
+        reinterpret_cast<void*>(slot_ids.data_ptr<int32_t>()),
+        reinterpret_cast<void*>(miss_mask.data_ptr<bool>()),
+        reinterpret_cast<void*>(workspace.data_ptr<int32_t>()),
         req_num_u32);
 
-    return slot_out;
+    return std::make_tuple(slot_ids, miss_mask);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
-    m.def("asu_hbm_index_lookup_simt", &asu_hbm_index_lookup_simt,
-          "ASU HBM index lookup with miss allocation, Ascend 950 SIMT PTA");
+    m.def("workspace_size",
+          &asu_hbm_index_lookup_simt_workspace_size,
+          pybind11::arg("req_num"),
+          "Return the int32 workspace element count.");
+    m.def("asu_hbm_index_lookup_simt",
+          &asu_hbm_index_lookup_simt,
+          pybind11::arg("token_to_slot"),
+          pybind11::arg("slot_to_token"),
+          pybind11::arg("lru_slots"),
+          pybind11::arg("query_token_ids"),
+          pybind11::arg("req_num"),
+          pybind11::arg("workspace") = at::Tensor(),
+          "Ascend 950 SIMT token lookup, allocation, and approximate-LRU eviction.");
 }

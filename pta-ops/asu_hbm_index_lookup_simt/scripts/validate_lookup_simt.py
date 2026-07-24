@@ -2,124 +2,96 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
-import sys
 from pathlib import Path
-from types import ModuleType
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-PKG_DIR = SCRIPT_DIR.parent
-REPO_ROOT = PKG_DIR.parents[1]
-OPS_SCRIPTS_DIR = REPO_ROOT / "ops" / "scripts"
-sys.path.insert(0, str(OPS_SCRIPTS_DIR))
-
-from asu_hbm_index_common import (  # noqa: E402
-    NOT_FOUND,
-    QUERY_COUNT,
-    make_index_case,
+from lookup_simt_common import (
+    PKG_DIR,
+    assert_runtime_result,
+    call_lookup,
+    expected_result,
+    load_extension,
     require_runtime,
-    to_npu,
+    to_npu_state,
+)
+
+from python.random_workload import (  # type: ignore[import-not-found]
+    QUERY_COUNT,
+    make_random_case,
+    validate_hit_count,
 )
 
 
+DEFAULT_HIT_COUNT = 1843
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Validate Ascend 950 SIMT PTA ASU HBM index lookup.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Validate Ascend 950 SIMT lookup with an exact hit count and "
+            "random unique miss tokens at randomized query positions."
+        )
+    )
     parser.add_argument("--build-dir", type=Path, default=PKG_DIR / "build")
     parser.add_argument("--module-path", type=Path, default=None)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--req-num", type=int, default=2)
-    parser.add_argument("--pattern", choices=("hit", "miss", "mixed"), default="mixed")
+    parser.add_argument(
+        "--hit-count",
+        type=int,
+        default=DEFAULT_HIT_COUNT,
+        help=f"exact hits per {QUERY_COUNT}-token request (default: {DEFAULT_HIT_COUNT})",
+    )
+    parser.add_argument("--seed", type=int, default=20260724)
+    parser.add_argument("--case-id", type=int, default=0)
     return parser.parse_args()
 
 
-def find_module_path(build_dir: Path) -> Path:
-    candidates = sorted(build_dir.expanduser().resolve().rglob("asu_hbm_index_lookup_simt*.so"))
-    if not candidates:
-        raise FileNotFoundError(
-            f"could not find asu_hbm_index_lookup_simt*.so under {build_dir}; "
-            "pass --module-path explicitly"
-        )
-    return candidates[0]
-
-
-def load_extension(module_path: Path | None, build_dir: Path) -> ModuleType:
-    if module_path is None:
-        module_path = find_module_path(build_dir)
-    module_path = module_path.expanduser().resolve()
-    if not module_path.exists():
-        raise FileNotFoundError(f"extension module does not exist: {module_path}")
-
-    spec = importlib.util.spec_from_file_location("asu_hbm_index_lookup_simt", module_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"could not create import spec for {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def make_npu_tensors(torch, case):
-    return {
-        "index": to_npu(torch, case.index),
-        "slot_to_index": to_npu(torch, case.slot_to_index),
-        "free_slots": to_npu(torch, case.free_slots),
-        "query_index": to_npu(torch, case.query_index),
-    }
-
-
-def assert_lookup_semantics(slot_out, index_before, slot_to_index, free_slots, query_index, index_after) -> int:
-    unique_misses = 0
-    for req_id in range(query_index.shape[0]):
-        assigned_slots = set()
-        free_slot_set = {int(slot) for slot in free_slots[req_id]}
-        for index_id_np in set(query_index[req_id].tolist()):
-            index_id = int(index_id_np)
-            before_slot = int(index_before[req_id, index_id])
-            after_slot = int(index_after[req_id, index_id])
-            if before_slot == NOT_FOUND:
-                unique_misses += 1
-                assert after_slot != NOT_FOUND, (req_id, index_id)
-                assert after_slot in free_slot_set, (req_id, index_id, after_slot)
-                assert after_slot not in assigned_slots, (req_id, index_id, after_slot)
-                assert int(slot_to_index[req_id, after_slot]) == index_id, (req_id, index_id, after_slot)
-                assigned_slots.add(after_slot)
-            else:
-                assert after_slot == before_slot, (req_id, index_id, before_slot, after_slot)
-
-        for pos, index_id_np in enumerate(query_index[req_id]):
-            index_id = int(index_id_np)
-            assert int(slot_out[req_id, pos]) == int(index_after[req_id, index_id]), (req_id, pos, index_id)
-    return unique_misses
+def validate_args(args: argparse.Namespace) -> None:
+    if args.req_num <= 0:
+        raise ValueError("--req-num must be positive")
+    if args.device < 0:
+        raise ValueError("--device cannot be negative")
+    if args.case_id < 0:
+        raise ValueError("--case-id cannot be negative")
+    validate_hit_count(args.hit_count)
 
 
 def main() -> None:
     args = parse_args()
-    torch = require_runtime(args.device)
-    module = load_extension(args.module_path, args.build_dir)
-    case = make_index_case(args.req_num, args.pattern)
-    tensors = make_npu_tensors(torch, case)
-
-    slot_out = module.asu_hbm_index_lookup_simt(
-        tensors["index"],
-        tensors["slot_to_index"],
-        tensors["free_slots"],
-        tensors["query_index"],
+    validate_args(args)
+    np, torch, _ = require_runtime(args.device)
+    module, module_path = load_extension(args.module_path, args.build_dir)
+    case = make_random_case(
+        np,
         args.req_num,
+        args.hit_count,
+        seed=args.seed,
+        case_id=args.case_id,
     )
+    expected = expected_result(np, case)
+    state = to_npu_state(torch, module, case)
+
+    outputs = call_lookup(module, state, args.req_num)
     torch.npu.synchronize()
+    assert_runtime_result(np, state, outputs, expected)
 
-    unique_misses = assert_lookup_semantics(
-        slot_out.cpu().numpy().reshape(args.req_num, QUERY_COUNT),
-        case.index,
-        tensors["slot_to_index"].cpu().numpy(),
-        case.free_slots,
-        case.query_index,
-        tensors["index"].cpu().numpy(),
+    miss_positions = np.flatnonzero(
+        case.query_token_ids[0] >= 10 * 1024
     )
-
     print(
-        "PASS lookup_simt: req_num={} pattern={} unique_misses={}".format(
-            args.req_num, args.pattern, unique_misses
+        "PASS lookup_simt: req_num={} hit_count={} miss_count={} "
+        "seed={} case_id={} module={}".format(
+            args.req_num,
+            case.hit_count,
+            case.miss_count,
+            args.seed,
+            args.case_id,
+            module_path,
+        )
+    )
+    print(
+        "request0 random miss positions sample={}".format(
+            miss_positions[:16].tolist()
         )
     )
 

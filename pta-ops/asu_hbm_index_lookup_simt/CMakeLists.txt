@@ -9,6 +9,10 @@ set(SOC_VERSION "Ascend950" CACHE STRING "Ascend SoC version")
 set(ASCEND_CANN_PACKAGE_PATH "" CACHE PATH "CANN ascend-toolkit path")
 set(PYTHON_BIN "python3" CACHE STRING "Python executable")
 
+if(NOT SOC_VERSION STREQUAL "Ascend950")
+  message(FATAL_ERROR "asu_hbm_index_lookup_simt supports Ascend950 only")
+endif()
+
 if(NOT ASCEND_CANN_PACKAGE_PATH)
   if(DEFINED ENV{ASCEND_HOME_PATH})
     set(ASCEND_CANN_PACKAGE_PATH "$ENV{ASCEND_HOME_PATH}")
@@ -29,6 +33,7 @@ endif()
 
 include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 
+set(Python3_EXECUTABLE "${PYTHON_BIN}")
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 
 execute_process(

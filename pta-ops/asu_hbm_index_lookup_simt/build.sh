@@ -7,6 +7,11 @@ BUILD_DIR="${BUILD_DIR:-${SCRIPT_DIR}/build}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 ASCEND_CANN_PACKAGE_PATH="${ASCEND_CANN_PACKAGE_PATH:-${ASCEND_HOME_PATH:-${ASCEND_INSTALL_PATH:-/usr/local/Ascend/ascend-toolkit/latest}}}"
 
+if [[ "${SOC_VERSION}" != "Ascend950" ]]; then
+  echo "asu_hbm_index_lookup_simt supports SOC_VERSION=Ascend950 only" >&2
+  exit 2
+fi
+
 if [[ -f "${ASCEND_CANN_PACKAGE_PATH}/set_env.sh" ]]; then
   # shellcheck disable=SC1090
   source "${ASCEND_CANN_PACKAGE_PATH}/set_env.sh"

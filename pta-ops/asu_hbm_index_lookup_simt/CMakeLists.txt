@@ -126,6 +126,6 @@ target_link_libraries(asu_hbm_index_lookup_simt PRIVATE
   ascendcl
 )
 set_target_properties(asu_hbm_index_lookup_simt PROPERTIES
-  BUILD_RPATH "$ORIGIN;${ASCEND_CANN_PACKAGE_PATH}/runtime/lib64;${TORCH_NPU_ROOT}/lib"
-  INSTALL_RPATH "$ORIGIN;${ASCEND_CANN_PACKAGE_PATH}/runtime/lib64;${TORCH_NPU_ROOT}/lib"
+  BUILD_RPATH "$ORIGIN;$ORIGIN/lib;${ASCEND_CANN_PACKAGE_PATH}/runtime/lib64;${TORCH_NPU_ROOT}/lib"
+  INSTALL_RPATH "$ORIGIN;$ORIGIN/lib;${ASCEND_CANN_PACKAGE_PATH}/runtime/lib64;${TORCH_NPU_ROOT}/lib"
 )

@@ -157,6 +157,10 @@ def test_lookup_simt_build_files_target_ascend_950_pta():
     assert "ASU_HBM_INDEX_LOOKUP_SIMT_INCLUDE_DIR" in cmake
     assert "\ninclude_directories(" not in cmake
     assert 'set(Python3_EXECUTABLE "${PYTHON_BIN}")' in cmake
+    assert (
+        'set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)'
+        in cmake
+    )
     assert 'SOC_VERSION ""' in cmake
     assert 'SOC_VERSION="${SOC_VERSION:-}"' in build
     assert "--soc-version" in build_driver

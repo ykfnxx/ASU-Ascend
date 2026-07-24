@@ -5,6 +5,13 @@ project(asu_hbm_index_lookup_simt LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# CANN 9.1's legacy ascendc_library merge command always forwards
+# CMAKE_BUILD_TYPE to merge_mix_obj.sh.  An empty value leaves --build-type
+# without an argument and the script exits before linking any device object.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
+endif()
+
 set(SOC_VERSION "" CACHE STRING "Exact Ascend SoC version")
 set(ASCEND_CANN_PACKAGE_PATH "" CACHE PATH "CANN ascend-toolkit path")
 set(PYTHON_BIN "python3" CACHE STRING "Python executable")

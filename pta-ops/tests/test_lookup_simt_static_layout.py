@@ -146,6 +146,12 @@ def test_lookup_simt_build_files_target_ascend_950_pta():
 
     assert "ascendc_library" in cmake
     assert "pybind11_add_module" in cmake
+    assert (
+        "target_include_directories("
+        "asu_hbm_index_lookup_simt_kernel PRIVATE"
+    ) in cmake
+    assert "ASU_HBM_INDEX_LOOKUP_SIMT_INCLUDE_DIR" in cmake
+    assert "\ninclude_directories(" not in cmake
     assert 'set(Python3_EXECUTABLE "${PYTHON_BIN}")' in cmake
     assert 'SOC_VERSION ""' in cmake
     assert 'SOC_VERSION="${SOC_VERSION:-}"' in build

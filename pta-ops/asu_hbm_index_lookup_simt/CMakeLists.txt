@@ -81,13 +81,15 @@ if(NOT TORCH_NPU_ROOT_RESULT EQUAL 0)
 endif()
 string(REGEX MATCH "[^\r\n]+$" TORCH_NPU_ROOT "${TORCH_NPU_ROOT}")
 
-include_directories(
-  ${CMAKE_CURRENT_SOURCE_DIR}/include
-  ${ASCEND_CANN_PACKAGE_PATH}/include
-)
+set(ASU_HBM_INDEX_LOOKUP_SIMT_INCLUDE_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/include")
 
 ascendc_library(asu_hbm_index_lookup_simt_kernel SHARED
   ${CMAKE_CURRENT_SOURCE_DIR}/src/asu_hbm_index_lookup_simt_kernel.cpp
+)
+target_include_directories(asu_hbm_index_lookup_simt_kernel PRIVATE
+  ${ASU_HBM_INDEX_LOOKUP_SIMT_INCLUDE_DIR}
+  ${ASCEND_CANN_PACKAGE_PATH}/include
 )
 ascendc_compile_definitions(asu_hbm_index_lookup_simt_kernel PRIVATE
   -DASCENDC_DUMP=0
@@ -97,7 +99,7 @@ pybind11_add_module(asu_hbm_index_lookup_simt
   ${CMAKE_CURRENT_SOURCE_DIR}/src/asu_hbm_index_lookup_simt_torch.cpp
 )
 target_include_directories(asu_hbm_index_lookup_simt PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${ASU_HBM_INDEX_LOOKUP_SIMT_INCLUDE_DIR}
   ${TORCH_INCLUDE_DIRS}
   ${TORCH_NPU_ROOT}/include
   ${TORCH_NPU_ROOT}/..

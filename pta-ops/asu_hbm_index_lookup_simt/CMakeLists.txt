@@ -36,6 +36,10 @@ endif()
 
 include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 
+# CANN 9.1's legacy host_config.cmake sets CMAKE_SKIP_RPATH globally.
+# Restore normal CMake RPATH handling for the PyTorch extension target below.
+set(CMAKE_SKIP_RPATH FALSE)
+
 set(Python3_EXECUTABLE "${PYTHON_BIN}")
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 

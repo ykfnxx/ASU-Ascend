@@ -173,6 +173,10 @@ def test_lookup_simt_build_files_target_ascend_950_pta():
     assert "unsupported Ascend 950 SOC_VERSION" not in build_driver
     assert "import torch_npu" in build_driver
     assert "built module:" in build_driver
+    assert "set(CMAKE_SKIP_RPATH FALSE)" in cmake
+    assert cmake.index("include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)") < cmake.index(
+        "set(CMAKE_SKIP_RPATH FALSE)"
+    )
     assert 'BUILD_RPATH "$ORIGIN;$ORIGIN/lib;' in cmake
     assert 'INSTALL_RPATH "$ORIGIN;$ORIGIN/lib;' in cmake
     assert "PTA" in readme

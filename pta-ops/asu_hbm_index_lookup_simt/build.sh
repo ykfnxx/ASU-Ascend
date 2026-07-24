@@ -2,15 +2,13 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SOC_VERSION="${SOC_VERSION:-Ascend950}"
+SOC_VERSION="${SOC_VERSION:-}"
 BUILD_DIR="${BUILD_DIR:-${SCRIPT_DIR}/build}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 ASCEND_CANN_PACKAGE_PATH="${ASCEND_CANN_PACKAGE_PATH:-${ASCEND_HOME_PATH:-${ASCEND_INSTALL_PATH:-/usr/local/Ascend/ascend-toolkit/latest}}}"
 
-if [[ "${SOC_VERSION}" != "Ascend950" &&
-      ! "${SOC_VERSION}" =~ ^Ascend950(PR|DT)_[[:alnum:]_.-]+$ ]]; then
-  echo "unsupported Ascend 950 SOC_VERSION: ${SOC_VERSION}" >&2
-  echo "run scripts/check_soc_version.sh to obtain the full value" >&2
+if [[ -z "${SOC_VERSION}" ]]; then
+  echo "SOC_VERSION must be set" >&2
   exit 2
 fi
 

@@ -5,16 +5,9 @@ project(asu_hbm_index_lookup_simt LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-set(SOC_VERSION "Ascend950" CACHE STRING "Ascend SoC version")
+set(SOC_VERSION "" CACHE STRING "Exact Ascend SoC version")
 set(ASCEND_CANN_PACKAGE_PATH "" CACHE PATH "CANN ascend-toolkit path")
 set(PYTHON_BIN "python3" CACHE STRING "Python executable")
-
-if(NOT SOC_VERSION STREQUAL "Ascend950" AND
-   NOT SOC_VERSION MATCHES "^Ascend950(PR|DT)_[A-Za-z0-9_.-]+$")
-  message(FATAL_ERROR
-    "Unsupported Ascend 950 SOC_VERSION: ${SOC_VERSION}. "
-    "Use scripts/check_soc_version.sh to obtain the full value.")
-endif()
 
 if(NOT ASCEND_CANN_PACKAGE_PATH)
   if(DEFINED ENV{ASCEND_HOME_PATH})

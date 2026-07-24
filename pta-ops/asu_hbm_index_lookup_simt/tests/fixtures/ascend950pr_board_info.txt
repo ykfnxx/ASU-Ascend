@@ -1,4 +1,0 @@
-Board ID                       : 0
-Chip Name                      : Ascend950PR
-NPU Name                       : 950_1234
-PCIe Bus Info                  : 0000:01:00.0

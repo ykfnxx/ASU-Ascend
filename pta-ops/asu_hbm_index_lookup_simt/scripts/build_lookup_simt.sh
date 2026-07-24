@@ -6,7 +6,7 @@ PKG_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BUILD_DIR_ARG="build"
 PYTHON_BIN_ARG="${PYTHON_BIN:-python3}"
 CANN_PATH_ARG="${ASCEND_CANN_PACKAGE_PATH:-${ASCEND_HOME_PATH:-${ASCEND_INSTALL_PATH:-/usr/local/Ascend/ascend-toolkit/latest}}}"
-SOC_VERSION_ARG="${SOC_VERSION:-Ascend950}"
+SOC_VERSION_ARG="${SOC_VERSION:-}"
 JOBS_ARG="$(nproc)"
 
 usage() {
@@ -19,7 +19,7 @@ Usage:
 Options:
   --build-dir PATH  CMake build directory (default: build under package)
   --cann-path PATH  CANN ascend-toolkit path
-  --soc-version SOC Full Ascend 950 SOC_VERSION
+  --soc-version SOC Exact SOC_VERSION (required unless set in environment)
   --python PATH     Python interpreter with torch, torch-npu, pybind11
   --jobs N          Parallel build jobs (default: nproc)
   -h, --help        Show this help
@@ -82,10 +82,8 @@ if ! [[ "${JOBS_ARG}" =~ ^[1-9][0-9]*$ ]]; then
   echo "--jobs must be a positive integer; got ${JOBS_ARG}" >&2
   exit 2
 fi
-if [[ "${SOC_VERSION_ARG}" != "Ascend950" &&
-      ! "${SOC_VERSION_ARG}" =~ ^Ascend950(PR|DT)_[[:alnum:]_.-]+$ ]]; then
-  echo "unsupported Ascend 950 SOC_VERSION: ${SOC_VERSION_ARG}" >&2
-  echo "run scripts/check_soc_version.sh to obtain the full value" >&2
+if [[ -z "${SOC_VERSION_ARG}" ]]; then
+  echo "--soc-version is required when SOC_VERSION is not set" >&2
   exit 2
 fi
 if [[ ! -d "${CANN_PATH_ARG}" ]]; then

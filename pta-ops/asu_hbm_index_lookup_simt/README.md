@@ -169,7 +169,7 @@ id。
 ```bash
 cd pta-ops/asu_hbm_index_lookup_simt
 
-# 950PR/950DT 的完整值为 <Chip Name>_<NPU Name>
+# 通过 Ascend runtime 直接查询，不自行拼接或猜测格式
 bash scripts/check_soc_version.sh --device 0
 SOC_VERSION="$(
   bash scripts/check_soc_version.sh --device 0 --value-only
@@ -182,13 +182,14 @@ bash scripts/build_lookup_simt.sh \
   --build-dir build
 ```
 
-检查脚本执行 `npu-smi info -t board -i 0`，将 `Chip Name` 和
-`NPU Name` 拼为完整 `SOC_VERSION`；例如
-`Ascend950PR_950_1234`。`--value-only` 只输出该值，可安全用于命令替换。
+检查脚本通过 `torch.npu.get_device_name()` 调用 Ascend runtime，直接取得
+编译所需的 SoC 字符串，不根据 `npu-smi` 字段自行拼接或校验格式。
+`npu-smi` 的 `Chip Name`/`NPU Name` 仅作为诊断信息展示。
+`--value-only` 只输出 runtime 返回值，可安全用于命令替换。
 
-编译脚本通过 `--soc-version` 将完整型号传给 CMake，检查 Python 构建
-依赖，完成 configure/build，并打印最终 Python extension 的路径。也可以
-使用低层入口：
+编译脚本不校验型号格式，只通过 `--soc-version` 将用户给出的值原样传给
+CANN/CMake。随后检查 Python 构建依赖，完成 configure/build，并打印最终
+Python extension 的路径。该参数没有默认型号；也可以使用低层入口：
 
 ```bash
 SOC_VERSION="${SOC_VERSION}" ./build.sh

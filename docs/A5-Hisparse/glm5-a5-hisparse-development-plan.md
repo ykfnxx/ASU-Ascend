@@ -15,9 +15,9 @@
 >
 > 当前产品分支：`dev/a5-glm5-dsa-sparse-eager`
 >
-> 当前已提交实现锚点：`923e2ae8`
+> 当前已提交实现锚点：`aac21b73`
 >
-> 当前里程碑：external Main + fixed-HBM eager scaffold
+> 当前里程碑：external Main + fixed-HBM tensor allocation eager scaffold
 
 **Goal：** 以 `vllm-ascend v0.23.0rc1` 为唯一 baseline，在不修改
 vLLM 的前提下，为 GLM-5 系列实现一套面向 Ascend A5 / Ascend 950、
@@ -58,13 +58,13 @@ current branch:
     dev/a5-glm5-dsa-sparse-eager
 
 current committed HEAD:
-    923e2ae8
+    aac21b73
 
 commits after release baseline:
-    11
+    12
 
 implementation commits after split prerequisite:
-    10
+    11
 ```
 
 当前 eager scaffold 已按重要节点形成以下产品提交：
@@ -81,6 +81,7 @@ ac1440e1  feat(attention): add DSA sparse eager batch contexts
 55eb3401  feat(worker): enter DSA sparse eager runtime
 ce8c7902  fix(attention): constrain DSA sparse target eager flow
 923e2ae8  feat(worker): externalize DSA sparse Decode Main cache
+aac21b73  feat(worker): allocate DSA sparse eager fixed tensors
 ```
 
 `923e2ae8` 已形成 external Main + fixed-HBM 里程碑：Decode
@@ -91,6 +92,13 @@ group。该回填只恢复 runner/layer metadata，不创建 Main full-size
 `KVCacheTensor`、runner 的 connector cache 字典或 connector 注册。固定 Hot
 payload、resident state、最大 eager plan，以及 eager batch context/scratch
 的最坏逻辑 HBM 峰值在 KV block profile 前统一扣除。
+
+`aac21b73` 进一步让预算与实际分配复用同一份 immutable cohort topology：
+标准 D consumer 在 KV tensor 初始化后、connector 注册前实际分配每层 Hot
+Cache、每 cohort resident state 与最大 eager plan，并自动绑定带显式
+index/I/O fail-fast stub 和 identity-only I/O resource 的开发期 runtime。
+eager execution context/scratch 仍按最坏逻辑峰值预留、按 batch 动态产生，
+不属于启动期固定 tensor。
 
 ### 0.1 本轮 eager scaffold 范围
 
@@ -114,9 +122,11 @@ payload、resident state、最大 eager plan，以及 eager batch context/scratc
 - P/D ready lifecycle、seat/epoch、cohort、fixed plan 和 runner context 已有
   可独立测试的状态机，但尚未接到真实 Main publication、Indexer-only
   connector completion 或 scheduler admission；
-- `bind_dsa_sparse_eager_runtime()` 目前没有生产调用方，标准启动路径不会
-  构造 index/I/O/backend/runtime；若外部未显式绑定 runtime，首个 D decode
-  会以 “no runtime is bound” fail-closed，而不是进入不可控 fallback；
+- 标准启动路径现在会构造并绑定开发期 stub runtime，但不会自动
+  `acquire_request()`；真实 Main/Indexer dual-ready admission bridge 尚未
+  接入，因此未 admission 的首个 D decode 会在 cache-seat 边界 fail-closed。
+  测试显式 admission 后会准确到达 index operator 的
+  `NotImplementedError`，不会进入 baseline/full-Main fallback；
 - 当前环境只完成隔离的 Python 单测；完整项目测试受本机缺少 `vllm` /
   `torch_npu` 限制，A5 真机、accuracy、graph、performance 结果均不存在。
 
@@ -126,15 +136,15 @@ payload、resident state、最大 eager plan，以及 eager batch context/scratc
 | Task 1 | **代码已实现，验收待完成** | `a99b89ab`；独立 spec/backend/allocation/binding 与四 layout unit cases 已写入 | 目标单测、完整 baseline regression、A5 GLM-5/MTP/FULL_DECODE_ONLY 结果尚无可核验记录 |
 | Task 2 | **eager adapter 部分完成** | `1647d61b`：Python wrapper 可把 Hot Cache/local indices/synthetic block table 送入现有 SFA；SFA operator/schema/tiling/kernel 零修改 | BF16/C8 真算子 parity、A5 与 graph 验证均未完成 |
 | Task 3 | **eager 接口部分完成** | `c9b09581`：backend/operator Protocol、初始化 registry、固定 read/write plan 与显式 stub 已建立 | public C ABI/header、真实 bridge/provider、publication/bind、conformance 与 graph 均未实现 |
-| Task 4 | **eager scaffold 部分完成** | `4b6ebc0d`、`923e2ae8`：Hot layout、resident state、seat/epoch、fixed plan；D scheduler 只见 Indexer，worker-local Main sidecar/zero-block placeholder 不分配 full Main；固定逻辑 HBM 预算已接入 | allocator granularity、真实 backend region、runtime factory/资源实例化、A5 allocation 与全模型 HBM 验证未完成 |
+| Task 4 | **eager scaffold 部分完成** | `4b6ebc0d`、`923e2ae8`、`aac21b73`：D scheduler 只见 Indexer且不分配 full Main；固定逻辑 HBM 预算已接入；Hot Cache、resident state、最大 eager plan 已按同一 topology 实际分配 | allocator granularity、真实 backend region/resource factory、A5 allocation 与全模型 HBM 验证未完成 |
 | Task 5 | **仅接口打桩** | `4b6ebc0d` 中有 `DSASparseIndexOperator` Protocol 与 fail-fast stub；ASU `d92a249` 仍是算法参考 | vllm-ascend custom op、binding/meta/build、oracle parity、A5 profile 均未实现 |
 | Task 6 | **eager 生命周期部分完成** | `4b6ebc0d`、`ac089495`、`ac1440e1`、`83fbf7bf`：seat/epoch、cohort ownership、fixed plan、batch context、dual-ready 状态机 | NPU state op、真实 scheduler/connector bridge、prefix/preemption 集成、MTP/draft runtime 与 graph state 未完成 |
-| Task 7 | **eager 数据流 scaffold 部分完成** | `c9b09581`、`1647d61b`、`55eb3401`：Main newest 写 Hot slot、无条件 lookup/I/O/wait、现有 SFA 调用和可注入 runner 入口已接线 | production runtime factory 未接；index/I/O 仍是 stub；真实 payload、newest backend write/join、四布局 A5 parity 与完整 accuracy 未完成 |
+| Task 7 | **eager 数据流 scaffold 部分完成** | `c9b09581`、`1647d61b`、`55eb3401`、`aac21b73`：Main newest 写 Hot slot、无条件 lookup/I/O/wait、现有 SFA 调用、runner 入口与开发期 stub runtime 已接线 | admission bridge 和真实 backend resource factory 未接；index/I/O 仍是 stub；真实 payload、newest backend write/join、四布局 A5 parity 与完整 accuracy 未完成 |
 | Task 8 | **本轮刻意后置** | eager-only 配置门禁会拒绝 graph 路径 | graph-owned state、capture/replay、MTP descriptor、profile/soak 均未实现 |
-| Task 9 | **生命周期 scaffold 部分完成** | `ac089495`：generation-bearing Main/Indexer dual-ready 与 seat admission 状态机；`923e2ae8` 建立 D scheduler Indexer-only 视图 | Main publish/bind、真实 Indexer-only connector projection/completion、scheduler 双-ready bridge、write/release lifecycle 均未实现 |
+| Task 9 | **生命周期 scaffold 部分完成** | `ac089495`：generation-bearing Main/Indexer dual-ready 与 seat admission 状态机；`923e2ae8` 建立 D scheduler Indexer-only 视图；`aac21b73` 的 runtime 暴露显式 seat acquire/release 边界 | Main publish/bind、真实 Indexer-only connector projection/completion、scheduler 双-ready bridge、write/release lifecycle 均未实现 |
 | Task 10 | **未开始** | 无系统验收 artifact | P/D E2E、profile、性能、soak、backend authoring guide 均不存在 |
 
-本次审计在隔离导入环境中已通过 59 个 cache/index/I/O/eager/lifecycle/
+本次审计在隔离导入环境中已通过 60 个 cache/index/I/O/eager/lifecycle/
 runtime 单测、18 个配置门禁单测和 9 个固定逻辑 HBM 预算单测。完整项目
 pytest 仍无法执行：当前审计环境未安装 `vllm`，加载
 `tests/ut/conftest.py` 时因 `ModuleNotFoundError: vllm` 终止。因此这些
@@ -930,7 +940,7 @@ external-main marker `KVCacheSpec`，而是按 `kv_role` 投影两个视图：
 
 #### 替代
 
-下表描述最终目标态；“本轮”说明 `923e2ae8` 已达到的 eager scaffold 边界。
+下表描述最终目标态；“本轮”说明 `aac21b73` 已达到的 eager scaffold 边界。
 
 | 修改前 | 修改后 |
 | --- | --- |
@@ -945,9 +955,11 @@ external-main marker `KVCacheSpec`，而是按 `kv_role` 投影两个视图：
 
 #### 新增
 
-下表是目标资源清单。当前提交已实现其中的数据结构与逻辑 HBM 预算，但由于
-production runtime factory 未接，不能把“分配时机”理解为标准启动路径已经
-实例化全部对象。
+下表是目标资源清单。当前提交已在标准 D consumer 初始化路径实际分配
+CacheSeatManager、每层 Hot KV、每 cohort resident state 和最大 eager plan；
+I/O context/region/completion 仍是 identity-only stub resource，backend
+region、publication/bind、dual-ready bridge 与 graph-owned resource 均未
+实例化。
 
 | 新增对象 | 分配时机 | 所有者 |
 | --- | --- | --- |
@@ -965,9 +977,9 @@ production runtime factory 未接，不能把“分配时机”理解为标准�
 继续交给原 KVCacheManager。Prefill worker 的 Main Full KV 保持 baseline。
 D-side 原 KVCacheManager 仍管理逻辑 block 数和 Full Indexer。目标架构中，
 D-side Main payload 的完整容量由 backend region 承担，Hot Cache 由
-`CacheSeatManager` 管理；当前提交尚无 production backend/runtime factory，
-因此只完成 D Main allocation 移除、metadata sidecar、逻辑预算与可注入
-Hot Cache 数据结构，尚不能承载完整 Main payload。
+`CacheSeatManager` 管理；当前提交已有固定 tensor allocation 和开发期 stub
+runtime，但尚无真实 backend resource factory，因此不能承载完整 Main
+payload。
 
 ### 7.2 HBM 预算与 `num_blocks` 计算
 
@@ -1736,7 +1748,8 @@ protected union：
 | `vllm_ascend/core/kv_cache_interface.py` | 前置迁移已完成 | Main/Indexer split spec；不新增 external Main marker |
 | `vllm_ascend/attention/indexer.py` | PR #11647 新增 | cache-only Indexer backend/metadata builder |
 | `vllm_ascend/patch/platform/patch_kv_cache_utils.py` | 后续按需修改 | backend region capacity 与 Indexer capacity 联合规划；本轮未修改 |
-| `vllm_ascend/worker/model_runner_v1.py` | 修改 | D scheduler Indexer-only 投影、worker-local Main metadata、eager runtime 入口 |
+| `vllm_ascend/worker/model_runner_v1.py` | 修改 | D scheduler Indexer-only 投影、worker-local Main metadata、fixed tensor allocation 与 eager runtime 入口 |
+| `vllm_ascend/worker/dsa_sparse_eager.py` | `83fbf7bf`/`aac21b73` 新增/扩展 | cohort topology、Hot/state/plan stub runtime 构造与 batch context 路由 |
 | `vllm_ascend/worker/dsa_sparse_external_main.py` | `923e2ae8` 新增 | immutable Main sidecar 与 worker-owned KVCacheConfig metadata 回填 |
 | `vllm_ascend/worker/dsa_sparse_memory.py` | `923e2ae8` 新增 | 固定 Hot/state/eager-plan、eager execution reserve 与 backend auxiliary HBM 预算 |
 | `vllm_ascend/distributed/kv_transfer/` integration hook | 修改 | P/D 角色校验、只注册 Indexer cache group、Main/Indexer ready fan-in |
@@ -1804,7 +1817,7 @@ Expected：
 
 ```text
 f4a08bddd0cc65a0bd8c3d377b158ae5ca7527db
-923e2ae8eaf9bbbb4239a94be4aef0050823d0d0
+aac21b73d5ba992b31251d147b857569924a7929
 ```
 
 - [ ] **Step 2：记录 A5 环境**
@@ -2035,14 +2048,18 @@ eager plan。`923e2ae8` 进一步实现：
   context/scratch 最坏逻辑峰值和 backend auxiliary bytes 在自动/显式 KV
   memory profile 路径中只扣除一次。
 
-尚未完成真实 backend region capacity/registration、运行时
-backend/coordinator factory、Main payload 装载、A5 allocation 以及全模型 HBM
-公式验证。当前预算按 logical tensor bytes 计算，尚未覆盖 PyTorch allocator
-alignment/fragmentation、未来自定义算子 workspace 或 backend 内部
-workspace；后两项必须通过 backend auxiliary/正式 runtime resource
-description 补齐。由于 production runtime factory 尚未接入，当前“已预留”
-只表示 KV block budget 已扣减，不表示 Hot Cache/state/plan 已由标准启动
-路径完成 tensor 实例化。
+`aac21b73` 进一步缓存同一份 cohort topology，并在 D worker KV tensor
+初始化后、connector registration 前实际分配每层 Hot Cache、每 cohort
+resident state 与最大 eager plan。测试逐 tensor 计数证明启动期固定 tensor
+bytes 等于预算中的 `core_fixed_tensor_bytes`。开发期 runtime 使用
+identity-only I/O resource 和 fail-fast index/I/O stub；它不自动
+acquire seat，不能绕过 dual-ready admission。
+
+尚未完成真实 backend region capacity/registration/resource factory、Main
+payload 装载、A5 allocation 以及全模型 HBM 公式验证。当前预算按 logical
+tensor bytes 计算，尚未覆盖 PyTorch allocator alignment/fragmentation、
+未来自定义算子 workspace 或 backend 内部 workspace；后两项必须通过
+backend auxiliary/正式 runtime resource description 补齐。
 
 **Files：**
 
@@ -2057,16 +2074,21 @@ description 补齐。由于 production runtime factory 尚未接入，当前“�
 `vllm_ascend/core/kv_cache_interface.py` 与 vLLM planner 不新增 external Main
 marker；backend capacity 若后续确需 planner hook，必须单独设计并验收。
 
-- [ ] **Step 1：让 P/D scheduler 各自保持完整 logical block space**
-- [ ] **Step 2：P worker 保持 full Main/Indexer allocation；只在 D worker
+- [x] **Step 1：让 P/D scheduler 各自保持完整 logical block space**
+- [x] **Step 2：P worker 保持 full Main/Indexer allocation；只在 D worker
       停止分配 Main full-size NPU paged tensor**
 - [ ] **Step 3：D worker 按 layer/rank 注册 backend Main regions**
-- [ ] **Step 4：P/D 两侧完整分配 NPU Indexer**
-- [ ] **Step 5：只在 D worker 预分配 `A=max_num_seqs` 个 cache seats 和每层
+- [x] **Step 4：P/D 两侧完整分配 NPU Indexer**
+- [x] **Step 5：只在 D worker 预分配 `A=max_num_seqs` 个 cache seats 和每层
       `[A*H/B,B,...]` Main Hot KV pool**
-- [ ] **Step 6：按 residency cohort 分配 `token_to_hot/hot_to_token/LRU`，
-      按 graph key 分配 hot block table、plan 和 completion**
-- [ ] **Step 7：先扣除固定 Hot State HBM，再联合计算 block 数**
+- [x] **Step 6a：按 residency cohort 分配
+      `token_to_hot/hot_to_token/LRU`，并分配最大 eager hot block
+      table/plan**
+- [ ] **Step 6b：按 graph key 分配正式 workspace、plan 和真实 backend
+      completion**
+- [x] **Step 7a：先扣除固定 eager Hot State HBM，再计算 NPU-resident
+      cache block 数**
+- [ ] **Step 7b：接入 backend capacity，并联合计算 block 数**
 
 ```text
 D_num_blocks = min(
@@ -2210,10 +2232,12 @@ prefix/preemption 的真实 runner 行为未验收。当前配置明确拒绝 MT
 调用顺序接为 Main newest→reserved Hot slot、Top-K semantic token position
 →lookup、无条件 read/wait、Hot KV/local indices/synthetic block table→现有
 SFA，并提供可注入的 model runner 外层 context 进入/清理 batch runtime。
-production runtime factory 尚无调用方，标准路径首个 D decode 会因 runtime
-未绑定而 fail-closed。不存在
+`aac21b73` 已让标准 D consumer 自动构造并绑定开发期 stub runtime，同时
+实际分配固定 Hot/state/plan tensors；但 dual-ready admission bridge 尚未
+接入，所以未取得 seat 的请求先在 admission 边界 fail-closed。不存在
 hit/miss 控制流拆分；all-hit 仍走 read/wait 接口。由于 index/I/O operator
-都是 fail-fast stub，尚不能搬运真实 payload 或完成端到端 decode。
+和 I/O resource 都是显式 stub，尚不能搬运真实 payload 或完成端到端
+decode。
 
 **Files：**
 
@@ -2225,17 +2249,17 @@ hit/miss 控制流拆分；all-hit 仍走 read/wait 接口。由于 index/I/O op
 - Create/Modify: `tests/ut/attention/test_dsa_sparse_sfa.py`
 - Create: `tests/e2e/nightly/single_node/ops/singlecard_ops/test_dsa_sparse_sfa.py`
 
-- [ ] **Step 1：保持完整 Indexer write**
-- [ ] **Step 2：Main KV 写 reserved newest slots**
+- [x] **Step 1：保持完整 Indexer write**
+- [x] **Step 2：Main KV 写 reserved newest slots**
 - [ ] **Step 3：提交 backend newest write**
 - [ ] **Step 4：使用 Top-K token positions 调用 SIMT lookup，并同时生成
       I/O source global slots、destination rows、valid mask 与 local indices**
 - [ ] **Step 5：每层无条件调用一次 backend read op**
 - [ ] **Step 6：每层无条件调用 wait**
-- [ ] **Step 7：以 Hot KV、local indices 和 synthetic block table 调用
+- [x] **Step 7：以 Hot KV、local indices 和 synthetic block table 调用
       现有 Sparse SFA**
 - [ ] **Step 8：graph 结束前 join write**
-- [ ] **Step 9：实现 leader plan-once / follower reuse**
+- [x] **Step 9：实现 leader plan-once / follower reuse**
 - [ ] **Step 10：覆盖四种 Main/Indexer layout**
 
 **DoD：**
@@ -2328,6 +2352,8 @@ generation-bearing Main/Indexer dual-ready 状态机、late completion 过滤、
 fail/finish/preempt release 与 ready 后 seat admission。`923e2ae8` external
 Main 里程碑已把 D scheduler spec 投影为 Indexer-only，并确保 worker-local
 Main sidecar/zero-block placeholder 不进入 connector cache 字典。
+`aac21b73` 创建的 stub runtime 暴露显式 acquire/release API，但标准
+scheduler/connector 仍没有调用它，不能视为 admission bridge 已完成。
 
 这仍不是 P/D handoff 闭环：P-side Main publication、D-side bind/remap、
 双端 connector 的 Indexer-only `KVCacheConfig` projection/completion、
@@ -2434,10 +2460,10 @@ authoring guide 均不存在。
 | 1 | PR1 | PR #11647 语义迁移 | commit `a99b89ab` 已实现；PR/回归待完成 | 四布局、DCP、baseline 全绿 |
 | 2 | PR2 | 现有 A5 BF16/C8 SFA Hot Cache 兼容验证 | eager wrapper scaffold 已有；真算子验证未开始 | SFA operator 零修改 + 真算子 parity |
 | 3 | PR3 | I/O ABI、registry、public fake-provider conformance | Python Protocol/registry/stub 已有；public ABI 未开始 | mini-graph capture/replay |
-| 4 | PR4 | external Main 规划、cache seat 与固定 Hot State | eager scaffold 已提交至 `923e2ae8` | 容量/HBM/seat/cohort UT；真实 runtime/A5 待完成 |
+| 4 | PR4 | external Main 规划、cache seat 与固定 Hot State | fixed budget 与实际 Hot/state/plan allocation 已提交至 `aac21b73` | allocator/A5 验证与真实 backend resource 待完成 |
 | 5 | PR5 | A5 SIMT 正式 custom op | 产品调用接口打桩；算子仍只有 ASU 原型 | 双 oracle + microbench |
 | 6 | PR6 | lifecycle、MTP union、cohort leader plan | target eager lifecycle scaffold 已有；MTP/draft 未开始 | state transition 全绿 |
-| 7 | PR7 | GLM-5 SFA runtime 集成 | target eager 调用链 scaffold 已有；真实算子/backend 未接 | synthetic-region 单层 parity |
+| 7 | PR7 | GLM-5 SFA runtime 集成 | target eager 调用链与自动 stub runtime 已有；admission/真实算子/backend 未接 | synthetic-region 单层 parity |
 | 8 | PR8 | FULL_DECODE_ONLY graph | 本轮刻意后置 | 全 graph key + profile |
 | 9 | PR9 | P/D-only publication/bind、Indexer handoff 与 ready lifecycle | dual-ready 纯状态机与 D scheduler 投影已有；真实 bridge 未接 | P/D block-id-remap round trip |
 | 10 | PR10 | A5 真机验收、性能、文档 | 未开始 | 最终 DoD |

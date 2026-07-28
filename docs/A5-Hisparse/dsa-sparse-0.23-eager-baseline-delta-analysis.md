@@ -16,8 +16,11 @@
 2. D 节点的 Main KV 不再由 scheduler KV block pool 分配，改为 worker 固定分配的每层 Hot Cache。
 3. 新增稳定 cache seat、residency 映射、近似 LRU 和固定执行 plan。
 4. 接入真实 Ascend 950 SIMT 融合算子 `dsa_sparse_lookup_update`。
-5. 每个 IndexCache cohort 每个 step 调用一次 lookup/update。
-6. 每个 sparse layer 都独立调用一次统一 I/O 接口，然后基于本层 Hot Cache 调用 SFA。
+5. 每个 IndexCache cohort 的 leader 每个 step 调用一次 lookup/update；followers
+   只复用 semantic Top-K、token-to-slot 驻留映射和本轮 lookup plan，不共享
+   Main KV payload。
+6. 每个 sparse layer 都独立持有 Hot Main Cache 和 I/O 资源，独立调用一次统一
+   I/O 接口，然后基于本层 Hot Cache 调用 SFA。
 7. 当前 I/O 仍为 mock；P/D Main 数据发布和历史 Main miss 读取没有真实实现。
 8. 增加 Mooncake 跳过开关和运行时探针，用于验证自定义算子及 Hot Cache 路径确实执行。
 
@@ -30,7 +33,10 @@
 3. 将 SFA cache 拆成：
    - Indexer cache：仍由 scheduler 分配和管理。
    - Main cache：D 节点从 scheduler 视图中移除。
-4. 根据层顺序和 `skip_topk` 划分 IndexCache cohort。
+4. 根据模型层顺序和 `skip_topk` 划分 IndexCache cohort：
+   - `skip_topk=False` 的层建立新 cohort，并成为 leader；
+   - 后续连续的 `skip_topk=True` 层加入最近的 cohort，成为 followers；
+   - 第一层不能是 follower。
 5. 预先计算并从 KV block pool 可用内存中扣除固定 HBM。
 6. 分配：
    - 所有 target cohort 共享的 batch metadata；
@@ -80,11 +86,14 @@ dsa_sparse_lookup_update（每个 cohort 一次）
     |-- 生成 resolved_hot_indices
     `-- 生成 miss_mask
     |
-    v
-dsa_sparse_io（每层一次，当前为 mock）
+    |  同一 cohort 的 followers 复用上述 semantic Top-K、映射和 plan
+    |  但各层不共享 Main KV payload
     |
     v
-SparseFlashAttention
+dsa_sparse_io（每层一次，写入本层 Hot Main Cache，当前为 mock）
+    |
+    v
+SparseFlashAttention（每层一次）
     |-- 本层 Hot Main Cache
     |-- [Q, 1, K] local sparse indices
     `-- synthetic Hot block table
@@ -92,10 +101,66 @@ SparseFlashAttention
 
 这里需要区分：
 
-- 每层有独立的 Hot Main Cache、I/O region、completion，且每层调用 I/O 和 SFA。
-- lookup/update 状态按 IndexCache cohort 共享。
-- 如果多个连续层通过 `skip_topk=True` 复用同一个 IndexCache，则它们共享一次 lookup 结果。
-- 如果每层都是 cohort leader，则才表现为每层一次 lookup。
+- Main KV payload 是逐层独立的。每层有自己的 Hot Cache planes、I/O context、
+  backend region 和 completion，并分别执行 I/O 与 SFA。
+- `token_to_hot`、`hot_to_token`、LRU、`state_seat_epoch` 以及本轮 lookup plan
+  不是逐层分配，而是由 IndexCache cohort 共享。
+- cohort 内共享的是 token position 到 local hot slot 的编号关系。例如
+  `token_position=100 -> hot_slot=7` 对 cohort 内各层相同，但 `layer 0` 的
+  slot 7 保存 layer 0 的 Main KV，`layer 1` 的 slot 7 保存 layer 1 的
+  Main KV；二者是不同的 tensor 地址和不同的 payload。
+- 如果多个连续层通过 `skip_topk=True` 复用 leader 的 semantic Top-K，则它们
+  也复用 leader 的 lookup 结果；如果每层都是 leader，lookup 才表现为逐层调用。
+
+### 2.4 “逐层 Cache”与 IndexCache cohort 的准确边界
+
+`IndexCache cohort` 不是 scheduler 的 KV cache group、block table 类型或共享
+payload 区域，而是当前分支在 DSA Sparse eager runtime 中新增的执行分组。它表示：
+
+```text
+一个产生 semantic Top-K 的 leader layer
+    +
+连续复用该 Top-K 的 skip_topk follower layers
+```
+
+当前资源所有权如下：
+
+| 资源 | 当前所有权与行为 |
+| --- | --- |
+| Main/MLA Hot Cache planes | 每层独立分配 |
+| I/O context、region、completion | 每层独立 |
+| 每层 Main KV 的 newest write | 写入本层 Hot Cache 的 reserved slot |
+| 每层 I/O 与 SFA 调用 | 每层每 step 各调用一次 |
+| scheduler 中的 Indexer KV cache | 按实际 Indexer cache layer 注册和管理，不由 `DSASparseCohort` 分配 |
+| semantic Top-K | leader 产生，`skip_topk` followers 复用 |
+| `token_to_hot/hot_to_token/LRU/state_seat_epoch` | 每个 cohort 一份 |
+| `resolved_hot_indices/miss_mask/workspace` | 每个 cohort、每种 plan key 一份 |
+| `cache_seat` | request 生命周期内稳定；同一个 seat 用来寻址各层各自的 Hot Cache 行 |
+
+因此，当前分支应描述为：
+
+> Main KV 数据空间逐层独立，但 cohort 内各层的 Hot Cache slot 布局保持同步，
+> 并共享 token-to-slot 驻留状态、淘汰顺序和 lookup plan。
+
+共享驻留映射依赖以下不变量：
+
+1. cohort 内所有 follower 使用与 leader 相同的 semantic Top-K token positions。
+2. 同一个 token position 在所有层中使用相同的 local hot slot 编号。
+3. 每层 I/O 都必须依据同一份 `resolved_hot_indices/miss_mask`，把该层自己的
+   Main KV 填入该层 Hot Cache 的对应 slot。
+4. 在本轮 SFA 开始前，每层自己的 I/O completion 必须满足；一层完成不能代替
+   另一层完成。
+5. cohort 内不能出现某一层独立淘汰、独立改变 slot 映射或使用不同 Top-K 的行为。
+
+当前 mock I/O 不搬运 history miss payload，因此只能验证调用拓扑和地址隔离，
+不能验证上述 payload 同步不变量在真实 I/O 下成立。
+
+如果设计中的“逐层 Cache”只要求每层 KV payload、region 和 completion 独立，
+当前实现符合该要求。如果它还要求每层独立维护 resident mapping、LRU、miss 和
+淘汰决策，则当前实现不符合这一更强定义：代码把“共享 semantic Top-K”进一步
+扩展成了“共享 physical slot mapping”。严格逐层驻留的实现应只保留 Top-K
+结果共享，并为每层分别分配 `DSASparseResidencyState`、`DSASparsePlan`，分别
+调用 `dsa_sparse_lookup_update`。
 
 ## 3. 主要修改位置及目的
 
@@ -320,6 +385,10 @@ request row 可以随 scheduler batch 重排，但请求持有的 seat 在请求
 - `lru_slots[N, S]`
 - `state_seat_epoch[N]`
 
+这里的“每个 cohort”不能写成“每个 layer”。同一 cohort 的 leader/followers
+共享这四个驻留张量，因此它们对同一 token position 使用相同的 local hot slot
+编号和相同的淘汰顺序；各层对应 slot 中存放的 Main KV payload 仍然独立。
+
 ### 5.2 固定执行计划
 
 #### `DSASparsePlanKey`
@@ -366,6 +435,19 @@ token_capacity = request_capacity * query_lane_capacity
 - `DSASparseResolution`：向 SFA 暴露本层 Hot Main Cache、local sparse indices、synthetic Hot block table。
 - `DSASparseEagerStep`：跟踪 lookup、newest write、I/O、SFA 是否完成。
 - `DSASparseMainWriteTarget`：将 SFA prolog 写目标切到本层 Hot Cache reserved slot。
+
+cohort 的构造不是按“若干层共享同一块 Main Cache”进行，而是按 IndexCache
+Top-K 生产/复用关系进行：
+
+```text
+skip_topk=False -> 新 cohort 的 leader
+skip_topk=True  -> 最近一个 cohort 的 follower
+```
+
+运行时先为 cohort 分配一份 `DSASparseResidencyState` 和 `DSASparsePlan`，
+再遍历 cohort 中的所有层，为每层分别分配 `DSASparseLayerHotCache` 和独立的
+I/O resources。这形成“cohort 共享索引驻留状态、layer 独占 payload”的两级
+所有权。
 
 ### 5.4 Runner/runtime
 
@@ -596,7 +678,8 @@ D 节点给 external Main layer 绑定 shape 第一维为 0 的 cache tensor。
 当前已经完成：
 
 - eager Decode 框架接线；
-- 每层独立 Hot Main Cache；
+- 每层独立 Hot Main Cache、I/O region 和 completion；
+- 基于 `skip_topk` 的 cohort Top-K/驻留映射/lookup plan 共享；
 - 固定 HBM 预算；
 - request seat 生命周期；
 - cohort lookup plan；
@@ -614,3 +697,10 @@ D 节点给 external Main layer 绑定 shape 第一维为 0 的 cache tensor。
 - 真实 connector completion 到 `DSASparsePDLifecycle` 的接线；
 - graph/capture 路径；
 - mock I/O 下的模型数值正确性。
+
+另外，当前实现是否满足最终设计中的“逐层 Cache”，取决于该术语是否包含驻留
+索引的所有权：
+
+- 按 payload 所有权定义：满足，每层的 Hot Main KV 和 I/O 资源均独立。
+- 按 payload 加 resident mapping/LRU 所有权定义：不满足，mapping、LRU 和
+  lookup plan 当前按 IndexCache cohort 共享。

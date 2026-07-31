@@ -1,13 +1,16 @@
 # GLM-5 Ascend A5 DSA Sparse KV Cache Offload 开发计划
 
-> 状态：Task 0 部分完成；Task 1 代码已实现、完整验收待完成；Task 2–4、
-> Task 6–7、Task 9 已进入 eager scaffold，Task 5 仅有调用接口打桩，
-> Task 8 与 Task 10 尚未开始
+> 状态：Task 0 部分完成；Task 1 代码已实现、完整验收待完成；Task 2
+> eager adapter 已实现；Task 3 完成统一 Python ABI 与 no-op mock；
+> Task 4–7 完成 Graph 外源码闭环；Task 9 只完成同步 mock 生命周期；
+> Task 8、真实 I/O/P/D bridge 与 Task 10 尚未完成
 >
 > 编写日期：2026-07-24
 >
 > 本次修订：2026-07-27，更新 `dev/a5-glm5-dsa-sparse-eager` 的真实实现
-> 状态；本轮只实现 eager scaffold，正式算子、ACL Graph 与 A5 验收后置
+> 状态，并冻结索引侧只使用单一融合算子 `dsa_sparse_lookup_update`：
+> epoch reset、newest 判定、resident lookup、slot 分配/淘汰和 LRU 更新均在
+> 同一次调用内完成；不再设计独立 prepare/pack/unpack custom op
 >
 > 计划存放仓库：ASU-Ascend
 >
@@ -15,9 +18,11 @@
 >
 > 当前产品分支：`dev/a5-glm5-dsa-sparse-eager`
 >
-> 当前已提交实现锚点：`aac21b73`
+> 当前已提交实现锚点：`aac21b73`；本节所述 Graph 外增量仍位于未提交
+> working tree
 >
-> 当前里程碑：external Main + fixed-HBM tensor allocation eager scaffold
+> 当前里程碑：Graph 外
+> `dsa_sparse_lookup_update → mock dsa_sparse_io → existing SFA`
 
 **Goal：** 以 `vllm-ascend v0.23.0rc1` 为唯一 baseline，在不修改
 vLLM 的前提下，为 GLM-5 系列实现一套面向 Ascend A5 / Ascend 950、
@@ -30,8 +35,10 @@ transfer 交付到 Decode worker 的完整 Indexer HBM。只有 Main region 与
 Indexer KV 均 ready 后，请求才进入 decode 并领取 cache seat。Decode worker
 启动时一次性预分配 `max_num_seqs` 个固定容量 Main Hot KV seats，不分配
 full Main NPU payload。Lightning Indexer 的 Top-K token position 直接查询
-token 粒度 resident index；查询结果始终形成固定形状 I/O plan，并固定执行
-`lookup → I/O → wait → 现有 SFA`。I/O mask 全为 0 时仍保留 I/O 图节点，
+token 粒度 resident index；`dsa_sparse_lookup_update` 输出固定形状的
+`resolved_hot_indices` 与 `miss_mask`，统一 I/O op 在设备侧由 Top-K、
+block table、stable seat 和 local slot 直接派生源/目标地址，并固定执行
+`lookup_update → I/O → 现有 SFA`。`miss_mask` 全为 0 时仍保留 I/O 图节点，
 只是不发生 payload transfer。SFA 算子、ABI 和 kernel 均不修改。
 
 **Tech Stack：** vLLM-Ascend V1 Runner、Ascend 950、CANN 9.x、
@@ -90,67 +97,87 @@ sidecar 保存，并只在 worker 自有的 `KVCacheConfig` 副本中回填到�
 group。该回填只恢复 runner/layer metadata，不创建 Main full-size
 `KVCacheTensor`。Main layer 的 zero-block layout placeholder 不进入
 `KVCacheTensor`、runner 的 connector cache 字典或 connector 注册。固定 Hot
-payload、resident state、最大 eager plan，以及 eager batch context/scratch
-的最坏逻辑 HBM 峰值在 KV block profile 前统一扣除。
+payload、resident state、plan 与 eager batch context/scratch 的最坏逻辑
+HBM 峰值在 KV block profile 前统一扣除。
 
-`aac21b73` 进一步让预算与实际分配复用同一份 immutable cohort topology：
-标准 D consumer 在 KV tensor 初始化后、connector 注册前实际分配每层 Hot
-Cache、每 cohort resident state 与最大 eager plan，并自动绑定带显式
-index/I/O fail-fast stub 和 identity-only I/O resource 的开发期 runtime。
-eager execution context/scratch 仍按最坏逻辑峰值预留、按 batch 动态产生，
-不属于启动期固定 tensor。
+在 `aac21b73` 之上的当前未提交 working tree 已完成本轮 Graph 外增量：
 
-### 0.1 本轮 eager scaffold 范围
+- 标准 D consumer 在 KV tensor 初始化后、connector 注册前实际分配每层
+  Hot Cache、一次 role-level batch metadata、每 cohort resident state、
+  lookup outputs 和固定 SIMT workspace；
+- `dsa_sparse_lookup_update` 已从 ASU 原型迁入正式 CANN/PTA 目录，接入
+  Ascend 950 build、Torch schema/meta 与 Python wrapper；
+- eager 调用合同已收敛为一次 fused lookup/update 和每层一次统一
+  `dsa_sparse_io`，删除长期 history read-plan tensor 和独立 wait；
+- 当前只接受显式 `io_backend="mock"`。mock 只校验固定 ABI，不读取
+  `miss_mask`、不搬运 newest/history payload；
+- model runner 只为 mock runtime 同步模拟 generation-bearing dual-ready、
+  seat acquire、finish/preempt/resume release；真实 publication、connector
+  completion 与 scheduler ready gate 尚未接入。
 
-本轮是长期目标的可审查 Python/eager 骨架，不改变后续正式交付目标：
+### 0.1 本轮 Graph 外范围
 
-- 只允许 `enforce_eager=true`；ACL Graph、capture/replay、正式 A5 SIMT
-  lookup 算子与 I/O bridge/build 均刻意后置；
-- index 与 I/O 只提供 Protocol/调用接口和显式
-  `NotImplementedError` stub，不提供能搬运真实 Main KV 的产品 backend；
+本轮完成长期目标的 Graph 外、target normal-decode 源码路径，不改变后续
+正式交付目标：
+
+- 只允许 `enforce_eager=true`；ACL Graph、capture/replay 与 graph-owned
+  resource 均后置；
+- 索引侧只保留 `dsa_sparse_lookup_update`。epoch reset、newest 判定、
+  resident lookup、duplicate canonicalization、slot 分配/淘汰和 LRU 更新
+  均在同一个 Ascend 950 SIMT kernel 中完成；
+- I/O 侧只保留一次 `dsa_sparse_io` 调用。当前实现是显式注入的 no-op
+  mock，不是默认 backend、真实 provider 或 CPU fallback；
 - 当前 Decode consumer 仅支持 target-only normal decode，固定
   `max_query_tokens_per_request=1`；D 侧 `num_speculative_tokens != 0`
   在配置期 fail-fast。Prefill producer 保持 baseline speculative 配置与
   full Main/Indexer cache。长期目标中的 D 侧 MTP3/draft 仍保留，但必须在
   独立 target/draft Hot Cache runtime 完成后才能打开；
 - eager 调用序列固定为
-  `Top-K → lookup → read_async → wait_read → existing SFA`，不按 hit/miss
-  建立 Python 控制流；全命中时仍调用 I/O 接口，只是 valid mask 全 0；
+  `Indexer KV write → Main newest Hot write → Top-K →
+  dsa_sparse_lookup_update → mock dsa_sparse_io → existing SFA`，不按
+  hit/miss 建立 Python 控制流；全命中时仍调用同一个 I/O 接口；
 - 现有 SFA operator/schema/tiling/kernel 与 `DeviceOperator` 均未修改；
   当前改动只在 Python wrapper 上把 Hot Cache、local indices 和 synthetic
   block table 传给现有 SFA 调用；
-- P/D ready lifecycle、seat/epoch、cohort、fixed plan 和 runner context 已有
-  可独立测试的状态机，但尚未接到真实 Main publication、Indexer-only
-  connector completion 或 scheduler admission；
-- 标准启动路径现在会构造并绑定开发期 stub runtime，但不会自动
-  `acquire_request()`；真实 Main/Indexer dual-ready admission bridge 尚未
-  接入，因此未 admission 的首个 D decode 会在 cache-seat 边界 fail-closed。
-  测试显式 admission 后会准确到达 index operator 的
-  `NotImplementedError`，不会进入 baseline/full-Main fallback；
-- 当前环境只完成隔离的 Python 单测；完整项目测试受本机缺少 `vllm` /
-  `torch_npu` 限制，A5 真机、accuracy、graph、performance 结果均不存在。
+- role-level row/query/block/newest metadata 只分配并 stage 一次；resident
+  state、lookup outputs 和 workspace 按 cohort 私有；Hot payload、region
+  identity 与 completion 按 layer 私有；
+- seat/epoch、generation-bearing dual-ready、cohort leader/follower 和
+  runner context 已有固定生命周期。标准启动路径仅在
+  `io_backend="mock"` 时绑定 mock runtime，并在 `_update_states()` 同步
+  模拟新请求、finish、preempt 与 resume；retire 在 upstream 状态更新前先
+  做 idle preflight，upstream 成功后再释放，批量 admission 失败会回收本轮
+  已领取的 seat；
+- mock miss 会更新 resident mapping，但对应 Hot payload 没有被填充；下一
+  step 可能把该 slot 判为 hit。因此当前 mock 只能验证 index/state、调用
+  拓扑、生命周期，或预先填充 Hot Cache 的全 resident 场景，不能验证含
+  miss 的 SFA 数值、多 step decode 或模型 accuracy；
+- 当前环境只运行了标准库 CPU oracle、Python 语法和静态 ABI 检查；缺少
+  `torch`/`pytest`/`vllm`/`torch_npu`、CANN 与 A5，完整 pytest、真实 OPP
+  build、NPU parity、accuracy、graph 和 performance 结果均不存在。
 
 | Task | 当前状态 | 可核验证据 | 剩余门槛 |
 | --- | --- | --- | --- |
 | Task 0 | **部分完成** | baseline ancestry 与当前实现 commit 已固定；baseline GLM-5 YAML 存在 | A5 环境记录、baseline 真机结果、ABI/HBM/performance budget 评审 artifact 均未提交 |
 | Task 1 | **代码已实现，验收待完成** | `a99b89ab`；独立 spec/backend/allocation/binding 与四 layout unit cases 已写入 | 目标单测、完整 baseline regression、A5 GLM-5/MTP/FULL_DECODE_ONLY 结果尚无可核验记录 |
 | Task 2 | **eager adapter 部分完成** | `1647d61b`：Python wrapper 可把 Hot Cache/local indices/synthetic block table 送入现有 SFA；SFA operator/schema/tiling/kernel 零修改 | BF16/C8 真算子 parity、A5 与 graph 验证均未完成 |
-| Task 3 | **eager 接口部分完成** | `c9b09581`：backend/operator Protocol、初始化 registry、固定 read/write plan 与显式 stub 已建立 | public C ABI/header、真实 bridge/provider、publication/bind、conformance 与 graph 均未实现 |
-| Task 4 | **eager scaffold 部分完成** | `4b6ebc0d`、`923e2ae8`、`aac21b73`：D scheduler 只见 Indexer且不分配 full Main；固定逻辑 HBM 预算已接入；Hot Cache、resident state、最大 eager plan 已按同一 topology 实际分配 | allocator granularity、真实 backend region/resource factory、A5 allocation 与全模型 HBM 验证未完成 |
-| Task 5 | **仅接口打桩** | `4b6ebc0d` 中有 `DSASparseIndexOperator` Protocol 与 fail-fast stub；ASU `d92a249` 仍是算法参考 | vllm-ascend custom op、binding/meta/build、oracle parity、A5 profile 均未实现 |
-| Task 6 | **eager 生命周期部分完成** | `4b6ebc0d`、`ac089495`、`ac1440e1`、`83fbf7bf`：seat/epoch、cohort ownership、fixed plan、batch context、dual-ready 状态机 | NPU state op、真实 scheduler/connector bridge、prefix/preemption 集成、MTP/draft runtime 与 graph state 未完成 |
-| Task 7 | **eager 数据流 scaffold 部分完成** | `c9b09581`、`1647d61b`、`55eb3401`、`aac21b73`：Main newest 写 Hot slot、无条件 lookup/I/O/wait、现有 SFA 调用、runner 入口与开发期 stub runtime 已接线 | admission bridge 和真实 backend resource factory 未接；index/I/O 仍是 stub；真实 payload、newest backend write/join、四布局 A5 parity 与完整 accuracy 未完成 |
+| Task 3 | **统一 Python ABI + mock 已完成** | working tree：`DSASparseIOOperator.dsa_sparse_io()` 与 no-op `MockDSASparseIOOperator`；无旧 read/write/wait 数据面接口 | public C ABI/header、真实 bridge/provider、publication/bind、conformance 与 graph 均未实现 |
+| Task 4 | **Graph 外常驻张量与逻辑峰值预算已完成源码实现** | working tree：D 无 full Main；每层 Hot payload、一次共享 batch metadata、每 cohort state/lookup/workspace 固定分配；初始化/每步 eager 动态临时量按逻辑峰值预留 | allocator granularity、真实 backend region/resource factory、A5 allocation 与全模型 HBM 验证未完成 |
+| Task 5 | **算子源码迁移完成，真机验收待完成** | working tree：Ascend 950 CANN/PTA op、16-Tensor binding/meta/build、Python wrapper和 11 个 CPU oracle cases | CANN/OPP 实际编译、A5 bit-exact parity 与 profile 均未完成 |
+| Task 6 | **Graph 外生命周期已完成 mock 接线** | working tree：共享 row metadata、cohort-private state、fused epoch reset、mock dual-ready/seat、finish/preempt/resume 与 model runner 接线 | 真实 scheduler/connector bridge、prefix 行为、MTP/draft runtime 与 graph state 未完成 |
+| Task 7 | **Graph 外调用链完成，payload 仍为 mock** | working tree：每 cohort 一次 lookup、每层一次统一 mock I/O、现有 SFA；all-hit/miss 调用拓扑一致 | mock 不搬 payload；真实 completion、四布局 A5 parity、含 miss/multi-step 与完整 accuracy 未完成 |
 | Task 8 | **本轮刻意后置** | eager-only 配置门禁会拒绝 graph 路径 | graph-owned state、capture/replay、MTP descriptor、profile/soak 均未实现 |
-| Task 9 | **生命周期 scaffold 部分完成** | `ac089495`：generation-bearing Main/Indexer dual-ready 与 seat admission 状态机；`923e2ae8` 建立 D scheduler Indexer-only 视图；`aac21b73` 的 runtime 暴露显式 seat acquire/release 边界 | Main publish/bind、真实 Indexer-only connector projection/completion、scheduler 双-ready bridge、write/release lifecycle 均未实现 |
+| Task 9 | **同步 mock 生命周期已接 runner** | working tree 在 `_update_states()` 中模拟 generation-bearing dual-ready、admit、finish/preempt/resume；D scheduler 仍只见 Indexer | Main publish/bind、真实 Indexer-only connector completion、scheduler ready gate、write/release lifecycle 均未实现 |
 | Task 10 | **未开始** | 无系统验收 artifact | P/D E2E、profile、性能、soak、backend authoring guide 均不存在 |
 
-本次审计在隔离导入环境中已通过 60 个 cache/index/I/O/eager/lifecycle/
-runtime 单测、18 个配置门禁单测和 9 个固定逻辑 HBM 预算单测。完整项目
-pytest 仍无法执行：当前审计环境未安装 `vllm`，加载
-`tests/ut/conftest.py` 时因 `ModuleNotFoundError: vllm` 终止。因此这些
-隔离结果只证明 Python/eager scaffold 的局部行为，不能替代完整 regression、
-A5 allocation、P/D E2E 或 accuracy 验收；Task 1 Step 7 和 DoD 仍保持
-未完成。
+本轮新增的标准库 CPU oracle 11/11 通过，覆盖 all/none/mixed resident、
+duplicate、padding/inactive、free-first、eviction/reverse invalidation、
+epoch reset、row reorder、newest、MTP union 和重复 `(row,lane)` 拒绝。
+Python `py_compile`、
+Torch/OpDef/kernel 静态 ABI 一致性、AscendC CPU-debug stub 语法、
+`build_aclnn.sh` shell 语法与 `git diff --check` 作为本轮源码门禁。历史
+scaffold 的隔离单测结果不等于当前 working tree 已跑完整 pytest；当前环境
+缺少依赖，不能替代 A5 allocation、P/D E2E、payload 或 accuracy 验收。
 
 后续更新状态时遵循：
 
@@ -159,11 +186,11 @@ A5 allocation、P/D E2E 或 accuracy 验收；Task 1 Step 7 和 DoD 仍保持
 - ASU 原型不计作 vllm-ascend 产品 Task 完成；
 - 设计评审通过不等于实现完成。
 
-当前实现只证明 eager scaffold 的对象边界与调用顺序，不能据此声明 DSA
-Sparse 功能可用。下一阶段应依次接真实 index operator、I/O
-backend/runtime factory、Main publication、Indexer-only connector
-projection 与 scheduler dual-ready bridge；graph 和 A5 系统验收继续保持
-后置。
+当前实现证明 Graph 外的固定对象所有权、fused index state transition、
+mock 生命周期和调用顺序；不证明真实 Main payload 或模型功能可用。下一
+阶段应依次完成 CANN/A5 单算子验收、真实 I/O backend/runtime factory、
+Main publication、Indexer-only connector projection 与 scheduler
+dual-ready bridge；graph 与系统验收继续后置。
 
 ---
 
@@ -227,7 +254,8 @@ path:       pta-ops/asu_hbm_index_lookup_simt
 - duplicate non-resident entry 的 CAS canonical occurrence；
 - victim 双向失效；
 - stable batch approximate LRU；
-- one AIV core per active batch row，并通过 stable cache seat 访问长期状态；
+- 一个 request row 在一次处理期间由单个 AIV 独占，并通过 stable cache seat
+  访问长期状态；`R>AIV count` 时每个 AIV 按 row stride 顺序处理多行；
 - 256 SIMT threads；
 - 固定 NPU workspace；
 - `slot_ids + miss_mask` 固定输出。
@@ -271,7 +299,8 @@ path:       pta-ops/asu_hbm_index_lookup_simt
   - stream/device synchronize；
   - replay 期间 tensor/workspace 动态分配。
 - vLLM 原有 scheduler/control plane 仍负责调度和准备既有 graph input；
-  它不得读取、compact、解释或搬运 DSA Sparse I/O plan 与 KV payload。
+  它不得读取、compact、解释或搬运 DSA Sparse miss mask、device address
+  descriptor 与 KV payload。
 - row/request/block lifecycle metadata 只允许复用 ModelRunner 既有的固定
   graph-input copy 边界；禁止新增 Python 逐 row/逐 block pass、device value
   readback、同步点或独立 H2D stage。
@@ -324,12 +353,14 @@ path:       pta-ops/asu_hbm_index_lookup_simt
    request 通过稳定 cache seat 绑定该显存，不能直接使用会被压缩重排的
    batch row 作为长期地址。
 7. Top-K 到 hot slot 的所有决策在 NPU 完成。
-8. backend read/write 直接消费固定形状 NPU plan。
-9. IndexCache leader 生成一次 plan，follower layers 复用。
+8. `dsa_sparse_lookup_update` 只输出固定形状 local indices 与 miss mask；
+   `dsa_sparse_io` 在设备侧派生 read 地址并消费固定 newest write descriptor。
+9. IndexCache leader 执行一次 lookup/update，follower layers 复用结果。
 10. normal decode、MTP3、prefix/block identity、row reuse 均正确。
 11. 整个 decode 数据链进入 `FULL_DECODE_ONLY` graph。
 12. 外部 backend 无需修改 SFA 或 vLLM KV planner 即可接入。
-13. SFA 前的数据路径固定为 `Top-K → lookup → I/O → wait → SFA`，不构造
+13. SFA 前的数据路径固定为
+    `Top-K → dsa_sparse_lookup_update → dsa_sparse_io → SFA`，不构造
     resident/non-resident 两条执行路径。
 
 ### 3.2 非目标
@@ -428,23 +459,22 @@ flowchart TB
         I["Full Indexer KV<br/>D-side HBM"]
         SEAT["Allocate stable cache seat<br/>only after ready"]
         T["Lightning Indexer Top-K"]
-        L["A5 SIMT Lookup<br/>token position → hot slot"]
-        PLAN["Fixed-shape I/O Plan<br/>source / destination / valid_mask"]
-        IO["I/O Operator<br/>always invoked"]
-        W["Device Wait"]
+        L["A5 SIMT dsa_sparse_lookup_update<br/>lookup + state update"]
+        IO["Unified dsa_sparse_io<br/>addressing + payload + completion"]
         H["Per-layer Main Hot KV Pool<br/>D-side HBM"]
         BT["Synthetic Hot Block Table"]
         A["Existing Sparse SFA<br/>ABI / kernel unchanged"]
         READY --> DS --> SEAT
         READY --> I
-        I --> T --> L --> PLAN --> IO --> W --> A
+        I --> T --> L --> IO --> A
         L -->|"resolved hot indices"| A
+        L -->|"miss mask"| IO
         H --> A
         BT --> A
         SEAT --> L
         SEAT --> BT
-        BR --> IO
-        H -->|"newest graph write"| BR
+        BR <-->|"history read / newest write"| IO
+        IO <-->|"Hot payload"| H
     end
 ```
 
@@ -518,22 +548,21 @@ physical block number；不支持跨 TP/PP 重分片。
 ```text
 01  写完整 NPU Indexer KV
 02  写本轮 Main KV 到 reserved newest hot slots
-03  backend.write_async(newest -> external region)
-04  Lightning Indexer Top-K
-05  A5 SIMT lookup：token position -> local hot slot，并生成固定形状 I/O plan
-06  backend.read_async(plan, valid_mask)；每次都调用
-07  device wait(read completion)；每次都调用
-08  生成/选择 synthetic hot block table
-09  现有 Sparse SFA 使用 resolved local hot indices
-10  device wait(write completion) / secondary stream join
-11  graph replay 结束
+03  Lightning Indexer Top-K
+04  dsa_sparse_lookup_update：
+    epoch reset + newest 判定 + lookup + 分配/淘汰 + 映射/LRU 更新
+05  统一 DSA Sparse I/O op：
+    newest -> backend，并按 miss_mask 执行 backend -> Hot Cache
+06  I/O op 内建立 main stream 可见的 read/write completion dependency
+07  现有 Sparse SFA 使用 resolved local hot indices
+08  graph replay 结束
 ```
 
-第 05 步内部必须判断一个 token 是否已经 resident，否则无法决定是否需要
-payload transfer；但该判断只写入 `read_valid_mask`，不得改变后续算子序列。
-不存在 Python/C++ 层的 all-resident fast path、non-resident slow path、
-条件 I/O 或条件 SFA。全 resident 时第 06 步仍执行，`read_valid_mask` 全为
-0，backend op 不提交任何 payload transfer。
+第 04 步必须判断一个 token 是否已经 resident，否则无法决定是否需要
+payload transfer；但该判断只写入固定形状 `miss_mask`，不得改变后续算子
+序列。不存在 Python/C++ 层的 all-resident fast path、non-resident slow
+path、条件 I/O 或条件 SFA。全 resident 时第 05 步仍执行，`miss_mask`
+全为 0，I/O op 只处理有效 newest write，不提交 history payload read。
 
 任何 backend 辅助 stream 都必须在 graph 结束前通过 event 直接或间接回到
 main stream。不得让未完成 payload write 脱离本次 graph 生命周期。
@@ -588,13 +617,14 @@ prefill 内频繁互相淘汰，无法维持当前 decode lookup/LRU 合同。
 | reserved newest slot | 本轮 decode/MTP 新生成 KV 的不可淘汰 slot |
 | publication | P 端按 portable block identity 发布的完整 prompt Main KV |
 | storage region | backend 为 D-side 单个 layer/rank 注册并绑定到 D physical blocks 的完整 Main KV 区域 |
-| read plan | `read_global_slots + read_destination_hot_row_ids + read_valid_mask` |
-| write plan | `write_global_slots + write_destination_hot_row_ids + write_valid_mask` |
-| lookup group | 同一 residency cohort 内一个 IndexCache leader 及 followers 共享的 plan/state |
+| lookup result | 固定形状 `resolved_hot_indices + miss_mask` |
+| newest write descriptor | `write_global_slots + write_destination_hot_row_ids + write_valid_mask`，由固定公式填充 |
+| lookup group | 同一 residency cohort 内一个 IndexCache leader 及 followers 共享的 lookup result/state |
 | residency cohort | payload 始终同步填充的一组 layer regions；cohort 间 resident state 隔离 |
 
 Top-K token position 是 resident lookup identity，不先改成 global slot。
-只有固定 I/O plan 需要通过当前 block table 生成 backend source address：
+只有 I/O op 需要通过当前 block table 生成 backend source address；该地址在
+op 内按 entry 派生，不在 lookup 前后物化成另一组 plan tensor：
 
 ```text
 valid =
@@ -637,7 +667,7 @@ hot_to_token[local_hot_slot] == token_position
 - D request 在 `main_region_ready && indexer_ready` 之前不得进入 running，
   也不得领取 cache seat；
 - P/D bind 后，D-side region 的 slot identity 只使用 D physical block；
-  P physical block 不得进入 Decode lookup/I/O plan；
+  P physical block 不得进入 Decode lookup 或 I/O device addressing；
 - 一个 running request 只绑定一个 cache seat，一个 cache seat 同时只属于
   一个 running request；
 - request 在 batch row 间移动时只更新 `row_to_cache_seat`，不搬运 Hot KV、
@@ -648,11 +678,11 @@ hot_to_token[local_hot_slot] == token_position
   lookup、LRU 或 SFA；
 - 一轮 Top-K union 内的所有 selected slots 均受保护，不可互相淘汰；
 - 同一个非 resident token 的重复 occurrence 只允许一个 canonical
-  occurrence 设置 `read_valid_mask=True`；
+  occurrence 设置 `miss_mask=True`；
 - padding token position 为 `-1`，输出 `local_hot_slot=-1,
-  read_valid_mask=False`；
-- seat owner/epoch 变化时，由 NPU state op 重置整行；
-- 同一个 lookup group 同时只允许一个 lookup/read/attention 闭环；
+  miss_mask=False`；
+- seat owner/epoch 变化时，由 `dsa_sparse_lookup_update` 在查询前重置整行；
+- 同一个 lookup group 同时只允许一个 lookup_update/I/O/attention 闭环；
 - backend read 完成前 Attention 不得消费新分配 hot slot；
 - backend write completion 前 reserved slot 不得覆盖；
 - graph replay 返回前，本轮 backend write 必须已经 join。
@@ -671,7 +701,7 @@ hot_to_token[local_hot_slot] == token_position
 
 ## 6. 支持矩阵与配置
 
-> 以下为长期首期交付矩阵。本轮 eager scaffold 的临时实现门禁更窄：
+> 以下为长期首期交付矩阵。本轮 Graph 外实现门禁更窄：
 > `enforce_eager=true`；D consumer 只允许 target normal decode 和
 > `num_speculative_tokens=0`，P producer 仍保持 baseline MTP 配置；ACL
 > Graph 和 D-side MTP/draft 均 fail-fast。这一临时门禁不删除长期目标。
@@ -691,7 +721,7 @@ hot_to_token[local_hot_slot] == token_position
 | Parallel | P/D 两侧同构 baseline TP16/EP；`pipeline_parallel_size=1`；DCP=1；PCP=1 |
 | Main cache | BF16、A5 SFA C8 |
 | Indexer cache | BF16、A5 LI C8 |
-| IndexCache | independent 与 leader/follower plan-once |
+| IndexCache | independent 与 leader lookup-result-once / follower reuse |
 | Lifecycle | prefix、batch row reorder、cache seat reuse、preemption/resume、eviction |
 | I/O | 外部 provider ABI；测试仅 link-time fake provider fixture |
 
@@ -743,6 +773,11 @@ D worker：
   }
 }
 ```
+
+上述 JSON 是长期真实 backend + graph 目标。当前 Graph 外开发运行只接受
+D consumer 的 `"io_backend": "mock"`、`enforce_eager=true` 和
+`num_speculative_tokens=0`；mock 不需要、也不会解释真实 storage options。
+P/D 双端真实启动配置在 Task 3/9 完成前不可用。
 
 配置规则：
 
@@ -824,8 +859,9 @@ C = 当前 rank 上的 residency cohort 数
 “为每个 running request 分配固定长度 MLA Cache”在实现上不是 request
 到来后动态执行 `torch.empty`。Decode worker 启动/capture 前一次性分配
 `A` 个等长 cache seats，且只在 P/D handoff ready 后让 running request
-领取其中一个 seat。所有 Hot KV tensor、resident index、I/O plan、workspace、
-block table 和 completion resource 地址在 replay 期间固定。
+领取其中一个 seat。所有 Hot KV tensor、resident index、lookup output、
+newest write descriptor、workspace、block table 和 completion resource 地址
+在 replay 期间固定。
 
 ### 7.1 修改前后：保留、替代与新增
 
@@ -859,7 +895,7 @@ flowchart LR
         AX --> AH
         AH --> ASFA
         ABT --> ASFA
-        AE -->|"fixed I/O plan"| AH
+        AE -->|"dsa_sparse_io device addressing"| AH
     end
 ```
 
@@ -918,10 +954,10 @@ external-main marker `KVCacheSpec`，而是按 `kv_role` 投影两个视图：
   在 eager context 中提供；
 - zero-block placeholder 不进入 `KVCacheTensor`、`self.kv_caches`、
   `KVCacheTensor` connector view 或 connector registration；
-- D 侧先从可用于 KV blocks 的 HBM 中扣除固定 Hot payload、resident state、
-  最大 eager plan、eager batch context/scratch 最坏逻辑峰值和 backend
-  auxiliary reservation，再由 Full Indexer 和其他未 offload cache 决定
-  NPU block capacity；
+- D 侧先从可用于 KV blocks 的 HBM 中扣除固定 Hot payload、共享 batch
+  metadata、每 cohort resident state/lookup/workspace、eager
+  context/scratch 最坏逻辑峰值和 backend auxiliary reservation，再由 Full
+  Indexer 和其他未 offload cache 决定 NPU block capacity；
 - 长期目标中，`kv_cache_config.num_blocks` 还需受 backend region capacity
   约束；P/D 两侧可有不同 physical block id，但 layout 必须同构。该 backend
   capacity/runtime factory 尚未在本轮 scaffold 中实现。
@@ -940,7 +976,8 @@ external-main marker `KVCacheSpec`，而是按 `kv_role` 投影两个视图：
 
 #### 替代
 
-下表描述最终目标态；“本轮”说明 `aac21b73` 已达到的 eager scaffold 边界。
+下表描述最终目标态；“本轮”说明 `aac21b73` 之上的当前 Graph 外 working
+tree 已达到的边界。
 
 | 修改前 | 修改后 |
 | --- | --- |
@@ -949,26 +986,27 @@ external-main marker `KVCacheSpec`，而是按 `kv_role` 投影两个视图：
 | P/D transfer 默认把同一 KV cache 集合送到 D 端 tensor | Main 由 backend publication/bind 到 D region；既有 P/D KV transfer 只注册 Indexer cache group |
 | 假设 P/D physical block/global slot 可直接对应 | 使用 portable block identity handoff，再 bind/remap 到 D-side physical blocks |
 | Scheduler block table 同时给 SFA 和 KV 写入寻址 | 原 block table 只给 backend I/O/newest storage write 寻址；SFA 改用 synthetic hot block table |
-| Main KV 通过原 `slot_mapping` 写入 full NPU blocks | 目标为写入当前 seat 的 reserved newest slots，并以固定 write plan 同步到 backend；本轮只完成 Hot slot 写入和 write 接口/plan 骨架，未执行 backend write/join |
+| Main KV 通过原 `slot_mapping` 写入 full NPU blocks | 目标为写入当前 seat 的 reserved newest slots，并由统一 `dsa_sparse_io` 同步到 backend；本轮完成 Hot slot 与 newest descriptor，mock 不执行 backend write |
 | 临时 batch row 隐含承担 cache owner 身份 | 稳定 `cache_seat` 成为长期 owner；`row_to_cache_seat` 仅是每次 replay 的地址翻译 |
 | Top-K token position 直接寻址 full Main KV | Top-K 先查询 `token_to_hot`，得到 SFA 可用的 local hot slot |
 
 #### 新增
 
-下表是目标资源清单。当前提交已在标准 D consumer 初始化路径实际分配
-CacheSeatManager、每层 Hot KV、每 cohort resident state 和最大 eager plan；
-I/O context/region/completion 仍是 identity-only stub resource，backend
-region、publication/bind、dual-ready bridge 与 graph-owned resource 均未
-实例化。
+下表是目标资源清单。当前 working tree 已在标准 D consumer 初始化路径
+实际分配 `CacheSeatManager`、每层 Hot KV、一次 role-level batch metadata、
+每 cohort resident state、lookup outputs 与固定 workspace。I/O
+context/region/completion 仍是 identity-only mock resource，backend region、
+publication/bind、真实 dual-ready bridge 与 graph-owned resource 均未实例化。
 
 | 新增对象 | 分配时机 | 所有者 |
 | --- | --- | --- |
 | `CacheSeatManager` 与 `request_id -> cache_seat` | runner 初始化；request lifecycle 更新 | ModelRunner control plane |
 | 每层 Main Hot KV pool | KV cache 初始化/capture 前 | local PP/TP rank 的 layer |
 | token 粒度 resident index 与 LRU | KV cache 初始化/capture 前 | residency cohort leader |
-| `row_to_cache_seat`、`seat_epoch` | 固定 tensor；既有 input update 边界刷新 | graph role / cohort |
-| synthetic hot block table | capture 前固定分配；replay 更新有效 rows | graph key |
-| 固定 read/write plan、workspace、completion/event | capture 前 | graph key × layer/region |
+| row/query/seq/block/newest batch metadata 与 synthetic hot block table | 固定 tensor；既有 input update 边界统一刷新 | graph role；所有 target cohort 共享一份 |
+| `token_to_hot/hot_to_token/LRU/state_seat_epoch` | 初始化/capture 前 | residency cohort |
+| `valid_topk_counts/topk/resolved/miss/workspace` | 初始化/capture 前 | graph key × residency cohort |
+| unified I/O completion/event | 初始化/capture 前 | graph key × layer/region |
 | backend full Main regions | backend 初始化 | layer × PP rank × TP rank |
 | P-side publication 与 D-side bind/remap state | request P/D handoff | backend + P/D lifecycle adapter |
 | `main_region_ready/indexer_ready/request_ready` fan-in | request P/D handoff | D-side control plane |
@@ -977,8 +1015,8 @@ region、publication/bind、dual-ready bridge 与 graph-owned resource 均未
 继续交给原 KVCacheManager。Prefill worker 的 Main Full KV 保持 baseline。
 D-side 原 KVCacheManager 仍管理逻辑 block 数和 Full Indexer。目标架构中，
 D-side Main payload 的完整容量由 backend region 承担，Hot Cache 由
-`CacheSeatManager` 管理；当前提交已有固定 tensor allocation 和开发期 stub
-runtime，但尚无真实 backend resource factory，因此不能承载完整 Main
+`CacheSeatManager` 管理；当前 working tree 已有固定 tensor allocation 和
+mock runtime，但尚无真实 backend resource factory，因此不能承载完整 Main
 payload。
 
 ### 7.2 HBM 预算与 `num_blocks` 计算
@@ -1008,22 +1046,49 @@ hot_payload_bytes =
 resident_index_bytes =
     C * (
         A * L * sizeof(int32)        # token_to_hot
-      + A * M * sizeof(int32)        # hot_to_token
+      + A * S * sizeof(int32)        # hot_to_token；reserved newest 不入长期映射
       + A * S * sizeof(int32)        # lru_slots
       + A * sizeof(int32)            # state_seat_epoch
     )
 
-eager_execution_reserve_bytes =
+batch_metadata_bytes =
+      2 * A * sizeof(int32)          # row_to_cache_seat / row_seat_epoch
+    + role-level query/seq/block/hot-block/newest fixed tensors
+
+lookup_plan_bytes =
     C * (
-        context_lifetime_bytes
-      + max(begin_scratch_bytes, lookup_scratch_bytes)
+        valid_topk_counts_bytes
+      + topk_positions_bytes
+      + resolved_hot_indices_bytes
+      + miss_mask_bytes
+      + A * (3*S + 3*256 + 4) * sizeof(int32)
+    )
+
+eager_execution_reserve_bytes =
+      shared_batch_staging_bytes
+    + C * (
+          context_lifetime_bytes
+        + lookup_scratch_bytes
+      )
+
+initialization_scratch_bytes =
+    max(
+        query_capacity * sizeof(int32),  # shared flat query initializer
+        S * sizeof(int32)                # per-cohort LRU arange initializer
+    )
+
+runtime_peak_reserve_bytes =
+    max(
+        initialization_scratch_bytes,
+        eager_execution_reserve_bytes
     )
 
 dsa_sparse_fixed_eager_bytes =
     hot_payload_bytes
+  + batch_metadata_bytes
   + resident_index_bytes
-  + C * max_eager_plan_bytes
-  + eager_execution_reserve_bytes
+  + lookup_plan_bytes
+  + runtime_peak_reserve_bytes
   + backend_auxiliary_bytes
 
 D_HBM_current_eager =
@@ -1040,12 +1105,17 @@ D_HBM_current_eager =
 后续 decode 产生的历史；当前 scaffold 只移除了 D-side full Main allocation
 并扣减固定逻辑预算，尚未建立实际 backend 容量。
 
-`C` 是 residency cohort 数。当前提交按 logical tensor bytes 扣除 Hot
-payload、resident state、每个 cohort 的最大 eager plan，以及
-`DSASparseEagerBatchContext` 生命周期 tensor 加 begin/lookup 两阶段较大者
-的临时峰值。当前 `backend_auxiliary_bytes=0`，且尚未覆盖 PyTorch allocator
-alignment/fragmentation、真实 backend 内部 workspace 或未来自定义算子
-workspace；这些不能被解读为“已预留但当前未使用”。
+`C` 是 residency cohort 数。当前 working tree 按 logical tensor bytes
+扣除 Hot payload、一次共享 batch metadata、每 cohort resident state、
+lookup outputs/固定 SIMT workspace，以及
+`shared_batch_staging + C*(context_lifetime + lookup_scratch)`。固定 fused-op
+workspace 已在 `lookup_plan_bytes` 中计入；初始化构造固定 tensor 时的
+`flat_query_indices[Q]` 与 `arange(S)` 显式临时量单独计为
+`initialization_scratch_bytes`，总预留在初始化峰值和执行峰值之间取较大者，
+不再使用 `begin_scratch/lookup_scratch` 二选一。当前
+`backend_auxiliary_bytes=0`，且尚未覆盖 PyTorch allocator
+alignment/fragmentation 或真实 backend 内部 workspace；这些不能被解读为
+“已预留但当前未使用”。
 
 长期 graph 实现还必须在上述 eager 预算之外加入所有 graph bucket 的固定
 workspace、completion/event backing 和 graph runtime bytes；本轮明确没有
@@ -1056,8 +1126,9 @@ planner：
 
 1. 计算每个 PP/TP rank 的 local Main layer layout 和 `main_row_bytes`；
 2. 从可用 HBM 中预留 Main Hot KV pool；
-3. 当前 eager 路径预留 resident index、最大 eager plan、eager batch
-   context/scratch 逻辑峰值和 backend auxiliary bytes；
+3. 当前 eager 路径预留共享 batch metadata、resident index、每 cohort
+   lookup outputs/workspace、eager shared/per-cohort execution 逻辑峰值和
+   backend auxiliary bytes；
 4. 长期 graph 路径再预留所有 graph buckets 的 plan/workspace、
    completion/event backing；模型和 runtime 固定开销继续由 baseline
    memory profile 计入；
@@ -1077,7 +1148,7 @@ D_num_blocks = min(
 
 8. 将统一 `D_num_blocks` 交还 D-side scheduler/KV cache config。
 
-当前提交只实现固定逻辑 HBM 扣减后由 NPU-resident cache 计算
+当前 working tree 只实现固定逻辑 HBM 扣减后由 NPU-resident cache 计算
 `npu_capacity_blocks`，backend capacity 尚不约束 `D_num_blocks`；在真实
 backend capacity 查询接入前，不能据此声明外存容量闭环。
 
@@ -1100,7 +1171,7 @@ free_seats:       stack/queue of [0, A)
 seat_owner[A]:    request handle or FREE
 seat_epoch[A]:    monotonically increasing int32
 request_to_seat:  control-plane map
-row_to_cache_seat[R]: fixed NPU graph input
+row_to_cache_seat[R]: fixed NPU graph input；-1 表示 inactive/padding row
 ```
 
 ```mermaid
@@ -1122,27 +1193,30 @@ stateDiagram-v2
 3. **request 进入 running：** ready 后 control plane 从 `free_seats` 领取
    seat，写 `seat_owner`，递增 `seat_epoch`，并在既有 graph-input copy
    边界更新 `row_to_cache_seat`/epoch。
-4. **首次 replay：** NPU state op 比较 epoch；不一致时把该 seat 的
-   `token_to_hot`、`hot_to_token` 和 LRU 重置。旧 payload 不必清零，因为
-   epoch mismatch 后不可寻址。
+4. **首次 replay：** `dsa_sparse_lookup_update` 在查询前比较 epoch；
+   不一致时把该 seat 的 `token_to_hot`、`hot_to_token` 和 LRU 重置。旧
+   payload 不必清零，因为 epoch mismatch 后不可寻址。
 5. **batch reorder/condense：** 只改变 `row_to_cache_seat[row]`。Hot KV、
    token index 和 LRU 留在原 seat，零 payload copy。
-6. **request finish/preempt：** 当前 graph 已 join read/write 后标记 inactive，
-   删除 `request_to_seat` 并归还 seat。preempt/resume 不承诺保留 Hot Cache；
-   resume 重新领取 seat，从 backend 按固定流水线恢复。
+6. **request finish/preempt：** 当前 graph 的统一 I/O completion dependency
+   已满足后标记 inactive，删除 `request_to_seat` 并归还 seat。
+   preempt/resume 不承诺保留 Hot Cache；resume 重新领取 seat，从 backend
+   按固定流水线恢复。
 7. **seat reuse：** 新 owner 通过新 epoch 触发 device reset，不能观察旧
    request 的 mapping。payload 继续 lazy overwrite。
 
-seat 分配/释放属于低频 request control plane；Top-K resident lookup、I/O
-plan 和 payload transfer 仍完全在 NPU graph 内，不能把 seat lifecycle
-扩展成逐 token Host 数据路径。
+seat 分配/释放属于低频 request control plane；Top-K resident lookup、
+miss mask、I/O device addressing 和 payload transfer 仍完全在 NPU graph
+内，不能把 seat lifecycle 扩展成逐 token Host 数据路径。
 
 ### 7.4 Token 粒度 Resident Index
 
 该索引只存在于 Decode worker。Lightning Indexer 保持 baseline 扁平输出
-`[Q, K]`。NPU pack op 使用
-`token_to_row`、`token_to_lane`、`row_to_cache_seat` 和
-`query_valid_mask` 构造内部 `[R, T, K]` union。
+`[Q, K]`。`dsa_sparse_lookup_update` 直接读取固定 shape 的
+`query_to_row`、`query_to_lane`、`row_to_cache_seat`、
+`query_valid_mask` 和 `topk_positions`，在算子内部构造每个 request 的
+`[T, K]` protected union；不在它之前增加 pack custom op，也不在它之后
+增加 unpack/linearize custom op。
 
 resident index 使用与既有 DSA Sparse lookup 相同的 dense direct table +
 reverse table + approximate LRU：
@@ -1150,10 +1224,10 @@ reverse table + approximate LRU：
 | Tensor | Shape | Dtype | 所有权 |
 | --- | ---: | --- | --- |
 | `token_to_hot` | `[A, L]` | `int32` | residency cohort |
-| `hot_to_token` | `[A, M]` | `int32` | residency cohort |
+| `hot_to_token` | `[A, S]` | `int32` | residency cohort |
 | `lru_slots` | `[A, S]` | `int32` | residency cohort |
 | `state_seat_epoch` | `[A]` | `int32` | residency cohort |
-| `workspace` | `[R, workspace_stride]` | `int32` | graph key |
+| `workspace` | `[R, workspace_stride]` | `int32` | graph key × residency cohort |
 
 正向和反向关系为：
 
@@ -1168,7 +1242,8 @@ mapping 保存 block generation。request 内 token position 是语义身份；
 D-side backend global slot 只在构造 I/O source address 时由当前 D block
 table 计算。
 seat 复用、preempt/resume 和 speculative token position 重写分别通过
-seat epoch、cold resume 和 newest mapping overwrite 处理。
+seat epoch、cold resume 和算子内 newest stale-mapping invalidation 处理。
+reserved newest slot 不写入上述长期双向映射。
 
 索引的实际实例数由 residency cohort 决定：
 
@@ -1184,10 +1259,18 @@ IndexCache followers 机械复制完全相同的 dense table。这样索引 HBM 
 `num_layers * A * L * 4` 降为 `num_cohorts * A * L * 4`，同时不改变每层
 payload 隔离。
 
-`workspace_stride` 由 operator tiling 按 `(S, T*K, 256 threads)` 计算，
-按 CANN alignment 向上取整，并在 Task 0 冻结公式与上限。
+当前 Ascend 950 实现冻结：
 
-### 7.5 固定 Graph Plan 与单一路径 Lookup 算法
+```text
+workspace_stride = 3*S + 3*256 + 4       # int32 elements per request row
+T <= 4
+T*K <= S
+```
+
+workspace 是调用方预分配的固定二维 tensor，不由 kernel 动态分配，也不再
+额外做未计入预算的 tiling alignment。
+
+### 7.5 固定 Graph 输入输出与单次 Lookup-Update 算法
 
 同一个 `Q` 可以对应不同的 `(R, T)`，graph 资源 key 为：
 
@@ -1200,28 +1283,25 @@ DSASparseGraphKey(
 )
 ```
 
-固定 plan：
+固定 graph 输入、输出和确定性 write descriptor：
 
 | Tensor | Shape | Dtype |
 | --- | ---: | --- |
-| `row_active` | `[R]` | `uint8/bool` |
-| `row_to_cache_seat` | `[R]` | `int32` |
+| `row_to_cache_seat` | `[R]` | `int32`，`-1` 表示 inactive/padding row |
 | `row_seat_epoch` | `[R]` | `int32` |
-| `seq_lens` | `[R]` | baseline dtype |
-| `token_to_row` / `token_to_lane` | `[Q]` | `int32` |
-| `query_valid_mask` | `[Q]` | `uint8/bool` |
+| `seq_lens` | `[R]` | `int32` |
+| `query_positions` | `[Q]` | `int32` |
+| `query_to_row` / `query_to_lane` | `[Q]` | `int32` |
+| `query_valid_mask` | `[Q]` | `bool` |
 | `valid_topk_counts` | `[Q]` | `int32` |
 | `topk_positions` | `[Q, K]` | `int32` |
-| `read_source_global_slots` | `[R, T, K]` | `int32` |
-| `read_local_hot_slot_ids` | `[R, T, K]` | `int32` |
-| `read_destination_hot_row_ids` | `[R, T, K]` | `int32` |
-| `read_valid_mask` | `[R, T, K]` | `uint8/bool` |
 | `resolved_hot_indices` | `[Q, K]` | `int32` |
-| `hot_block_table` | `[R, H / B]` | baseline block-table dtype |
+| `miss_mask` | `[Q, K]` | `bool` |
+| `hot_block_table` | `[R, H / B]` | `int32` |
 | `write_global_slots` | `[R, T]` | `int32` |
 | `write_destination_hot_row_ids` | `[R, T]` | `int32` |
-| `write_valid_mask` | `[R, T]` | `uint8/bool` |
-| `completion_resources` | `[graph_key][region][direction][inflight_lane]` | opaque |
+| `write_valid_mask` | `[R, T]` | `bool` |
+| `completion_resources` | `[graph_key][region][inflight_lane]` | opaque |
 
 地址关系：
 
@@ -1229,38 +1309,60 @@ DSASparseGraphKey(
 read_destination_hot_row_id =
     cache_seat * H + local_hot_slot
 
+read_source_global_slot =
+    block_table[row, token_position // B] * B
+    + token_position % B
+
 hot_block_table[row, block_idx] =
     row_to_cache_seat[row] * (H / B) + block_idx
 
 resolved_hot_indices[q, k] =
-    local_hot_slot                         # [0, M)，不是 flattened row
+    local_hot_slot                         # [0, S+T)，不是 flattened row
 ```
 
-每个 Top-K entry 在一个 lookup op 内产生相同结构的结果：
+inactive/padding row 的 `row_to_cache_seat=-1`，其整行
+`hot_block_table=-1`，不能直接使用负 seat 套用上式。
+
+其中 `hot_block_table` 与三个 newest write descriptor 由 framework 在既有
+graph-input staging 边界的同一次 row metadata copy 中按固定公式原地填写，
+不增加第二次逐 row Host pass，也不是 custom op。read source global slot
+和 destination hot row 由统一 I/O op 根据
+`topk_positions + resolved_hot_indices + miss_mask + row/block mapping`
+直接派生，不再长期保存三组 read plan tensor。
+
+`dsa_sparse_lookup_update` 的逻辑 ABI 为：
 
 ```text
-(resolved local hot slot,
- backend source global slot,
- backend destination hot row,
- read_valid bit)
+dsa_sparse_lookup_update(
+    token_to_hot!, hot_to_token!, lru_slots!, state_seat_epoch!,
+    row_to_cache_seat, row_seat_epoch,
+    query_positions, query_to_row, query_to_lane,
+    query_valid_mask, valid_topk_counts, seq_lens, topk_positions,
+    resolved_hot_indices!, miss_mask!, workspace!
+)
 ```
 
-算法顺序固定：
+它是索引侧唯一 custom op。每个 residency cohort 的 leader 每轮只调用一次；
+followers 只复用输出，不重复修改 mapping/LRU。算法顺序固定：
 
-1. validity gate 过滤 padding、无效 query lane 和越界 token position；
-2. 查询 `token_to_hot[seat, token_position]`；
-3. 对未 resident 的重复 token 做 canonicalization；
-4. 从 free/LRU slots 中为 canonical entries 分配 local slots，同时保护本轮
+1. 由 `request_row` 查 `row_to_cache_seat`；`seat < 0` 时整行输出无效；
+2. 比较 `row_seat_epoch` 与 `state_seat_epoch`，不一致时原地重置该 seat；
+3. 对本轮 `query_positions` 清理可能存在的旧 evictable stale mapping；
+4. validity gate 过滤 padding、无效 query lane 和越界 token position；
+5. 当前 Top-K token 等于对应 `query_position` 时，直接返回该 lane 的
+   reserved newest slot，写 `miss_mask=False`，不安装长期 mapping；
+6. 其他 token 查询 `token_to_hot[seat, token_position]`；
+7. 对未 resident 的重复 token 做 canonicalization；
+8. 从 free/LRU slots 中为 canonical entries 分配 local slots，同时保护本轮
    `[T,K]` union，避免本轮选择互相淘汰；
-5. victim 同时清理 `token_to_hot` 和 `hot_to_token`；
-6. 所有 occurrence 写 `resolved_hot_indices`；只有需要 payload transfer 的
-   canonical occurrence 写 `read_valid_mask=1`；
-7. 更新 `stale + newly allocated + selected resident` approximate LRU；
-8. 无条件调用一次 I/O op；
-9. 无条件调用 wait；
-10. 无条件调用一次现有 SFA。
+9. victim 同时清理 `token_to_hot` 和 `hot_to_token`，再安装新双向映射；
+10. 所有 occurrence 写 `resolved_hot_indices`；只有需要 payload transfer
+    的 canonical occurrence 写 `miss_mask=True`；
+11. 更新 `stale + newly allocated + selected resident` approximate LRU；
+12. 每层无条件调用一次统一 I/O op；
+13. 无条件调用一次现有 SFA。
 
-`read_valid_mask` 是 I/O op 的逐 entry 数据，不是框架控制流。禁止：
+`miss_mask` 是 I/O op 的逐 entry 数据，不是框架控制流。禁止：
 
 - Python/C++ 读取 resident 数或 transfer 数；
 - `if all_resident: skip_io`；
@@ -1268,20 +1370,22 @@ resolved_hot_indices[q, k] =
 - compact 后按动态长度提交 backend；
 - 为全 resident 和含 transfer 的输入捕获两张 graph。
 
-全 resident 时固定 plan 仍完整产生，I/O op 接收全 0 mask 并完成 device-side
-no-transfer，随后 wait 和 SFA 正常执行。
+全 resident 时 `resolved_hot_indices` 与 `miss_mask` 仍完整产生，I/O op
+接收全 0 history-read mask，随后 SFA 正常执行。
 
 completion、I/O workspace 和 auxiliary event 的所有权粒度为：
 
 ```text
 DSASparseGraphKey
 × layer/region
-× direction(read | write)
 × max_inflight_lanes
 ```
 
-首版每个 region 每个方向 `max_inflight_lanes=1`。leader/follower 只共享
-plan，不共享 per-layer payload、region completion 或 event。
+统一 I/O op 内部处理 newest write 与 history miss read，所以不再按
+read/write direction 分配两类 completion。首版每个 region
+`max_inflight_lanes=1`。leader/follower 只共享
+`resolved_hot_indices/miss_mask`，不共享 per-layer payload、region
+completion 或 event。
 
 ### 7.6 Hot Payload、Newest Slots 与 SFA 适配
 
@@ -1303,12 +1407,16 @@ alignment pad:   [M, H)
 ```
 
 - 当前最多 `T` 个有效 Main KV 直接写入 reserved newest slots；
-- state op 将当前 token positions 安装到这些 slots；被 Top-K 选中时
-  `read_valid_mask=0`，I/O op 仍被调用但不搬运这些 entry；
-- newest payload 使用固定 write plan 写入 backend；
-- 下一 replay 退休旧 reserved mappings；旧 token 再被选中时按普通
-  token position 查询/加载；
-- padding 区 `[M,H)` 永不进入 index、LRU、I/O plan 或 SFA。
+- 第 `lane` 个有效 query 的 reserved local slot 固定为 `S + lane`；
+- reserved destination、backend global slot 和 valid mask 由 framework 在
+  固定 graph-input staging 边界按 seat/lane/block-table 公式填写；
+- `dsa_sparse_lookup_update` 不把当前 token position 安装到
+  `token_to_hot/hot_to_token`；被 Top-K 选中时直接返回 reserved slot，
+  `miss_mask=False`；
+- newest payload 使用固定 write descriptor 写入 backend；
+- 下一 replay 不需要退休 reserved mapping；旧 newest 若再次被选中，作为
+  普通 token position 进入 lookup/LRU/read 路径；
+- padding 区 `[M,H)` 永不进入 index、LRU、I/O addressing 或 SFA。
 
 SFA 算子不增加第二套索引，不创建 DSA Sparse 专用 SFA op。pre-SFA adapter
 只替换输入 tensor/view：
@@ -1337,7 +1445,7 @@ Hot Cache layout，不能修改 SFA schema、tiling 或 kernel。
 | EP/DP | EP 不改变 MLA cache layer ownership；每个 DP replica 独立拥有 seat pool、index、Hot KV 和 backend context | 支持 baseline EP/DP1；DP>1 需按 replica 隔离 region namespace |
 | PP | P stage 发布其 local layers，D stage 绑定对应 local layers；D 每个 stage 只为 local layers 分配 Hot KV/regions | 首期固定 PP=1；PP>1 后续需补 P/D stage mapping、seat ownership 和 MTP graph-role 传播 |
 | Prefix cache | P/D scheduler 的 block sharing/refcount/block table 各自保留；handoff 用 content block key 可复用 backend payload，D 仍绑定自己的 physical blocks；每个 request 分配独立 seat/index | 支持语义正确性，不做跨 request Hot Cache sharing |
-| IndexCache | leader/followers 的 per-layer payload 与 region 独立；相同 Top-K 的 layers 使用同一 local-slot plan 和 cohort index | 支持 plan-once；每层仍无条件执行自己的 I/O op/wait/SFA |
+| IndexCache | leader/followers 的 per-layer payload 与 region 独立；相同 Top-K 的 layers 使用同一 `resolved_hot_indices/miss_mask` 和 cohort index | 支持 lookup-result-once；每层仍无条件执行自己的统一 I/O op/SFA |
 | DCP/PCP | 会改变 token ownership、Top-K gather、block-table locality 和 graph input layout | 首期 size 必须为 1，不实现 shard/replica fallback |
 
 TP 和 P/D 下 backend region identity 至少包含：
@@ -1426,6 +1534,10 @@ class DSASparseIOBackend(Protocol):
 `begin_publication/bind_publication` 的 metadata 可以由既有 P/D request
 lifecycle 传递，但不得携带 KV bytes。`bind_publication` 必须以 D-side
 block table 为目标建立 region mapping，不能假设 P/D physical block id 相同。
+request handle 在仍可能收到 late completion 的窗口内不得复用，
+`release_request(handle)` 对同一已释放 handle 必须幂等；framework 使用
+单一递增 generation 过滤 late completion，不为历史
+request/generation/handle 保留无界 tombstone 集合。
 
 ### 8.2 P/D population 与 ready 合同
 
@@ -1504,53 +1616,44 @@ full Main allocation。
 ### 8.3 Decode 图内逻辑 ABI
 
 ```text
-dsa_sparse_io_read_async(
+dsa_sparse_io(
     context,
     region,
-    read_global_slots,
-    read_destination_hot_row_ids,
-    read_valid_mask,
-    hot_planes!,
-    read_completion!
-)
-
-dsa_sparse_io_wait_read(
-    context,
-    read_completion!,
-    hot_planes!
-)
-
-dsa_sparse_io_write_async(
-    context,
-    region,
+    topk_positions,
+    resolved_hot_indices,
+    miss_mask,
+    query_to_row,
+    row_to_cache_seat,
+    block_table,
     write_global_slots,
     write_destination_hot_row_ids,
     write_valid_mask,
-    hot_planes,
-    write_completion!
-)
-
-dsa_sparse_io_wait_write(
-    context,
-    write_completion!,
-    hot_planes
+    hot_planes!,
+    io_completion!
 )
 ```
 
-具体 Torch schema 在 Task 3 通过 fake/meta 与 mutation/alias 测试冻结。逻辑合同为：
+Decode graph 只暴露这一个统一 I/O custom op，不再暴露独立
+read/write/wait custom op。实现可以在 op 内使用 backend function table、
+auxiliary stream 和预创建 event，但必须在该节点内建立 main stream 可见的
+read/write completion dependency。具体 Torch schema 在 Task 3 通过
+fake/meta 与 mutation/alias 测试冻结。逻辑合同为：
 
 - `context`、`region`、completion resource 和 workspace 地址在对应 graph
   生命周期内稳定；
-- 读写 plan 全部是固定 shape NPU tensor；
-- `read` 每个 replay 都调用，只对 `read_valid_mask=True` 的 canonical
-  entries 提交 payload transfer；mask 全 0 时为 no-transfer；
-- `wait_read` 建立编译器和 stream 都可见的 payload dependency；
-- `write` 后同一 global slot 的未来 read 必须看到最新 payload；
-- `wait_write` 在 reserved slot 覆盖和 graph 结束前完成；
+- newest write descriptor 全部是固定 shape NPU tensor；
+- read source global slot 和 destination hot row 由 op 在设备侧按
+  `topk_positions`、block table、seat 和 resolved local slot 派生；
+- 每个 replay、每层只调用一次；只对 `miss_mask=True` 的 canonical entries
+  提交 history payload read，mask 全 0 时为 history no-transfer；
+- 同一次调用处理有效 newest write 和 history miss read；
+- op 返回的依赖必须保证 SFA 能观察到全部有效 read payload，且 graph replay
+  返回前全部 newest write 已 join；
+- write 后同一 global slot 的未来 read 必须看到最新 payload；
 - completion resource 是预创建、地址稳定的 opaque resource，可由 device token
   和/或 ACL event handle 组成；
 - 不返回 per-replay CPU Future、Python integer，不允许 Host polling/callback；
-- backend 不读取 device plan 到 Host。
+- backend 不读取 device tensor 到 Host。
 
 ### 8.4 外部 C ABI
 
@@ -1642,10 +1745,10 @@ Decode `enqueue_read/enqueue_write/enqueue_wait` 的硬合同：
 | `token_to_slot` | `token_to_hot`，key 保持 request token position |
 | `slot_to_token` | `hot_to_token` |
 | `lru_slots` | 可淘汰 hot slots 的 LRU-to-MRU 排列 |
-| duplicate non-resident CAS | 只产生一个 `read_valid_mask=True` entry |
+| duplicate non-resident CAS | 只产生一个 `miss_mask=True` entry |
 | victim reverse invalidation | 同时清理两张映射 |
 | batch approximate LRU | `stale + newly allocated + selected resident` |
-| one AIV / request | one AIV / active batch row，通过 `row_to_cache_seat` 访问稳定状态 |
+| one AIV / request | 每行由单个 AIV 独占；`R>AIV count` 时按 `blockIdx+n*blockDim` 分批，通过 `row_to_cache_seat` 访问稳定状态 |
 | 256 SIMT threads | A5 specialization 固定 |
 
 ### 9.2 不能照搬的部分
@@ -1654,38 +1757,37 @@ Decode `enqueue_read/enqueue_write/enqueue_wait` 的硬合同：
 | --- | --- |
 | `128K` index | `L = max_model_len`，每个 cache seat 一行 |
 | `10K` slots | `S = device_buffer_size` |
-| `2K` query | flat `[Q,K]` 经 NPU pack 后形成 `[R,T,K]` union |
+| `2K` query | flat `[Q,K]` 由 `dsa_sparse_lookup_update` 内部按 row/lane mapping 形成 `[R,T,K]` union |
 | Python `req_num` | `DSASparseGraphKey` 静态推导的 `(Q,R,T)` |
 | Python 现场分配输出 | capture 前预分配输出 |
 | `ctypes.CDLL` launcher | 正式 CANN/PTA custom op |
 | 独立 kernel workspace | GraphParams/Coordinator 长期持有 |
 | 固定 `int16` slot id | 集成统一使用 `int32` |
-| 固定 `31492` workspace | tiling 按 `(S,T*K,256)` 计算 |
-| IO 留给调用脚本 | 固定 device plan 直接进入 backend op |
+| 固定 `31492` workspace | `[R, 3*S + 3*256 + 4]` 的调用方持有 `int32` workspace |
+| IO 留给调用脚本 | `dsa_sparse_io` 在设备侧直接派生地址并调用 backend |
 
-### 9.3 建议 custom ops
+### 9.3 固定 custom ops
 
 ```text
-dsa_sparse_prepare_state
-    row_to_cache_seat + row_seat_epoch + row_active
-    -> reset changed seats, install newest token mappings
+dsa_sparse_lookup_update
+    token_to_hot! + hot_to_token! + lru_slots! + state_seat_epoch!
+    + row_to_cache_seat + row_seat_epoch
+    + query_positions + query_to_row/lane
+    + query/Top-K valid metadata + seq_lens + topk_positions + workspace!
+    -> resolved_hot_indices! + miss_mask!
 
-dsa_sparse_pack_lookup_input
-    flat topk_positions + seq_lens + block_table + row_to_cache_seat
-    + token_to_row/lane + query/Top-K valid masks
-    -> token positions + read_source_global_slots
-
-dsa_sparse_index_lookup
-    token_to_hot! + hot_to_token! + lru_slots!
-    + token positions + row_to_cache_seat + row_active + workspace!
-    -> read_local_hot_slot_ids! + read_valid_mask!
-
-dsa_sparse_linearize_and_unpack
-    cache seat + local hot slot + H
-    -> read_destination_hot_row_ids + resolved_hot_indices + hot_block_table
+dsa_sparse_io
+    topk_positions + resolved_hot_indices + miss_mask
+    + query_to_row + row_to_cache_seat + block_table
+    + fixed newest write descriptor
+    + backend region/completion + hot payload!
+    -> updated hot payload and completed newest write dependency
 ```
 
-可在实现时合并算子，但必须保持：
+以上是 Decode graph 的完整 DSA Sparse custom-op 集合，不再增加
+`prepare_newest`、`prepare_state`、pack、unpack、linearize 或独立 wait
+custom op。`hot_block_table` 和 newest write descriptor 由 framework 在既有
+graph-input staging 边界按固定公式填写。实现必须保持：
 
 - state/output/workspace 地址固定；
 - mutation/alias schema 明确；
@@ -1694,7 +1796,9 @@ dsa_sparse_linearize_and_unpack
 - 沿用 A5 CANN custom OPP / `_C_ascend` 路径，不依赖通用
   `vllm_ascend_C` pybind 热路径；
 - 不在 op 内动态分配；
-- 不保留“外部 writer 并发修改同一 row”的防御分支。
+- 不保留“外部 writer 并发修改同一 row”的防御分支；
+- 每个 residency cohort 每轮只执行一次 `dsa_sparse_lookup_update`；
+- 每个 layer 每轮只执行一次 `dsa_sparse_io`。
 
 ### 9.4 MTP union
 
@@ -1704,37 +1808,36 @@ Lightning Indexer 的输入/输出仍是 baseline 扁平 shape：
 [Q, K]
 ```
 
-图内 pack 使用 query→row/lane mapping 构成内部 `[R,T,K]`，其中
-`query_valid_mask=False` 的 normal/short-draft/padding lanes 全部写 `-1`。
-SIMT 算子随后为同一 request 的最多 `T*K` token positions 建立本轮
-protected union：
+`dsa_sparse_lookup_update` 使用 query→row/lane mapping 在内部构成
+`[R,T,K]`，其中 `query_valid_mask=False` 的
+normal/short-draft/padding lanes 直接输出 `-1/False`。算子为同一 request
+的最多 `T*K` token positions 建立本轮 protected union：
 
 1. 以 `(cache_seat, token_position)` 查询 `token_to_hot`；
 2. 对 duplicate non-resident positions 执行 CAS canonicalization；
 3. 从不在 protected union 中的 LRU slots 分配 victims；
 4. 安装 `token_to_hot/hot_to_token` 双向映射；
-5. 写回每个 query position 的 `read_local_hot_slot_ids`；
+5. 写回每个 query position 的 `resolved_hot_indices`；
 6. 只对需要 payload transfer 的 canonical entry 写
-   `read_valid_mask=True`；
-7. NPU 线性化 backend destination rows，并 unpack 为 `[Q,K]`
-   `resolved_hot_indices`；
-8. 更新 batch approximate LRU。
+   `miss_mask=True`；
+7. 更新 batch approximate LRU。
 
 这样在 fused/batched Sparse SFA 执行前，MTP query 之间不会互相淘汰。
+backend source/destination 地址由后续 `dsa_sparse_io` 直接派生。
 
 ### 9.5 Newest slots
 
 - 当前最多 `T` 个有效 Main KV 先写入 reserved slots；
-- `dsa_sparse_prepare_state` 只由 lookup-group leader 执行一次，并将有效
-  token positions 映射到 reserved slots；
-- 若某 newest token position 先前位于 evictable slot，安装 reserved mapping 前
-  必须清理该 slot 的 reverse entry，并将它保留为合法 free
-  evictable slot；
-- 若 Top-K 选中本轮 newest，直接返回 reserved slot，`read_valid_mask=False`；
+- reserved destination 与 write descriptor 由 framework 按固定公式填写，
+  不调用独立 prepare 算子；
+- `dsa_sparse_lookup_update` 只由 lookup-group leader 执行一次；它在普通
+  lookup 前清理当前 query positions 可能存在的 evictable stale mapping，
+  并将对应 slot 保留为合法 free evictable slot；
+- 若 Top-K 选中本轮 newest，直接返回 reserved slot，`miss_mask=False`；
 - reserved slots 不参加 LRU；
-- followers 只写各自 layer 的 reserved payload 和复用 leader plan，不重复
-  修改共享 mapping/LRU；
-- write completion 完成后，下一 replay 开始时退休旧 newest mapping；
+- followers 只写各自 layer 的 reserved payload 并复用 leader lookup result，
+  不重复修改共享 mapping/LRU；
+- reserved newest 不进入长期双向映射，因此下一 replay 没有退休操作；
 - 旧 newest 若再次被选中，作为普通 token position 进入 LRU/read 路径。
 
 ---
@@ -1744,29 +1847,31 @@ protected union：
 | 模块 | 计划改动 | 主要职责 |
 | --- | --- | --- |
 | `vllm_ascend/ascend_config.py` | 修改 | DSA Sparse core 配置与启动门禁 |
+| `vllm_ascend/dsa_sparse_config.py` | 当前修改 | Graph 外仅允许 `io_backend="mock"`，校验 eager/role/shape/topology |
 | `vllm_ascend/platform.py` | 修改 | A5、GLM-5、FULL_DECODE_ONLY 与 capability 校验 |
 | `vllm_ascend/core/kv_cache_interface.py` | 前置迁移已完成 | Main/Indexer split spec；不新增 external Main marker |
 | `vllm_ascend/attention/indexer.py` | PR #11647 新增 | cache-only Indexer backend/metadata builder |
 | `vllm_ascend/patch/platform/patch_kv_cache_utils.py` | 后续按需修改 | backend region capacity 与 Indexer capacity 联合规划；本轮未修改 |
-| `vllm_ascend/worker/model_runner_v1.py` | 修改 | D scheduler Indexer-only 投影、worker-local Main metadata、fixed tensor allocation 与 eager runtime 入口 |
-| `vllm_ascend/worker/dsa_sparse_eager.py` | `83fbf7bf`/`aac21b73` 新增/扩展 | cohort topology、Hot/state/plan stub runtime 构造与 batch context 路由 |
+| `vllm_ascend/worker/model_runner_v1.py` | 修改 | D scheduler Indexer-only 投影、fixed tensor/runtime 初始化及同步 mock request lifecycle |
+| `vllm_ascend/worker/dsa_sparse_eager.py` | 已扩展 | shared batch metadata、cohort-private state/plan、mock lifecycle 与 batch context 路由 |
 | `vllm_ascend/worker/dsa_sparse_external_main.py` | `923e2ae8` 新增 | immutable Main sidecar 与 worker-owned KVCacheConfig metadata 回填 |
-| `vllm_ascend/worker/dsa_sparse_memory.py` | `923e2ae8` 新增 | 固定 Hot/state/eager-plan、eager execution reserve 与 backend auxiliary HBM 预算 |
+| `vllm_ascend/worker/dsa_sparse_memory.py` | 已扩展 | Hot、共享 batch metadata、cohort state/lookup/workspace、eager reserve 与 backend auxiliary HBM 预算 |
 | `vllm_ascend/distributed/kv_transfer/` integration hook | 修改 | P/D 角色校验、只注册 Indexer cache group、Main/Indexer ready fan-in |
-| `vllm_ascend/attention/sfa_v1.py` | 修改 | 固定 Top-K → lookup → I/O → wait → SFA 流水线 |
+| `vllm_ascend/attention/sfa_v1.py` | 修改 | 固定 Top-K → lookup_update → unified I/O → SFA 流水线 |
 | `vllm_ascend/attention/utils.py` | 修改 | 固定 query/row-to-seat/lifecycle graph metadata |
 | `vllm_ascend/device/device_op.py` | 本轮不修改 | 继续调用现有 A5 SFA；Hot 参数替换由 Python wrapper 完成 |
 | `vllm_ascend/spec_decode/llm_base_proposer.py` | 修改 | target/draft residency cohort 接线 |
-| `vllm_ascend/attention/dsa_sparse.py` | 新增 | cache seat manager、coordinator、lookup cohort、graph state |
-| `vllm_ascend/attention/dsa_sparse_io.py` | 新增 | backend registry、layout、capability、binding |
-| `vllm_ascend/ops/dsa_sparse.py` | 新增 | Python custom-op wrapper/meta |
-| `vllm_ascend/ops/dsa_sparse_io.py` | 新增 | I/O bridge wrapper/meta |
+| `vllm_ascend/attention/dsa_sparse.py` | 已扩展 | cache seat、shared metadata、cohort state、fused lookup 与统一 I/O coordinator |
+| `vllm_ascend/attention/dsa_sparse_io.py` | 已扩展 | backend control-plane contract、统一 data-plane ABI 与 no-op mock |
+| `vllm_ascend/attention/dsa_sparse_pd.py` | 当前修改 | generation-bearing dual-ready、stable seat retire 与有界 active-state 生命周期 |
+| `vllm_ascend/ops/dsa_sparse.py` | 当前新增 | 正式 fused custom-op Python wrapper |
+| `vllm_ascend/ops/dsa_sparse_io.py` | 后续新增 | 真实 I/O bridge wrapper/meta |
 | `vllm_ascend/compilation/acl_graph.py` | 修改 | 按 graph key 持有固定 plan/completion/event |
-| `csrc/attention/dsa_sparse_index_lookup/` | 新增 | A5 SIMT 正式 custom op |
+| `csrc/attention/dsa_sparse_lookup_update/` | 当前新增 | A5 SIMT 融合 lookup/update 正式 custom op 源码 |
 | `csrc/attention/sparse_flash_attention/` | **不修改** | 继续使用现有 BF16 SFA schema/tiling/kernel |
 | `csrc/attention/kv_quant_sparse_flash_attention/` | **不修改** | 继续使用现有 C8 SFA schema/tiling/kernel |
-| `csrc/torch_binding.cpp` | 修改 | 只注册 lookup/state/I/O bridge 所需 entrypoints |
-| `csrc/torch_binding_meta.cpp` | 修改 | 只注册 lookup/state/I/O fake/meta |
+| `csrc/torch_binding.cpp` | 当前修改 | 已注册 `dsa_sparse_lookup_update`；统一 I/O bridge 后续增加 |
+| `csrc/torch_binding_meta.cpp` | 当前修改 | 已注册 fused op meta；统一 I/O meta 后续增加 |
 | `csrc/dsa_sparse_io/` | 新增 | 版本化 ABI header 与 generic bridge |
 | `CMakeLists.txt` | 修改 | 显式纳入 I/O bridge/include 与 public header install |
 | `csrc/build_aclnn.sh` | 修改 | 注册 ascend950 operator build |
@@ -1786,12 +1891,10 @@ vllm_ascend/kv_offload/cpu_npu.py
 ## 11. 分阶段开发任务
 
 **交付硬门禁：** Task 1 的代码已作为独立 commit 落地，但 baseline/A5
-验收尚未完成。本轮已经并行建立 Task 2–7、Task 9 的 eager Python scaffold，
-用于冻结对象边界、显存公式和调用顺序；这些 scaffold 不算越过正式交付门禁，
-也不能作为后续 Task 的验收依赖。正式算子与数据面合入仍须先由 Task 2 证明
-现有 SFA 可直接消费 Hot Cache layout/local indices，再依次完成 I/O ABI、
-SIMT、P/D lifecycle 与 A5 验证。该门禁的目标是验证兼容性，不是创建或修改
-SFA 算子。
+验收尚未完成。本轮 working tree 已把 Task 2–7、Task 9 推进到 Graph 外源码
+闭环，并迁入正式 fused SIMT 算子源码；这些源码与 CPU oracle 结果不算越过
+CANN/A5、真实 I/O、P/D 或 graph 交付门禁。现有 SFA 仍只通过 Hot Cache
+adapter 复用，不能创建或修改 SFA 算子来绕过兼容性验证。
 
 ### Task 0：冻结 baseline、环境与 ABI 决策
 
@@ -1977,12 +2080,19 @@ BF16/C8 真算子输出 parity；A5 和 graph 测试仍未开始。
 
 ### Task 3：定义 I/O ABI、registry 与 conformance fixture
 
-**当前状态：eager 接口部分完成。** `c9b09581` 已提供
-`DSASparseIOBackend` / `DSASparseIOOperator` Protocol、初始化期 registry、
-layout/capability/portable identity 数据结构、固定形状 read/write 调用接口
-以及显式 fail-fast stub；单测固定了 all-hit 也调用 read/wait 的顺序。它不是
-真实 I/O 实现：public header、C bridge、operator binding/meta、provider
-fixture、publication/bind 和 runtime factory 均不存在。
+**当前状态：统一 Python ABI 与 no-op mock 已完成。** 当前 working tree
+保留 `DSASparseIOBackend` control-plane Protocol、初始化期 registry、
+layout/capability/portable identity 数据结构，并把 Decode data plane 收敛为
+唯一的 `DSASparseIOOperator.dsa_sparse_io()`。它一次消费 newest write
+descriptor 与 `dsa_sparse_lookup_update` 的
+`resolved_hot_indices/miss_mask`，不再暴露正式
+`read_async/write_async/wait` 三段接口。
+
+`MockDSASparseIOOperator` 始终被调用并校验 Top-K/newest/block-table shape、
+dtype 及 Hot planes 前两维的最小结构合同，但不读取 tensor 值、不派生地址、
+不搬运 payload；它只用于 Graph 外控制路径。本 Task 仍未完成完整 device/
+contiguous/capacity/layout conformance、public header、C bridge、operator
+binding/meta、provider fixture、publication/bind 和真实 runtime factory。
 
 **Files：**
 
@@ -1996,22 +2106,30 @@ fixture、publication/bind 和 runtime factory 均不存在。
 - Modify: `vllm_ascend/ascend_config.py`
 - Modify: `vllm_ascend/platform.py`
 
-本轮只完成 `vllm_ascend/attention/dsa_sparse_io.py` 和对应 eager unit
-tests；`vllm_ascend/ops/`、`csrc/`、CMake 与 conformance 文件均后置。
+本轮只完成 `vllm_ascend/attention/dsa_sparse_io.py` 的统一 ABI/no-op mock
+和对应 unit test 源码；`vllm_ascend/ops/dsa_sparse_io.py`、I/O `csrc/`、
+CMake 与 conformance 文件均后置。
 
 - [ ] **Step 1：先写 ABI/version/capability/PP-DCP-PCP 启动失败测试**
-- [ ] **Step 2：实现初始化 registry 与 freeze 生命周期**
+- [x] **Step 2：实现初始化 registry 与 freeze 生命周期**
 - [ ] **Step 3：实现 layout、capacity、region registration、P-side
       publication、D-side bind/remap 与 request ready/release contract**
-- [ ] **Step 4：实现 publish/read/write/wait bridge 与 fake/meta**
+- [ ] **Step 4：实现 publication/bind backend bridge，并为单一
+      `dsa_sparse_io` 注册 mutation/alias 与 fake/meta**
 - [ ] **Step 5：实现 public-ABI-only link-time fake provider fixture**
 - [ ] **Step 6：验证单 stream capture/replay**
 - [ ] **Step 7：验证 secondary stream event capture/join**
-- [ ] **Step 8：验证 all-zero `read_valid_mask` 仍执行 read/wait 节点，但
-      provider payload transfer count 为 0**
+- [ ] **Step 8：验证 all-zero `miss_mask` 仍执行同一 `dsa_sparse_io` 节点，
+      history payload transfer count 为 0**
 - [ ] **Step 9：capture 后 poison provider function table，验证 replay 零 Host dispatch**
 - [ ] **Step 10：验证 `kv_both`、非同构 P/D cache layout/topology 与不支持
       Indexer-only transfer 时初始化失败**
+
+Graph 外阶段附加项：
+
+- [x] 单一 `dsa_sparse_io` Python ABI；
+- [x] 无条件调用、无 Host tensor-value read 的 no-op mock；
+- [x] mock miss/payload 无效边界写入测试与文档。
 
 **DoD：**
 
@@ -2020,10 +2138,12 @@ tests；`vllm_ascend/ops/`、`csrc/`、CMake 与 conformance 文件均后置。
 - PP、DCP 或 PCP size 不等于 1 时 DSA Sparse 启动失败；
 - 只有 `kv_producer/kv_consumer` 配对可启动，P/D physical block id 不同的
   publication/bind case 正确；
-- publish/read/write/wait 均保持 NPU-direct；Decode read/write/wait 可
+- 同一 token position 在 D block table remap 前后保持相同 resident key，
+  `dsa_sparse_io` 使用新 block table 派生新的 source global slot；
+- publish 与 Decode I/O 均保持 NPU-direct；单一 `dsa_sparse_io` 可
   capture/replay；
-- all-zero 与 mixed `read_valid_mask` 使用同一图节点序列；
-- delayed fake provider 证明 wait dependency 生效；
+- all-zero 与 mixed `miss_mask` 使用同一图节点序列；
+- delayed fake provider 证明 op 内 completion dependency 生效；
 - fixture 仅依赖安装后的 public header/library，且不进入产品 artifact；
 - capture 后连续 replay 的 C/Python provider Host call count 不变；
 - 产品配置中无 Host pool 字段；
@@ -2033,9 +2153,10 @@ tests；`vllm_ascend/ops/`、`csrc/`、CMake 与 conformance 文件均后置。
 
 ### Task 4：实现 external Main KV 规划与固定 Hot State
 
-**当前状态：eager scaffold 部分完成。** `4b6ebc0d` 已建立固定 Hot
-layout/payload、每 cohort resident index、seat/epoch、row mapping 和最大
-eager plan。`923e2ae8` 进一步实现：
+**当前状态：Graph 外常驻张量与逻辑峰值预算已完成源码实现。**
+`4b6ebc0d` 已建立固定 Hot layout/payload、每 cohort resident index、
+seat/epoch 和 row mapping。
+`923e2ae8` 进一步实现：
 
 - P scheduler/worker 继续保留 full Main + full Indexer；
 - D scheduler 只看到 Indexer spec，不使用 external-main/zero-byte marker；
@@ -2044,22 +2165,23 @@ eager plan。`923e2ae8` 进一步实现：
 - Main full-size raw tensor allocation/reshape 被跳过；正确 layout 的
   zero-block placeholder 只用于初始化 binding，不进入 `KVCacheTensor`、
   runner connector cache 字典或 connector registration；
-- 固定 Hot payload、resident state、最大 eager plan、eager batch
-  context/scratch 最坏逻辑峰值和 backend auxiliary bytes 在自动/显式 KV
-  memory profile 路径中只扣除一次。
+- 固定 Hot payload、resident state、eager batch context/scratch 最坏逻辑
+  峰值、固定 tensor 初始化 scratch 和 backend auxiliary bytes 在自动/显式
+  KV memory profile 路径中只扣除一次。
 
-`aac21b73` 进一步缓存同一份 cohort topology，并在 D worker KV tensor
-初始化后、connector registration 前实际分配每层 Hot Cache、每 cohort
-resident state 与最大 eager plan。测试逐 tensor 计数证明启动期固定 tensor
-bytes 等于预算中的 `core_fixed_tensor_bytes`。开发期 runtime 使用
-identity-only I/O resource 和 fail-fast index/I/O stub；它不自动
-acquire seat，不能绕过 dual-ready admission。
+`aac21b73` 之上的当前 working tree 进一步缓存同一份 cohort topology，并在
+D worker KV tensor 初始化后、connector registration 前实际分配每层 Hot
+Cache、一次 role-level batch metadata、每 cohort resident state、lookup
+outputs 与 fused-op workspace。预算公式使用完全相同的常驻 tensor 规格，
+并显式覆盖当前分配实现中的 `flat_query_indices[Q]`/`arange(S)` 初始化
+临时量。
+开发期 runtime 使用正式 lookup wrapper 和 identity-only no-op I/O resource。
 
 尚未完成真实 backend region capacity/registration/resource factory、Main
 payload 装载、A5 allocation 以及全模型 HBM 公式验证。当前预算按 logical
 tensor bytes 计算，尚未覆盖 PyTorch allocator alignment/fragmentation、
-未来自定义算子 workspace 或 backend 内部 workspace；后两项必须通过
-backend auxiliary/正式 runtime resource description 补齐。
+真实 backend 内部 workspace；后者必须通过 backend auxiliary/正式 runtime
+resource description 补齐。
 
 **Files：**
 
@@ -2081,11 +2203,11 @@ marker；backend capacity 若后续确需 planner hook，必须单独设计并�
 - [x] **Step 4：P/D 两侧完整分配 NPU Indexer**
 - [x] **Step 5：只在 D worker 预分配 `A=max_num_seqs` 个 cache seats 和每层
       `[A*H/B,B,...]` Main Hot KV pool**
-- [x] **Step 6a：按 residency cohort 分配
-      `token_to_hot/hot_to_token/LRU`，并分配最大 eager hot block
-      table/plan**
-- [ ] **Step 6b：按 graph key 分配正式 workspace、plan 和真实 backend
-      completion**
+- [x] **Step 6a：分配一次 role-level batch metadata、每 residency cohort
+      的 `token_to_hot/hot_to_token/LRU`、lookup outputs 和固定 fused-op
+      workspace**
+- [ ] **Step 6b：按 graph key 分配 graph-owned resource 和真实 backend
+      completion/event**
 - [x] **Step 7a：先扣除固定 eager Hot State HBM，再计算 NPU-resident
       cache block 数**
 - [ ] **Step 7b：接入 backend capacity，并联合计算 block 数**
@@ -2097,8 +2219,9 @@ D_num_blocks = min(
 )
 ```
 
-- [ ] **Step 8：实现 ready 后的 request→seat 分配/释放与
-      `row_to_cache_seat` 固定输入**
+- [x] **Step 8a：实现 Graph 外 mock dual-ready 后的 request→seat
+      分配/释放与 `row_to_cache_seat` 固定输入**
+- [ ] **Step 8b：接入真实 scheduler/connector ready gate**
 - [ ] **Step 9：验证修改前后逐对象 HBM 公式**
 
 **DoD：**
@@ -2119,41 +2242,59 @@ D_num_blocks = min(
 
 ### Task 5：迁入 Ascend 950 SIMT 索引算子
 
-**当前状态：只有产品调用接口打桩，算子实现未开始。** `4b6ebc0d` 已定义
-`DSASparseIndexOperator` Protocol 与 `UnimplementedDSASparseIndexOperator`，
-使 eager pipeline 可以冻结输入/输出合同并在误用时 fail-fast。ASU commit
-`d92a249` 仍只作为 direct-launch A5 SIMT lookup/LRU 参考；vllm-ascend 中
-没有正式 custom op、Torch binding/meta、build integration 或扩展 oracle。
+**当前状态：算子源码迁移完成，CANN/A5 验收待完成。** 当前 working tree
+已建立正式 `DSASparseLookupUpdateOperator.lookup_update()`、Python
+`torch.ops._C_ascend.dsa_sparse_lookup_update` wrapper、16-Tensor Torch
+schema/meta、ACLNN adapter、op host/tiling、arch35 SIMT kernel 与 Ascend 950
+build 接入。旧 `prepare_newest()`/`lookup()` 已删除，不保留兼容 device op
+或 CPU fallback。ASU commit `d92a249` 只作为算法参考。
 
 **Files：**
 
-- Create: `csrc/attention/dsa_sparse_index_lookup/CMakeLists.txt`
-- Create: `csrc/attention/dsa_sparse_index_lookup/dsa_sparse_index_lookup_torch_adpt.h`
-- Create: `csrc/attention/dsa_sparse_index_lookup/op_host/CMakeLists.txt`
-- Create: `csrc/attention/dsa_sparse_index_lookup/op_host/dsa_sparse_index_lookup_def.cpp`
-- Create: `csrc/attention/dsa_sparse_index_lookup/op_host/dsa_sparse_index_lookup_infershape.cpp`
-- Create: `csrc/attention/dsa_sparse_index_lookup/op_host/dsa_sparse_index_lookup_tiling.{h,cpp}`
-- Create: `csrc/attention/dsa_sparse_index_lookup/op_host/op_api/aclnn_dsa_sparse_index_lookup.{h,cpp}`
-- Create: `csrc/attention/dsa_sparse_index_lookup/op_kernel/dsa_sparse_index_lookup.cpp`
-- Create: `csrc/attention/dsa_sparse_index_lookup/op_kernel/dsa_sparse_index_lookup_common.h`
-- Create: `csrc/attention/dsa_sparse_index_lookup/op_kernel/arch35/*`
+- Create: `csrc/attention/dsa_sparse_lookup_update/CMakeLists.txt`
+- Create: `csrc/attention/dsa_sparse_lookup_update/dsa_sparse_lookup_update_torch_adpt.h`
+- Create: `csrc/attention/dsa_sparse_lookup_update/op_host/CMakeLists.txt`
+- Create: `csrc/attention/dsa_sparse_lookup_update/op_host/dsa_sparse_lookup_update_def.cpp`
+- Create: `csrc/attention/dsa_sparse_lookup_update/op_host/dsa_sparse_lookup_update_infershape.cpp`
+- Create: `csrc/attention/dsa_sparse_lookup_update/op_host/dsa_sparse_lookup_update_tiling.{h,cpp}`
+- Create: `csrc/attention/dsa_sparse_lookup_update/op_host/op_api/aclnn_dsa_sparse_lookup_update.{h,cpp}`
+- Create: `csrc/attention/dsa_sparse_lookup_update/op_kernel/dsa_sparse_lookup_update.cpp`
+- Create: `csrc/attention/dsa_sparse_lookup_update/op_kernel/dsa_sparse_lookup_update_common.h`
+- Create: `csrc/attention/dsa_sparse_lookup_update/op_kernel/arch35/*`
 - Create: `vllm_ascend/ops/dsa_sparse.py`
+- Modify: `vllm_ascend/attention/dsa_sparse.py`
+- Modify: `vllm_ascend/worker/dsa_sparse_eager.py`
 - Modify: `csrc/build_aclnn.sh`
 - Modify: 对应 Torch binding/meta 注册
-- Create: `tests/ut/ops/test_dsa_sparse_index_reference.py`
-- Create: `tests/e2e/nightly/single_node/ops/singlecard_ops/test_dsa_sparse_index_lookup.py`
+- Modify: `tests/ut/attention/test_dsa_sparse_eager.py`
+- Create: `tests/ut/ops/test_dsa_sparse_lookup_update_reference.py`
+- Create: `tests/e2e/nightly/single_node/ops/singlecard_ops/test_dsa_sparse_lookup_update.py`
 
-- [ ] **Step 1：冻结 ASU-compatible lookup/LRU oracle，并新增项目扩展 oracle**
-- [ ] **Step 2：先写 flat/pack、固定 shape、mutation、validity、
-      seat epoch 与 MTP union 测试**
-- [ ] **Step 3：实现 `dsa_sparse_prepare_state`**
-- [ ] **Step 4：实现 flat pack、token-position lookup、I/O source
-      global-slot map 与 local-index unpack**
-- [ ] **Step 5：参数化并迁入 SIMT lookup/LRU**
-- [ ] **Step 6：注册 proper custom op 与 fake/meta**
-- [ ] **Step 7：接入 ascend950 build**
-- [ ] **Step 8：A5 真机逐状态对比**
-- [ ] **Step 9：单算子 profile**
+实施顺序先以当前 DecodeOnly `T=1` 打通 A5 单算子和 eager 数据流；schema
+保留固定 `query_to_row/query_to_lane` 输入，不为 MTP 更换接口。`T<=4` 的
+CPU oracle 可以在本 Task 建立，真实 MTP graph/runtime 验收归 Task 8。
+
+- [x] **Step 1：冻结 ASU-compatible lookup/LRU oracle，并新增项目扩展 oracle**
+- [x] **Step 2：冻结 `dsa_sparse_lookup_update` 的固定 shape、dtype、
+      mutation/alias、workspace 与 fake/meta 合同**
+- [x] **Step 3：先写 row→seat、epoch reset、newest、validity 与 MTP union
+      的单次调用测试**
+- [x] **Step 4：参数化并迁入 ASU SIMT lookup/LRU，实现 duplicate miss、
+      分配/淘汰、双向映射与 LRU update**
+- [x] **Step 5：在同一 kernel 内实现 epoch reset、newest stale-mapping
+      invalidation 和 reserved-slot 输出**
+- [x] **Step 6：输出固定 `[Q,K]` 的 `resolved_hot_indices/miss_mask`；
+      不生成 read address plan**
+- [x] **Step 7：把 `DSASparseIndexOperator.prepare_newest()/lookup()`
+      合并为 `DSASparseLookupUpdateOperator.lookup_update()`，标准 runtime
+      绑定正式 wrapper**
+- [x] **Step 8：注册 proper custom op 与 fake/meta**
+- [x] **Step 9：接入 ascend950 build**
+- [ ] **Step 10：A5 真机逐状态对比**
+- [ ] **Step 11：单算子 profile**
+
+Step 1–9 的 `[x]` 只表示源码与静态合同完成。当前环境没有 CANN/A5，尚未
+产生真实 OPP build 或 device parity 证据。
 
 必测（所有 case 的算子序列完全相同）：
 
@@ -2166,16 +2307,17 @@ D_num_blocks = min(
 - LRU stable order；
 - seat epoch reset；
 - batch row reorder 但 cache seat 不变；
-- token position 对应的 physical block address 改变但 resident key 不变；
 - newest reserved slots；
 - MTP union；
-- leader/follower plan reuse。
+- leader/follower lookup-result reuse。
 
 **DoD：**
 
 - ASU-compatible core cases 在等价 shape/state、排除 reserved/lifecycle
   扩展后，与固定 ASU commit 的 output/state bit-exact；
 - MTP/newest/seat lifecycle 与项目扩展 CPU oracle 逐元素一致；
+- 每个 cohort 每轮只有一次 `dsa_sparse_lookup_update` 调用；
+- 不存在 prepare/pack/unpack/linearize 辅助 custom op；
 - graph 内固定输出和 workspace；
 - profile 区间无 H2D/D2H/Host callback；
 - 不存在 ctypes/pybind direct launcher 热路径；
@@ -2183,39 +2325,58 @@ D_num_blocks = min(
 
 ---
 
-### Task 6：生命周期与 device plan
+### Task 6：生命周期与固定 device inputs/outputs
 
-**当前状态：eager 生命周期部分完成。** `4b6ebc0d`、`ac089495`、
-`ac1440e1` 与 `83fbf7bf` 已实现 request-private stable seat、generation/epoch、
-row mapping、leader/follower cohort ownership、固定 eager plan、batch
-context/router，以及 Main+Indexer 双 ready 后才能领取 seat 的纯状态机。该
-状态机尚未接 scheduler/connector/backend，index reset/lookup 仍是 stub；
-prefix/preemption 的真实 runner 行为未验收。当前配置明确拒绝 MTP/draft，
-因此只有 target/draft 类型边界，没有 draft Hot Cache 执行路径。
+**当前状态：Graph 外 target 生命周期已完成 mock 接线。** 当前 working tree
+实现 request-private stable seat、generation/epoch、一次共享 row metadata、
+leader/follower cohort ownership、固定 plan，以及每 batch 动态
+context/router/SFA view（其逻辑峰值已纳入 HBM 预算），并在 fused op 中
+完成 epoch reset。`model_runner_v1._update_states()` 在显式 mock runtime 下
+同步模拟 dual-ready、admit、finish、preempt 与 resume。它尚未接真实
+scheduler/connector/backend；prefix 真实 runner 行为未验收。当前配置明确
+拒绝 MTP/draft，因此只有 target/draft 类型边界，没有 draft Hot Cache
+执行路径。
 
-**Files：**
+**本轮已实现 Files：**
 
 - Modify: `vllm_ascend/attention/dsa_sparse.py`
+- Modify: `vllm_ascend/attention/dsa_sparse_pd.py`
+- Modify: `vllm_ascend/worker/dsa_sparse_eager.py`
 - Modify: `vllm_ascend/worker/model_runner_v1.py`
-- Modify: `vllm_ascend/attention/utils.py`
-- Modify: `vllm_ascend/compilation/acl_graph.py`
-- Modify: `vllm_ascend/spec_decode/llm_base_proposer.py`
-- Create: `tests/ut/attention/test_dsa_sparse_lifecycle.py`
+- Modify:
+  `tests/ut/attention/test_dsa_sparse{,_eager,_pd}.py`
+- Modify:
+  `tests/ut/worker/test_dsa_sparse_eager_runtime.py`
+- Modify:
+  `tests/ut/worker/a2/test_model_runner_v1.py`
 
-- [ ] **Step 1：在既有 graph-input copy 边界写固定
-      `row_to_cache_seat/row_seat_epoch/query mapping` tensor**
-- [ ] **Step 2：NPU reset epoch changed seats**
-- [ ] **Step 3：安装/退休 MTP newest mappings**
-- [ ] **Step 4：NPU pack/unpack 并构造具名 read/write fixed plans**
-- [ ] **Step 5：按 residency cohort 建立 leader-owned state**
-- [ ] **Step 6：为 followers 建立只读 plan view**
-- [ ] **Step 7：隔离 target/draft state，仅复用 baseline semantic Top-K buffer**
-- [ ] **Step 8：覆盖 prefix、row reuse、preemption/resume**
+`vllm_ascend/attention/utils.py`、
+`vllm_ascend/compilation/acl_graph.py` 和
+`vllm_ascend/spec_decode/llm_base_proposer.py` 属于后续 graph/draft 接入范围，
+本轮没有修改，也没有创建单独的
+`tests/ut/attention/test_dsa_sparse_lifecycle.py`。
+
+- [x] **Step 1a（Graph 外）：写固定 shape 的
+      `row_to_cache_seat/row_seat_epoch/query mapping` tensor；inactive row
+      统一写 `seat=-1`，正式 op ABI 不接收 `row_active`**
+- [ ] **Step 1b（Task 8）：把当前 `pack_rows()` Host 循环和独立 H2D
+      staging 合并到 ModelRunner 既有 graph-input copy 边界**
+- [x] **Step 2：在同一次 `dsa_sparse_lookup_update` 中处理 epoch reset、
+      newest 与 resident lookup/update**
+- [x] **Step 3a（Graph 外）：由独立 vectorized NPU metadata stage 按固定
+      公式填写 hot block table 与 newest write descriptor，不新增
+      prepare custom op**
+- [ ] **Step 3b（Task 8）：将该 stage 纳入既有固定地址 input-copy/capture
+      生命周期，消除每 batch 动态 staging tensor**
+- [x] **Step 4：按 residency cohort 建立 leader-owned state**
+- [x] **Step 5：为 followers 建立只读 lookup result view**
+- [ ] **Step 6：隔离 target/draft state，仅复用 baseline semantic Top-K buffer**
+- [ ] **Step 7：覆盖 prefix、row reuse、preemption/resume**
 
 **DoD：**
 
 - seat 领取/归还在 request control plane 完成，token index reset/transition
-  在 NPU 完成；
+  在 `dsa_sparse_lookup_update` 内完成；
 - forward 无 tensor value Python branch；
 - follower 不二次更新 LRU；
 - target/draft 相同 token position 不产生跨 cohort false residency；
@@ -2227,40 +2388,48 @@ prefix/preemption 的真实 runner 行为未验收。当前配置明确拒绝 MT
 
 ### Task 7：接入 GLM-5 SFA 数据路径
 
-**当前状态：eager 数据流 scaffold 部分完成。** `c9b09581`、
-`ac1440e1`、`1647d61b` 和 `55eb3401` 已把 target normal decode 的 Python
-调用顺序接为 Main newest→reserved Hot slot、Top-K semantic token position
-→lookup、无条件 read/wait、Hot KV/local indices/synthetic block table→现有
-SFA，并提供可注入的 model runner 外层 context 进入/清理 batch runtime。
-`aac21b73` 已让标准 D consumer 自动构造并绑定开发期 stub runtime，同时
-实际分配固定 Hot/state/plan tensors；但 dual-ready admission bridge 尚未
-接入，所以未取得 seat 的请求先在 admission 边界 fail-closed。不存在
-hit/miss 控制流拆分；all-hit 仍走 read/wait 接口。由于 index/I/O operator
-和 I/O resource 都是显式 stub，尚不能搬运真实 payload 或完成端到端
-decode。
+**当前状态：Graph 外调用链完成，payload 仍为 mock。** 当前 working tree
+把 target normal decode 调用顺序收敛为 Main newest→reserved Hot slot、
+Top-K semantic token position→一次 `dsa_sparse_lookup_update`→每层一次
+`dsa_sparse_io`→Hot KV/local indices/synthetic block table→现有 SFA，并
+提供 model runner 外层 context 的进入/清理。旧
+`prepare_newest()/lookup()` 与 `write_async/read_async/wait` 数据面接口已
+删除。不存在 hit/miss Python 控制流拆分；all-hit/miss 使用相同调用拓扑。
 
-**Files：**
+lookup 使用正式 wrapper；I/O 仍是 no-op mock。因此该路径能验证索引状态和
+框架拓扑，但不能搬运真实 payload 或完成含 miss 的端到端 decode。
 
-- Modify: `vllm_ascend/attention/sfa_v1.py`
+**当前实现 Files：**
+
+- Existing committed adapter:
+  `vllm_ascend/attention/sfa_v1.py`
 - Modify: `vllm_ascend/attention/dsa_sparse.py`
-- Do not modify in this milestone: `vllm_ascend/device/device_op.py`
+- Modify: `vllm_ascend/attention/dsa_sparse_io.py`
+- Modify: `vllm_ascend/worker/dsa_sparse_eager.py`
 - Modify: `vllm_ascend/worker/model_runner_v1.py`
-- Modify: `vllm_ascend/spec_decode/llm_base_proposer.py`
-- Create/Modify: `tests/ut/attention/test_dsa_sparse_sfa.py`
-- Create: `tests/e2e/nightly/single_node/ops/singlecard_ops/test_dsa_sparse_sfa.py`
+- Modify:
+  `tests/ut/attention/test_dsa_sparse{,_eager,_io}.py`
+- Modify:
+  `tests/ut/worker/test_dsa_sparse_eager_runtime.py`
+
+`vllm_ascend/device/device_op.py` 本里程碑不修改；
+`vllm_ascend/spec_decode/llm_base_proposer.py`、独立 SFA unit/e2e parity
+fixture 属于 Task 7/8 的未完成项，当前 working tree 不包含
+`test_dsa_sparse_sfa.py`。
 
 - [x] **Step 1：保持完整 Indexer write**
 - [x] **Step 2：Main KV 写 reserved newest slots**
-- [ ] **Step 3：提交 backend newest write**
-- [ ] **Step 4：使用 Top-K token positions 调用 SIMT lookup，并同时生成
-      I/O source global slots、destination rows、valid mask 与 local indices**
-- [ ] **Step 5：每层无条件调用一次 backend read op**
-- [ ] **Step 6：每层无条件调用 wait**
-- [x] **Step 7：以 Hot KV、local indices 和 synthetic block table 调用
+- [x] **Step 3：使用 Top-K token positions 调用一次
+      `dsa_sparse_lookup_update`，生成 `resolved_hot_indices/miss_mask`**
+- [x] **Step 4a：每层无条件调用一次统一 `dsa_sparse_io` no-op mock**
+- [ ] **Step 4b：在真实 op 内派生 history read 地址，并同时处理 newest
+      write 与 miss read**
+- [ ] **Step 5：建立 I/O op 到 SFA 以及 graph-end 的 device completion
+      dependency**
+- [x] **Step 6：以 Hot KV、local indices 和 synthetic block table 调用
       现有 Sparse SFA**
-- [ ] **Step 8：graph 结束前 join write**
-- [x] **Step 9：实现 leader plan-once / follower reuse**
-- [ ] **Step 10：覆盖四种 Main/Indexer layout**
+- [x] **Step 7：实现 leader lookup-result-once / follower reuse**
+- [ ] **Step 8：覆盖四种 Main/Indexer layout**
 
 **DoD：**
 
@@ -2268,6 +2437,8 @@ decode。
   test-only full-resident sparse reference 一致；
 - newest 或全部 history 已 resident 时仍经过 I/O op，但对应 entry 不发生
   payload transfer；
+- 每个 cohort 每轮只调用一次 `dsa_sparse_lookup_update`，每层每轮只调用
+  一次 `dsa_sparse_io`；
 - 每个 canonical non-resident token 只发生一次 payload transfer；
 - follower 只读自己的 region，不修改 plan/LRU；
 - target/draft 分别填充自己的 cohort，不能跨 role 复用 residency；
@@ -2305,8 +2476,10 @@ normal/MTP descriptor 或 replay 测试。长期 `FULL_DECODE_ONLY` 目标和以
 - [ ] **Step 3：分别绑定 `_graph_params`/`_draft_graph_params` 与各自
       residency cohort ownership**
 - [ ] **Step 4：保持 `update_graph_params()` 无 DSA Sparse CPU task patch**
-- [ ] **Step 5：验证 normal `[Q,K] -> [R,1,K]` pack/unpack**
-- [ ] **Step 6：验证 partial draft 与 MTP3 `[Q,K] -> [R,4,K]` union**
+- [ ] **Step 5：验证 normal `[Q,K]` 在 `dsa_sparse_lookup_update` 内按
+      `(R,1)` mapping 查询和更新**
+- [ ] **Step 6：验证 partial draft 与 MTP3 `[Q,K]` 在同一算子内按
+      `(R,4)` mapping 建立 protected union**
 - [ ] **Step 7：证明 replay 走 `enable_npugraph_ex` 路径且无 Host synchronize**
 - [ ] **Step 8：验证所有 baseline capture sizes**
 - [ ] **Step 9：连续 replay soak**
@@ -2323,12 +2496,10 @@ normal/MTP descriptor 或 replay 测试。长期 `FULL_DECODE_ONLY` 目标和以
 
 ```text
 newest write
-→ Top-K token-position lookup
-→ fixed I/O plan
-→ backend read op（always）
-→ wait
+→ Top-K
+→ dsa_sparse_lookup_update（once per cohort）
+→ dsa_sparse_io（once per layer, always）
 → existing Sparse SFA
-→ write join
 ```
 
 - 无 graph break；
@@ -2337,6 +2508,7 @@ newest write
 - synthetic pre-populated region 下 normal、partial draft 与 MTP3 graph
   output/state 通过；
 - all-resident 与 mixed-resident replay 使用同一张 graph、相同节点序列；
+- 图中不出现 prepare/pack/unpack/linearize 或独立 wait DSA Sparse 节点；
 - 每个 bucket 的 mini-graph 1,000 次 replay，named DSA Sparse buffer 数量和
   地址不变；
 - `Q=128` 的 normal `(R=128,T=1)` 与 MTP3 `(R=32,T=4)` descriptor
@@ -2347,13 +2519,15 @@ newest write
 
 ### Task 9：P/D-only population、handoff 与 region lifecycle
 
-**当前状态：生命周期 scaffold 部分完成。** `ac089495` 已实现
+**当前状态：同步 mock 生命周期已接 model runner，真实 P/D 未接。**
+`ac089495` 已实现
 generation-bearing Main/Indexer dual-ready 状态机、late completion 过滤、
 fail/finish/preempt release 与 ready 后 seat admission。`923e2ae8` external
 Main 里程碑已把 D scheduler spec 投影为 Indexer-only，并确保 worker-local
 Main sidecar/zero-block placeholder 不进入 connector cache 字典。
-`aac21b73` 创建的 stub runtime 暴露显式 acquire/release API，但标准
-scheduler/connector 仍没有调用它，不能视为 admission bridge 已完成。
+当前 working tree 的 mock runtime 在 `_update_states()` 中同步生成两类 ready
+completion 并调用 acquire/release，使 Graph 外 request lifecycle 可执行。
+这是测试 fixture，不是来自真实 scheduler/connector 的 admission bridge。
 
 这仍不是 P/D handoff 闭环：P-side Main publication、D-side bind/remap、
 双端 connector 的 Indexer-only `KVCacheConfig` projection/completion、
@@ -2459,13 +2633,13 @@ authoring guide 均不存在。
 | ---: | --- | --- | --- | --- |
 | 1 | PR1 | PR #11647 语义迁移 | commit `a99b89ab` 已实现；PR/回归待完成 | 四布局、DCP、baseline 全绿 |
 | 2 | PR2 | 现有 A5 BF16/C8 SFA Hot Cache 兼容验证 | eager wrapper scaffold 已有；真算子验证未开始 | SFA operator 零修改 + 真算子 parity |
-| 3 | PR3 | I/O ABI、registry、public fake-provider conformance | Python Protocol/registry/stub 已有；public ABI 未开始 | mini-graph capture/replay |
-| 4 | PR4 | external Main 规划、cache seat 与固定 Hot State | fixed budget 与实际 Hot/state/plan allocation 已提交至 `aac21b73` | allocator/A5 验证与真实 backend resource 待完成 |
-| 5 | PR5 | A5 SIMT 正式 custom op | 产品调用接口打桩；算子仍只有 ASU 原型 | 双 oracle + microbench |
-| 6 | PR6 | lifecycle、MTP union、cohort leader plan | target eager lifecycle scaffold 已有；MTP/draft 未开始 | state transition 全绿 |
-| 7 | PR7 | GLM-5 SFA runtime 集成 | target eager 调用链与自动 stub runtime 已有；admission/真实算子/backend 未接 | synthetic-region 单层 parity |
+| 3 | PR3 | I/O ABI、registry、public fake-provider conformance | 统一 Python ABI/no-op mock 已在 working tree；public ABI 未开始 | mini-graph capture/replay |
+| 4 | PR4 | external Main 规划、cache seat 与固定 Hot State | Graph 外共享 metadata、cohort state/lookup/workspace allocation 与预算已在 working tree | allocator/A5 验证与真实 backend resource 待完成 |
+| 5 | PR5 | A5 SIMT 正式 custom op | CANN/PTA、binding/meta/build 与 CPU oracle 源码已在 working tree | 真实 OPP build、A5 双 oracle + microbench |
+| 6 | PR6 | lifecycle、MTP union、cohort leader plan | target Graph 外 mock lifecycle 与 MTP union 算法已在 working tree；draft/graph 未开始 | state transition 全绿 |
+| 7 | PR7 | GLM-5 SFA runtime 集成 | fused lookup→mock I/O→SFA 与 mock admission 已在 working tree；真实 payload/backend 未接 | synthetic-region 单层 parity |
 | 8 | PR8 | FULL_DECODE_ONLY graph | 本轮刻意后置 | 全 graph key + profile |
-| 9 | PR9 | P/D-only publication/bind、Indexer handoff 与 ready lifecycle | dual-ready 纯状态机与 D scheduler 投影已有；真实 bridge 未接 | P/D block-id-remap round trip |
+| 9 | PR9 | P/D-only publication/bind、Indexer handoff 与 ready lifecycle | dual-ready 状态机、D scheduler 投影与同步 mock runner lifecycle 已有；真实 bridge 未接 | P/D block-id-remap round trip |
 | 10 | PR10 | A5 真机验收、性能、文档 | 未开始 | 最终 DoD |
 
 每个 PR：
@@ -2487,7 +2661,7 @@ authoring guide 均不存在。
 | L0 | PR #11647 split spec | CPU CI + A5 | 四布局、DCP、baseline |
 | L1 | 现有 SFA Hot Cache adapter | A5 | SFA operator/schema/tiling/kernel 零修改 + BF16/C8 parity |
 | L2 | SIMT 双 oracle | CPU + A5 | ASU core + project extension bit-exact |
-| L3 | I/O ABI | A5 public fake provider | publish/read/write/wait + no replay dispatch |
+| L3 | I/O ABI | A5 public fake provider | publication/bind + 单一 Decode I/O op + no replay dispatch |
 | L4 | ACL Graph | A5 | 无 graph break/地址变化 |
 | L5 | GLM-5 P/D E2E | A5 TP16 P/D workers | P→D handoff + full-resident sparse parity |
 | L6 | No-CPU profile | A5 | 新增路径无 Host data stage |
@@ -2497,11 +2671,8 @@ authoring guide 均不存在。
 
 所有项目扩展 case 比较：
 
-- `read_local_hot_slot_ids`；
-- `read_destination_hot_row_ids`；
-- `read_source_global_slots`；
 - `resolved_hot_indices`；
-- `read_valid_mask`；
+- `miss_mask`；
 - `token_to_hot`；
 - `hot_to_token`；
 - `state_seat_epoch`；
@@ -2521,7 +2692,6 @@ real eviction
 victim invalidation
 seat epoch reset
 batch row reorder with stable seat
-token position to storage block remap
 newest selected
 normal/short-draft validity
 MTP union
@@ -2532,6 +2702,11 @@ target/draft cohort isolation
 随机验证使用固定 seed。每个 graph key 与代表性 resident ratio 至少 100 个
 seed。CPU oracle 的 D2H 只允许出现在测试断言阶段，不得进入被 profile 的
 replay 区间。
+
+token position 到 D storage block 的 remap 不属于 SIMT 输出；它在 Task 3
+的 I/O conformance 中单独验证：resident key 和 resolved local slot 不变，
+`dsa_sparse_io` 必须使用 replay 的当前 D block table 派生新的 source
+global slot。
 
 ASU-compatible 的 all-resident/none-resident/mixed/duplicate/eviction/LRU
 core cases，在等价 shape/state 且排除 reserved slots、seat lifecycle 扩展后，
@@ -2551,7 +2726,7 @@ core cases，在等价 shape/state 且排除 reserved slots、seat lifecycle 扩
 - 每个 region/direction/inflight lane 使用独立 completion/workspace/event；
 - padding 通过 NPU mask 表示；
 - 连续不同输入 replay 不出现 stale buffer；
-- lookup、I/O、wait、SFA、write 均属于 captured graph；
+- `dsa_sparse_lookup_update`、`dsa_sparse_io` 和 SFA 均属于 captured graph；
 - secondary stream 通过 event 回到 main stream；
 - replay 内无动态 allocation/free；
 - normal、short draft、MTP3 shape 与 dependency 一并捕获；
@@ -2662,7 +2837,7 @@ fake provider 的指标不代表 I/O backend。真实存储 backend 必须单独
 | Main/Indexer 任一未完成就提前 decode | Task 9 delayed handoff | 显式双 ready fan-in，ready 前不入 batch、不领 seat |
 | P/D cache layout 或 TP shard 不同 | Task 3/9 initialization | 首期要求同构并 fail fast，不做 reshard |
 | prefix payload 在 P/D bind 时错误复用 | Task 9 shared-prefix case | content identity 管 payload，D block identity 管 address |
-| SIMT state 已提交但 payload 未完成 | Task 3/7 delayed read | 强制 wait；失败终止 graph |
+| SIMT state 已提交但 payload 未完成 | Task 3/7 delayed read | 强制统一 I/O op 建立 completion dependency；失败终止 graph |
 | `token_to_hot[A,L]` HBM 预算过大 | Task 0/4 | 编码前重审 cohort 数或索引结构 |
 | MTP union 超出 hot capacity | Task 0 config budget | 提高明确配置，不做逐 query fallback |
 | MTP query 内互相淘汰 | Task 5 oracle | union protection |
@@ -2710,14 +2885,19 @@ fake provider 的指标不代表 I/O backend。真实存储 backend 必须单独
 - [ ] target/draft residency cohort 隔离，仅共享 baseline semantic Top-K；
 - [ ] ASU-compatible lookup/LRU core 与固定 ASU commit bit-exact；
 - [ ] MTP3 union、newest、seat epoch/lifecycle 与扩展 oracle bit-exact；
+- [ ] Decode graph 只包含 `dsa_sparse_lookup_update` 与 `dsa_sparse_io`
+      两类 DSA Sparse custom op；
+- [ ] 每个 cohort 每轮一次 lookup/update，每层每轮一次 I/O；
 - [ ] I/O 只通过统一公开 ABI 接入；
 - [ ] 产品仓库没有具体 I/O backend；
-- [ ] core + public conformance fixture 的 I/O plan/KV payload 不经过 CPU；
+- [ ] core + public conformance fixture 的 device descriptors/KV payload
+      不经过 CPU；
 - [ ] 全部 graph key/capture sizes 可在
       `FULL_DECODE_ONLY + enable_npugraph_ex` replay；
 - [ ] graph 中无 break、Host callback、CPU synchronize 或动态 allocation；
 - [ ] all-resident 与 mixed-resident 输入固定执行
-      `lookup → I/O → wait → existing SFA`，不存在分支 graph；
+      `dsa_sparse_lookup_update → dsa_sparse_io → existing SFA`，不存在
+      分支 graph；
 - [ ] GLM-5 P/D TP16/EP、prefill handoff、normal decode、MTP3、prefix、
       row reuse、eviction 通过；
 - [ ] 四种 Main/Indexer layout 通过；

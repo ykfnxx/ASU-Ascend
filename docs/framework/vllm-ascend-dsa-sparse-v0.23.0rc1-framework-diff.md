@@ -1,13 +1,15 @@
 # vLLM-Ascend DSA Sparse 框架变更分析
 
 > 状态：Analysis<br>
-> 分析仓库：`/Users/yangkefan/workspace/work/vllm-ascend`<br>
+> 分析仓库：`/home/solidyang/workspace/vllm-ascend`<br>
 > 当前分支：`dsa-sparse-0.23-eager`<br>
 > 基线：`v0.23.0rc1`（`f4a08bddd0cc65a0bd8c3d377b158ae5ca7527db`）<br>
 > 当前 HEAD：`74f00dddc7fd76411058acd1d798084c65dc05ef`<br>
 > 比较范围：`v0.23.0rc1..HEAD`<br>
 > 排除范围：算子算法、tiling、kernel 实现和算子性能<br>
 > 分析日期：2026-08-03
+
+> 行号口径：下文的 `Lx-Ly` 均是分析 HEAD `74f00dddc7fd76411058acd1d798084c65dc05ef` 中、按 `nl -ba` 得到的 1-based 行号；比较范围固定为 `v0.23.0rc1..74f00dddc7fd76411058acd1d798084c65dc05ef`。如果工作树已经前移到后续提交，源码行号可能发生偏移，应先切换到该分析 HEAD 再核对。
 
 本文分析 `dsa-sparse-0.23-eager` 相对 `v0.23.0rc1` 的框架层变化，重点回答：
 
@@ -105,20 +107,20 @@ flowchart LR
 
 ### 4.1 第一层：拆分 Main Cache 与 Indexer Cache
 
-`vllm_ascend/core/kv_cache_interface.py` 中：
+`vllm_ascend/core/kv_cache_interface.py:L19-L144,L200-L209` 中：
 
 - `AscendMLAAttentionSpec` 现在只描述 Main Cache；
 - 新增 `AscendSFAIndexerCacheSpec`，单独描述 Indexer K、scale、LI C8 和 DCP replication；
 - `AscendSFAIndexerCacheSpec` 注册到 `FullAttentionManager`；
 - 删除原来依赖复合 Cache 的 `sparse_head_dim`、`sparse_kv_cache_ratio` 和混合 page size 计算。
 
-新增 `vllm_ascend/attention/indexer.py`：
+新增 `vllm_ascend/attention/indexer.py:L17-L73`：
 
 - 提供 cache-only `AscendSFAIndexerBackend`；
 - Indexer group 可参与 KV Cache 分配和 metadata 初始化；
 - backend 本身没有 attention forward。
 
-`IndexerWrapper` 不再清空 upstream `k_cache`。SFA forward 通过 `_compose_sfa_kv_cache()` 将：
+`vllm_ascend/ops/mla.py:L39-L61` 的 `IndexerWrapper` 不再清空 upstream `k_cache`。SFA forward 在 `vllm_ascend/attention/sfa_v1.py:L1604-L1610` 通过 `_compose_sfa_kv_cache()` 将：
 
 ```text
 Main Cache tuple + self.indexer.k_cache.kv_cache
@@ -128,14 +130,14 @@ Main Cache tuple + self.indexer.k_cache.kv_cache
 
 ### 4.2 第二层：Decode consumer 外置 Main Cache
 
-在 DSA Sparse KV consumer 上，`NPUModelRunner.get_kv_cache_spec()`：
+在 DSA Sparse KV consumer 上，`vllm_ascend/worker/model_runner_v1.py:L5205-L5347` 的 `NPUModelRunner.get_kv_cache_spec()`：
 
 1. 把 Main spec 保存到 `DSASparseExternalMainSpecs`；
 2. 返回给 scheduler 的 KV Cache spec 只包含 Indexer；
 3. scheduler 只为 Indexer 分配 blocks；
 4. KVConnector 也只注册 Indexer Cache。
 
-初始化 attention backend 时，runner 会复制一份 scheduler 的 `KVCacheConfig`，然后将 Main spec 作为 runner-only metadata 投影回唯一的 Indexer group：
+初始化 attention backend 时，`vllm_ascend/worker/model_runner_v1.py:L4168-L4204` 会复制一份 scheduler 的 `KVCacheConfig`；`vllm_ascend/worker/dsa_sparse_external_main.py:L22-L115` 负责 external Main 映射，然后将 Main spec 作为 runner-only metadata 投影回唯一的 Indexer group：
 
 - `kv_cache_groups` 可以看见 Main 和 Indexer spec；
 - `kv_cache_tensors` 仍然只包含 Indexer；
@@ -174,7 +176,7 @@ flowchart LR
 
 ### 4.4 Decode step 执行流程
 
-`NPUModelRunner._begin_dsa_sparse_eager_execution()` 只接受：
+`vllm_ascend/worker/model_runner_v1.py:L884-L920` 的 `_begin_dsa_sparse_eager_execution()` 只接受：
 
 - `DecodeOnly` batch；
 - 每请求每 step 恰好一个 token；
@@ -184,12 +186,12 @@ flowchart LR
 运行流程：
 
 1. 根据 request ID 获取稳定的 `request_index`。
-2. 根据 layer 顺序和 `skip_topk` 识别 Indexer cohort；不跳过 Top-K 的 layer 是 cohort leader，后续 `skip_topk=True` 的 layer 复用该 cohort。
-3. 所有 cohort 共享一份 `DSASparseStepMetadata`，每个 cohort 建立一个 `DSASparseEagerBatchContext`。
+2. `vllm_ascend/worker/model_runner_v1.py:L725-L821` 根据 layer 顺序和 `skip_topk` 识别 Indexer cohort；不跳过 Top-K 的 layer 是 cohort leader，后续 `skip_topk=True` 的 layer 复用该 cohort。
+3. `vllm_ascend/attention/dsa_sparse.py:L266-L280,L382-L598,L829-L1007` 让所有 cohort 共享一份 `DSASparseStepMetadata`，每个 cohort 建立一个 `DSASparseEagerBatchContext`。
 4. SFA preprocessing 将当前 token 的 Main payload 写入本请求 Hot Cache 的 live-tail block。
 5. Indexer 产生 2048 个语义 Top-K token positions。
 6. cohort leader 对 Top-K 做一次位置解析；follower 复用结果，不重复解析。
-7. 每个 Main layer 调用一次统一 I/O 边界。生产实现应负责把 miss 对应的 Main 历史 payload 装入 Hot Cache。
+7. `vllm_ascend/attention/dsa_sparse.py:L600-L768` 使每个 Main layer 调用一次统一 I/O 边界；I/O 协议与 mock 在 `vllm_ascend/attention/dsa_sparse_io.py:L110-L211`，生产实现应负责把 miss 对应的 Main 历史 payload 装入 Hot Cache。
 8. SFA 使用 Hot Cache、Hot block table 和重映射后的 indices 执行。
 9. step 成功则 finish；异常则 abort，并从 attention metadata 上解绑 context。
 
@@ -197,7 +199,7 @@ flowchart LR
 
 ## 5. P/D 生命周期变化
 
-新增 `DSASparsePDLifecycle`，将请求进入 Decode running 的条件从“普通 KV 已 ready”扩展为：
+新增 `vllm_ascend/attention/dsa_sparse_pd.py:L84-L294` 的 `DSASparsePDLifecycle`，将请求进入 Decode running 的条件从“普通 KV 已 ready”扩展为：
 
 ```text
 Main external region ready
@@ -219,7 +221,7 @@ Indexer KV ready
 
 只有 Main 和 Indexer 都 ready 后，才会分配稳定 `request_index`。finish、preempt、abort 都会释放 region 和 request index。迟到或 generation 不匹配的 completion 会被忽略，迟到的 Main region handle 会立即释放。
 
-当前 runner 真正接入的是 mock lifecycle：新请求和 resumed 请求被模拟为双 ready；finished、preempted、resumed 请求会先 retire，再根据 scheduler 状态重新 admission。
+当前 runner 真正接入的是 `vllm_ascend/worker/dsa_sparse_eager.py:L313-L437` 的 mock lifecycle：新请求和 resumed 请求被模拟为双 ready；`vllm_ascend/worker/model_runner_v1.py:L1057-L1121` 对 finished、preempted、resumed 请求先 retire，再根据 scheduler 状态重新 admission。
 
 ## 6. 数据结构变化
 
@@ -227,10 +229,10 @@ Indexer KV ready
 
 | 数据结构 | 修改前 | 修改后 | 目的 |
 |---|---|---|---|
-| `AscendMLAAttentionSpec` | Main、Indexer、scale、LI C8、DCP replication 混合描述 | 只描述 Main | 解耦缓存生命周期和分配策略 |
-| `AscendSFAIndexerCacheSpec` | 不存在 | 独立描述 Indexer K/scale | 允许 scheduler 和 connector 单独管理 Indexer |
-| `IndexerWrapper.k_cache` | 被置空 | 保留并绑定独立 Cache | 让 SFA 从 indexer module 获取 Cache |
-| `DSASparseExternalMainSpecs` | 不存在 | worker-local Main spec 映射 | Main 对 scheduler 隐藏、对 runner metadata 可见 |
+| `AscendMLAAttentionSpec` | Main、Indexer、scale、LI C8、DCP replication 混合描述 | 只描述 Main（`vllm_ascend/core/kv_cache_interface.py:L19-L87`） | 解耦缓存生命周期和分配策略 |
+| `AscendSFAIndexerCacheSpec` | 不存在 | 独立描述 Indexer K/scale（`vllm_ascend/core/kv_cache_interface.py:L90-L144,L200-L209`） | 允许 scheduler 和 connector 单独管理 Indexer |
+| `IndexerWrapper.k_cache` | 被置空 | 保留并绑定独立 Cache（`vllm_ascend/ops/mla.py:L39-L61`） | 让 SFA 从 indexer module 获取 Cache |
+| `DSASparseExternalMainSpecs` | 不存在 | worker-local Main spec 映射（`vllm_ascend/worker/dsa_sparse_external_main.py:L22-L115`） | Main 对 scheduler 隐藏、对 runner metadata 可见 |
 
 原 `AscendMLAAttentionSpec` 删除的主要字段和逻辑：
 
@@ -247,18 +249,18 @@ Indexer KV ready
 
 | 数据结构 | 生命周期 | 作用 |
 |---|---|---|
-| `DSASparseCacheConfig` | worker 生命周期 | 固化 max seq、max model length、block size 和 Top-K |
-| `RequestIndexManager` | worker 生命周期 | request ID 到 `[0, max_num_seqs)` 稳定 row 的映射 |
-| `DSASparseCohortKey` | worker 生命周期 | 标识共享同一 Indexer 的 target/draft cohort |
-| `DSASparseLookupState` | worker 生命周期 | 持久位置映射和 free-slot 状态 |
-| `DSASparseLayerLayout` | 初始化阶段 | 描述每层 Main Cache plane dtype/shape |
-| `DSASparseLayerHotCache` | worker 生命周期 | 每层固定地址的 Main Hot Cache tensors |
-| `DSASparseLayerBinding` | worker 生命周期 | 绑定 layer、cohort、Hot Cache 和 I/O resource |
-| `DSASparseStepMetadata` | 一个 model forward | batch 共享的 compact metadata |
-| `DSASparseEagerStep` | 一个 cohort 的一个 forward | lookup、I/O 和 layer 完成状态 |
-| `DSASparseEagerBatchContext` | 一个 model forward | 单 cohort 的操作入口 |
-| `DSASparseEagerContextRouter` | 一个 model forward | 将各 layer 路由到所属 cohort context |
-| `DSASparseEagerExecution` | `with forward` 作用域 | finish/abort 和 metadata detach |
+| `DSASparseCacheConfig` | worker 生命周期 | 固化 max seq、max model length、block size 和 Top-K（`vllm_ascend/attention/dsa_sparse.py:L41-L106`） |
+| `RequestIndexManager` | worker 生命周期 | request ID 到 `[0, max_num_seqs)` 稳定 row 的映射（`vllm_ascend/attention/dsa_sparse.py:L109-L153`） |
+| `DSASparseCohortKey` | worker 生命周期 | 标识共享同一 Indexer 的 target/draft cohort（`vllm_ascend/attention/dsa_sparse.py:L157-L168`） |
+| `DSASparseLookupState` | worker 生命周期 | 持久位置映射和 free-slot 状态（`vllm_ascend/attention/dsa_sparse.py:L171-L250`） |
+| `DSASparseLayerLayout` | 初始化阶段 | 描述每层 Main Cache plane dtype/shape（`vllm_ascend/attention/dsa_sparse.py:L283-L291`） |
+| `DSASparseLayerHotCache` | worker 生命周期 | 每层固定地址的 Main Hot Cache tensors（`vllm_ascend/attention/dsa_sparse.py:L292-L320`） |
+| `DSASparseLayerBinding` | worker 生命周期 | 绑定 layer、cohort、Hot Cache 和 I/O resource（`vllm_ascend/attention/dsa_sparse.py:L334-L351`） |
+| `DSASparseStepMetadata` | 一个 model forward | batch 共享的 compact metadata（`vllm_ascend/attention/dsa_sparse.py:L253-L280`） |
+| `DSASparseEagerStep` | 一个 cohort 的一个 forward | lookup、I/O 和 layer 完成状态（`vllm_ascend/attention/dsa_sparse.py:L367-L379`） |
+| `DSASparseEagerBatchContext` | 一个 model forward | 单 cohort 的操作入口（`vllm_ascend/attention/dsa_sparse.py:L829-L930`） |
+| `DSASparseEagerContextRouter` | 一个 model forward | 将各 layer 路由到所属 cohort context（`vllm_ascend/attention/dsa_sparse.py:L932-L1007`） |
+| `DSASparseEagerExecution` | `with forward` 作用域 | finish/abort 和 metadata detach（`vllm_ascend/worker/dsa_sparse_eager.py:L231-L310`） |
 
 ### 6.3 Lookup State
 
@@ -271,11 +273,11 @@ Indexer KV ready
 | `free_slots` | `[S, 2048]` | 2K 可替换 slot 列表 |
 | `free_head` | `[S, 16]` | free-list 头及对齐空间 |
 
-请求 admission 时，每个 cohort 对 request row 执行 reset，并把前 8K resident positions 初始化为一一映射。请求释放时再次 reset，防止状态泄漏到后续复用该 row 的请求。
+请求 admission 时，`vllm_ascend/attention/dsa_sparse.py:L223-L250` 对每个 cohort 的 request row 执行 reset，并把前 8K resident positions 初始化为一一映射；`vllm_ascend/attention/dsa_sparse.py:L448-L466` 负责 coordinator 级 request acquire/release。请求释放时再次 reset，防止状态泄漏到后续复用该 row 的请求。
 
 ### 6.4 Step Metadata
 
-`DSASparseStepMetadata` 包含：
+`vllm_ascend/attention/dsa_sparse.py:L266-L280` 定义的 `DSASparseStepMetadata` 包含：
 
 ```text
 request_ids
@@ -297,7 +299,7 @@ hot_block_table
 
 ### 7.1 固定 Hot Cache 公式
 
-设：
+设（对应 `vllm_ascend/attention/dsa_sparse.py:L41-L106,L171-L320` 的配置和状态表）：
 
 - `S`：`max_num_seqs`；
 - `L`：本 NPU 上的 Main layer 数量；
@@ -352,7 +354,7 @@ M_fixed
   + A
 ```
 
-`NPUWorker.determine_available_memory()` 在把显存交给 scheduler 计算 KV blocks 前，先扣除 `M_fixed`。显式指定 `kv_cache_memory_bytes` 时也会做同样扣减。
+`vllm_ascend/worker/worker.py:L532-L611` 的 `NPUWorker.determine_available_memory()` 在把显存交给 scheduler 计算 KV blocks 前，先扣除 `M_fixed`；显式指定 `kv_cache_memory_bytes` 时也会做同样扣减。预算公式和 breakdown 实现在 `vllm_ascend/worker/dsa_sparse_memory.py:L24-L126`，runner 的布局收集在 `vllm_ascend/worker/model_runner_v1.py:L671-L821`。
 
 ### 7.3 常见布局示例
 
@@ -482,7 +484,7 @@ A5 packed-C8 Main:
 
 ## 8. 配置与支持范围变化
 
-配置入口为：
+配置入口由 `vllm_ascend/dsa_sparse_config.py:L38-L131` 解析，并由 `vllm_ascend/platform.py:L450-L513` 做平台/运行模式校验：
 
 ```json
 {
@@ -508,12 +510,12 @@ A5 packed-C8 Main:
 | PCP | 1 |
 | Speculative decode | 不支持 |
 | Sequence padding | 不支持 FlashComm1、SP bypass、shared expert DP 相关 padding |
-| Top-K | 固定 2048 |
+| Top-K | 固定 2048（`vllm_ascend/dsa_sparse_config.py:L147-L156`、`vllm_ascend/dsa_sparse_constants.py:L4-L11`） |
 | Max model length | 不超过 128K |
 | Block size | 必须同时整除 8K 和 2K 区域 |
 | I/O backend | 只允许 `mock` |
 
-DSA Sparse consumer 还要求：
+上述配置项的字段白名单、mock-only I/O、P/D role 和 eager/parallel/speculative 限制集中在 `vllm_ascend/dsa_sparse_config.py:L59-L131,L158-L177`；DSA Sparse consumer 还要求：
 
 - `DecodeOnly`；
 - 每请求每 forward 一个 token；
@@ -527,91 +529,91 @@ DSA Sparse consumer 还要求：
 
 | 文件 | 状态 | 关键修改 | 目的 |
 |---|:---:|---|---|
-| `vllm_ascend/dsa_sparse_config.py` | A | 新增 DSA 配置解析和严格能力校验 | 避免不支持的模式静默回退 |
-| `vllm_ascend/dsa_sparse_constants.py` | A | 固化 128K、8K、2K、2K Top-K 等维度 | 建立统一框架/算子 ABI |
-| `vllm_ascend/ascend_config.py` | M | 将 DSA 配置纳入 `AscendConfig` | 提供全局配置入口 |
-| `vllm_ascend/platform.py` | M | 校验 A5、V1、eager、P/D、无 SP/CP 等条件 | 启动时 fail-fast |
-| `vllm_ascend/core/kv_cache_interface.py` | M | Main/Indexer spec 拆分；新增 Indexer spec registry | 解耦缓存分配与生命周期 |
-| `vllm_ascend/attention/indexer.py` | A | 新增 cache-only Indexer backend | 让 Indexer 成为独立 scheduler cache layer |
-| `vllm_ascend/attention/dsa_sparse.py` | A | Hot Cache、Lookup State、request index、cohort、step coordinator | DSA eager 数据面框架主体 |
-| `vllm_ascend/attention/dsa_sparse_io.py` | A | 定义 I/O backend/operator 协议与 mock 实现 | 为真实外部 Main 存储预留边界 |
-| `vllm_ascend/attention/dsa_sparse_pd.py` | A | Main/Indexer 双 ready、generation 和 retire 生命周期 | 防止迟到 completion 和 request row 泄漏 |
-| `vllm_ascend/attention/sfa_v1.py` | M | 重组独立 Indexer、写 Hot tail、接入 context、在 Hot Cache 上调用现有 SFA | 将新缓存架构接入现有 SFA forward |
-| `vllm_ascend/worker/dsa_sparse_eager.py` | A | 分配 runtime、cohort、Hot Cache；attach/detach context | 建立 batch 级 eager 执行生命周期 |
-| `vllm_ascend/worker/dsa_sparse_external_main.py` | A | Main spec 对 scheduler 隐藏、对 runner metadata 可见 | 不给 Main 分配 scheduler tensors |
-| `vllm_ascend/worker/dsa_sparse_memory.py` | A | 计算固定 Hot Cache/Lookup State HBM | 避免 runtime 初始化后 OOM |
-| `vllm_ascend/worker/model_runner_v1.py` | M | spec 构建、Cache 分配、external Main、runtime、request state 和 forward 集成 | 整体集成中心 |
-| `vllm_ascend/worker/worker.py` | M | 自动 profile 和显式 KV budget 中扣除固定 HBM | 将固定 Hot Cache 纳入显存规划 |
-| `vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py` | M | 测试模式下保留控制面但跳过 payload transfer | 支持 mock P/D probe |
-| `vllm_ascend/dsa_sparse_probe.py` | A | 输出同步、机器可读 runtime event | 验证真实执行路径和 tensor 地址 |
-| `vllm_ascend/envs.py` | M | 注册 Mooncake mock skip 与 runtime probe 开关 | 集中管理测试环境变量 |
-| `vllm_ascend/utils.py` | M | 删除依赖旧复合 spec 的 LI C8/indexer helper | 清理已失效的数据结构假设 |
+| `vllm_ascend/dsa_sparse_config.py:L21-L177` | A | 新增 DSA 配置解析和严格能力校验 | 避免不支持的模式静默回退 |
+| `vllm_ascend/dsa_sparse_constants.py:L4-L11` | A | 固化 128K、8K、2K、2K Top-K 等维度 | 建立统一框架/算子 ABI |
+| `vllm_ascend/ascend_config.py:L23,L44` | M | 将 DSA 配置纳入 `AscendConfig` | 提供全局配置入口 |
+| `vllm_ascend/platform.py:L450-L514` | M | 校验 A5、V1、eager、P/D、无 SP/CP 等条件 | 启动时 fail-fast |
+| `vllm_ascend/core/kv_cache_interface.py:L19-L144,L200-L209` | M | Main/Indexer spec 拆分；新增 Indexer spec registry | 解耦缓存分配与生命周期 |
+| `vllm_ascend/attention/indexer.py:L17-L73` | A | 新增 cache-only Indexer backend | 让 Indexer 成为独立 scheduler cache layer |
+| `vllm_ascend/attention/dsa_sparse.py:L41-L1007` | A | Hot Cache、Lookup State、request index、cohort、step coordinator | DSA eager 数据面框架主体 |
+| `vllm_ascend/attention/dsa_sparse_io.py:L25-L258` | A | 定义 I/O backend/operator 协议与 mock 实现 | 为真实外部 Main 存储预留边界 |
+| `vllm_ascend/attention/dsa_sparse_pd.py:L8-L294` | A | Main/Indexer 双 ready、generation 和 retire 生命周期 | 防止迟到 completion 和 request row 泄漏 |
+| `vllm_ascend/attention/sfa_v1.py:L1534-L1610,L1630-L1682,L1990-L2044` | M | 重组独立 Indexer、写 Hot tail、接入 context、在 Hot Cache 上调用现有 SFA | 将新缓存架构接入现有 SFA forward |
+| `vllm_ascend/worker/dsa_sparse_eager.py:L37-L505` | A | 分配 runtime、cohort、Hot Cache；attach/detach context | 建立 batch 级 eager 执行生命周期 |
+| `vllm_ascend/worker/dsa_sparse_external_main.py:L22-L115` | A | Main spec 对 scheduler 隐藏、对 runner metadata 可见 | 不给 Main 分配 scheduler tensors |
+| `vllm_ascend/worker/dsa_sparse_memory.py:L24-L126` | A | 计算固定 Hot Cache/Lookup State HBM | 避免 runtime 初始化后 OOM |
+| `vllm_ascend/worker/model_runner_v1.py:L359-L367,L625-L821,L884-L920,L1057-L1121,L2618-L2625,L4168-L4370,L5205-L5347` | M | spec 构建、Cache 分配、external Main、runtime、request state 和 forward 集成 | 整体集成中心 |
+| `vllm_ascend/worker/worker.py:L75-L76,L136-L137,L532-L658` | M | 自动 profile 和显式 KV budget 中扣除固定 HBM | 将固定 Hot Cache 纳入显存规划 |
+| `vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py:L928-L936` | M | 测试模式下保留控制面但跳过 payload transfer | 支持 mock P/D probe |
+| `vllm_ascend/dsa_sparse_probe.py:L17-L44` | A | 输出同步、机器可读 runtime event | 验证真实执行路径和 tensor 地址 |
+| `vllm_ascend/envs.py:L113-L122` | M | 注册 Mooncake mock skip 与 runtime probe 开关 | 集中管理测试环境变量 |
+| `vllm_ascend/utils.py:L113-L132,L1715-L1719` | M | 删除依赖旧复合 spec 的 LI C8/indexer helper | 清理已失效的数据结构假设 |
 
 ### 9.2 位于 ops 目录但属于框架胶水的修改
 
-`vllm_ascend/ops/mla.py` 中 `IndexerWrapper` 不再将 upstream `k_cache` 置空，而是保留引用，供独立 `AscendSFAIndexerCacheSpec` 分配和绑定。该变化是 Cache 所有权重构的必要胶水，不涉及本报告排除的算子算法分析。
+`vllm_ascend/ops/mla.py:L39-L61` 中 `IndexerWrapper` 不再将 upstream `k_cache` 置空，而是保留引用，供独立 `AscendSFAIndexerCacheSpec` 分配和绑定。该变化是 Cache 所有权重构的必要胶水，不涉及本报告排除的算子算法分析。
 
 ### 9.3 构建、CI 和验证入口
 
 | 文件 | 状态 | 目的 |
 |---|:---:|---|
-| `.github/workflows/scripts/test_config.yaml` | M | 将 `attention/indexer.py` 和 `test_indexer.py` 纳入 SFA 测试路由 |
-| `setup.py` | M | `setuptools_scm` 只匹配 `v[0-9]*` release tag，避免 checkpoint tag 误判版本；与 DSA 主体无关 |
-| `examples/dsa_sparse_pd_mock_probe.sh` | A | 启动同机 1P1D mock probe，验证路由、执行拓扑和 Hot Cache SFA |
-| `examples/dsa_sparse_probe_validate.py` | A | 校验 probe event、每 cohort lookup 次数、每层 Hot Cache 地址和 profile 记录 |
+| `.github/workflows/scripts/test_config.yaml:L99-L103` | M | 将 `attention/indexer.py` 和 `test_indexer.py` 纳入 SFA 测试路由 |
+| `setup.py:L454-L475`（导入位于 `L32`） | M | `setuptools_scm` 只匹配 `v[0-9]*` release tag，避免 checkpoint tag 误判版本；与 DSA 主体无关 |
+| `examples/dsa_sparse_pd_mock_probe.sh:L3-L534`（启动参数/环境变量见 `L50-L66,L305-L323`，启动见 `L346-L392`，校验见 `L519-L534`） | A | 启动同机 1P1D mock probe，验证路由、执行拓扑和 Hot Cache SFA |
+| `examples/dsa_sparse_probe_validate.py:L12-L430` | A | 校验 probe event、每 cohort lookup 次数、每层 Hot Cache 地址和 profile 记录 |
 
 ### 9.4 非算子框架测试
 
 | 文件 | 状态 | 主要覆盖 |
 |---|:---:|---|
-| `tests/ut/attention/a2/test_sfa_v1.py` | M | Main/Indexer 重组、Hot Cache SFA 路由与 shape |
-| `tests/ut/attention/test_dsa_sparse.py` | A | 固定维度、四张状态表、request index 稳定复用 |
-| `tests/ut/attention/test_dsa_sparse_eager.py` | A | leader/follower、lookup once、I/O failure、coordinator poison |
-| `tests/ut/attention/test_dsa_sparse_io.py` | A | I/O registry、ABI、mock no-op 行为 |
-| `tests/ut/attention/test_dsa_sparse_pd.py` | A | 双 ready、generation、迟到 completion、finish/preempt |
-| `tests/ut/attention/test_indexer.py` | A | cache-only backend 和 metadata builder |
-| `tests/ut/kv_offload/test_mooncake_connector.py` | M | mock skip Mooncake payload |
-| `tests/ut/test_dsa_sparse_config.py` | A | 配置能力边界和错误条件 |
-| `tests/ut/test_dsa_sparse_probe_validate.py` | A | probe 结果验证和 Hot Cache 地址检查 |
-| `tests/ut/test_platform.py` | M | A5、V1、eager、P/D 等平台校验 |
-| `tests/ut/worker/a2/test_model_runner_v1.py` | M | spec 拆分、四种 Cache layout、external Main、runtime 集成 |
-| `tests/ut/worker/test_dsa_sparse_eager_runtime.py` | A | runtime/context attach、shared metadata、默认 lookup adapter |
-| `tests/ut/worker/test_dsa_sparse_memory.py` | A | 固定 HBM 公式和 worker reservation |
+| `tests/ut/attention/a2/test_sfa_v1.py:L109-L272` | M | Main/Indexer 重组、Hot Cache SFA 路由与 shape |
+| `tests/ut/attention/test_dsa_sparse.py:L23-L108` | A | 固定维度、四张状态表、request index 稳定复用 |
+| `tests/ut/attention/test_dsa_sparse_eager.py:L54-L287` | A | leader/follower、lookup once、I/O failure、coordinator poison |
+| `tests/ut/attention/test_dsa_sparse_io.py:L24-L144` | A | I/O registry、ABI、mock no-op 行为 |
+| `tests/ut/attention/test_dsa_sparse_pd.py:L40-L233` | A | 双 ready、generation、迟到 completion、finish/preempt |
+| `tests/ut/attention/test_indexer.py:L16-L56` | A | cache-only backend 和 metadata builder |
+| `tests/ut/kv_offload/test_mooncake_connector.py:L833-L920` | M | mock skip Mooncake payload |
+| `tests/ut/test_dsa_sparse_config.py:L54-L141` | A | 配置能力边界和错误条件 |
+| `tests/ut/test_dsa_sparse_probe_validate.py:L110-L173` | A | probe 结果验证和 Hot Cache 地址检查 |
+| `tests/ut/test_platform.py:L86-L157` | M | A5、V1、eager、P/D 等平台校验 |
+| `tests/ut/worker/a2/test_model_runner_v1.py:L172-L519` | M | spec 拆分、四种 Cache layout、external Main、runtime 集成 |
+| `tests/ut/worker/test_dsa_sparse_eager_runtime.py:L80-L151` | A | runtime/context attach、shared metadata、默认 lookup adapter |
+| `tests/ut/worker/test_dsa_sparse_memory.py:L22-L159` | A | 固定 HBM 公式和 worker reservation |
 
 ### 9.5 算子范围文件
 
 以下 29 个文件属于算子、算子测试或独立 benchmark 范围，本报告仅列出，不分析实现：
 
 ```text
-csrc/attention/dsa_sparse_lookup_update/CMakeLists.txt
-csrc/attention/dsa_sparse_lookup_update/dsa_sparse_lookup_update_torch_adpt.h
-csrc/attention/dsa_sparse_lookup_update/op_host/CMakeLists.txt
-csrc/attention/dsa_sparse_lookup_update/op_host/dsa_sparse_lookup_update_def.cpp
-csrc/attention/dsa_sparse_lookup_update/op_host/dsa_sparse_lookup_update_infershape.cpp
-csrc/attention/dsa_sparse_lookup_update/op_host/dsa_sparse_lookup_update_tiling.cpp
-csrc/attention/dsa_sparse_lookup_update/op_host/dsa_sparse_lookup_update_tiling.h
-csrc/attention/dsa_sparse_lookup_update/op_host/op_api/aclnn_dsa_sparse_lookup_update.cpp
-csrc/attention/dsa_sparse_lookup_update/op_host/op_api/aclnn_dsa_sparse_lookup_update.h
-csrc/attention/dsa_sparse_lookup_update/op_kernel/arch35/dsa_sparse_lookup_update_simt.h
-csrc/attention/dsa_sparse_lookup_update/op_kernel/dsa_sparse_lookup_update.cpp
-csrc/attention/dsa_sparse_lookup_update/op_kernel/dsa_sparse_lookup_update_common.h
-csrc/build_aclnn.sh
-csrc/torch_binding.cpp
-csrc/torch_binding_meta.cpp
-vllm_ascend/ops/dsa_sparse.py
-vllm_ascend/ops/mla.py
-tests/ut/ops/dsa_sparse_lookup_update_reference.py
-tests/ut/ops/test_dsa_sparse_lookup_update_kernel_source.py
-tests/ut/ops/test_dsa_sparse_lookup_update_reference.py
-tests/ut/ops/test_dsa_sparse_lookup_update_torch.py
-tests/ut/ops/test_mla.py
-tools/dsa_sparse_lookup_update/.gitignore
-tools/dsa_sparse_lookup_update/README.md
-tools/dsa_sparse_lookup_update/benchmark_operator.py
-tools/dsa_sparse_lookup_update/build_and_install.sh
-tools/dsa_sparse_lookup_update/common.py
-tools/dsa_sparse_lookup_update/profile_operator.py
-tools/dsa_sparse_lookup_update/test_correctness.py
+csrc/attention/dsa_sparse_lookup_update/CMakeLists.txt:L1-L13
+csrc/attention/dsa_sparse_lookup_update/dsa_sparse_lookup_update_torch_adpt.h:L1-L104
+csrc/attention/dsa_sparse_lookup_update/op_host/CMakeLists.txt:L1-L28
+csrc/attention/dsa_sparse_lookup_update/op_host/dsa_sparse_lookup_update_def.cpp:L1-L53
+csrc/attention/dsa_sparse_lookup_update/op_host/dsa_sparse_lookup_update_infershape.cpp:L1-L60
+csrc/attention/dsa_sparse_lookup_update/op_host/dsa_sparse_lookup_update_tiling.cpp:L1-L310
+csrc/attention/dsa_sparse_lookup_update/op_host/dsa_sparse_lookup_update_tiling.h:L1-L19
+csrc/attention/dsa_sparse_lookup_update/op_host/op_api/aclnn_dsa_sparse_lookup_update.cpp:L1-L74
+csrc/attention/dsa_sparse_lookup_update/op_host/op_api/aclnn_dsa_sparse_lookup_update.h:L1-L41
+csrc/attention/dsa_sparse_lookup_update/op_kernel/arch35/dsa_sparse_lookup_update_simt.h:L1-L395
+csrc/attention/dsa_sparse_lookup_update/op_kernel/dsa_sparse_lookup_update.cpp:L1-L75
+csrc/attention/dsa_sparse_lookup_update/op_kernel/dsa_sparse_lookup_update_common.h:L1-L36
+csrc/build_aclnn.sh:L1-L319
+csrc/torch_binding.cpp:L1-L2982
+csrc/torch_binding_meta.cpp:L1-L1906
+vllm_ascend/ops/dsa_sparse.py:L1-L65
+vllm_ascend/ops/mla.py:L1-L213
+tests/ut/ops/dsa_sparse_lookup_update_reference.py:L1-L215
+tests/ut/ops/test_dsa_sparse_lookup_update_kernel_source.py:L1-L102
+tests/ut/ops/test_dsa_sparse_lookup_update_reference.py:L1-L154
+tests/ut/ops/test_dsa_sparse_lookup_update_torch.py:L1-L97
+tests/ut/ops/test_mla.py:L1-L170
+tools/dsa_sparse_lookup_update/.gitignore:L1-L3
+tools/dsa_sparse_lookup_update/README.md:L1-L84
+tools/dsa_sparse_lookup_update/benchmark_operator.py:L1-L335
+tools/dsa_sparse_lookup_update/build_and_install.sh:L1-L133
+tools/dsa_sparse_lookup_update/common.py:L1-L256
+tools/dsa_sparse_lookup_update/profile_operator.py:L1-L290
+tools/dsa_sparse_lookup_update/test_correctness.py:L1-L292
 ```
 
 ## 10. 提交演进
